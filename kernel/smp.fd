@@ -1,0 +1,226 @@
+// stdlib/smp.fd — SMP (Symmetric Multi-Processing) support
+//
+// Provides AP (Application Processor) startup, IPI (Inter-Processor
+// Interrupt) sending, and per-CPU initialization for multi-core systems.
+//
+// Usage:
+//   use smp;
+//   smp::init();
+//   val ncpus = smp::cpu_count();
+//   smp::start_ap(1);  // Start CPU 1
+//   smp::send_ipi(1, 0x20);  // Send interrupt vector 0x20 to CPU 1
+//
+// References:
+//   - Intel SDM Vol 3: Multiple Processor Management
+//   - OSDev Wiki: Symmetric Multiprocessing
+
+module smp;
+
+// ─── Constants ──────────────────────────────────────────────────────────
+
+// AP startup trampoline location (must be page-aligned, low memory)
+const AP_TRAMPOLINE_ADDR: i64 = 0x8000;
+
+// LAPIC registers (offsets from LAPIC base, typically 0xFEE00000)
+const LAPIC_BASE: i64          = 0xFEE00000;
+const LAPIC_ID: i64            = 0x020;
+const LAPIC_EOI: i64           = 0x0B0;
+const LAPIC_ICR_LO: i64        = 0x300;
+const LAPIC_ICR_HI: i64        = 0x310;
+const LAPIC_ERROR: i64         = 0x280;
+const LAPIC_SPIV: i64          = 0x0F0;
+
+// ICR flags
+const LAPIC_ICR_LEVEL_ASSERT: i64 = 0x4000;
+const LAPIC_ICR_INIT: i64         = 0x0500;
+const LAPIC_ICR_STARTUP: i64      = 0x0600;
+const LAPIC_ICR_PHYSICAL: i64     = 0x0000;
+
+// CPU states
+const CPU_STATE_OFFLINE: i64  = 0;
+const CPU_STATE_STARTING: i64 = 1;
+const CPU_STATE_ONLINE: i64   = 2;
+const CPU_STATE_HALTED: i64   = 3;
+
+// ─── Per-CPU state ───────────────────────────────────────────────────────
+
+pub struct CpuInfo {
+    pub apic_id: i64,
+    pub state: i64,
+    pub stack_ptr: i64,
+    pub idt_ptr: i64,
+    pub gdt_ptr: i64,
+}
+
+var cpus: Vec;
+var cpu_count_val: i64;
+
+// ─── LAPIC helpers ───────────────────────────────────────────────────────
+
+fn lapic_read(offset: i64) -> i64 {
+    val addr = LAPIC_BASE + offset;
+    return p_volatile_load(addr);
+}
+
+fn lapic_write(offset: i64, value: i64) {
+    val addr = LAPIC_BASE + offset;
+    p_volatile_store(addr, value);
+}
+
+// Get the APIC ID of the current CPU.
+pub fn smp_current_cpu_id() -> i64 {
+    return (lapic_read(LAPIC_ID) >> 24) & 0xFF;
+}
+
+// ─── IPI (Inter-Processor Interrupt) ─────────────────────────────────────
+
+// Send an IPI to a specific CPU.
+// target_apic_id: APIC ID of the target CPU
+// vector: interrupt vector number
+pub fn smp_send_ipi(target_apic_id: i64, vector: i64) -> i64 {
+    // Set high register (target APIC ID)
+    lapic_write(LAPIC_ICR_HI, (target_apic_id & 0xFF) << 24);
+    // Set low register (vector + delivery mode)
+    // Delivery mode: fixed (0x000), level: assert (0x4000), dest: physical (0x0)
+    lapic_write(LAPIC_ICR_LO, vector | LAPIC_ICR_LEVEL_ASSERT | LAPIC_ICR_PHYSICAL);
+
+    // Wait for delivery (check delivery status bit 12)
+    var timeout: i64 = 1000000;
+    while timeout > 0 {
+        val status = lapic_read(LAPIC_ICR_LO);
+        if (status & 0x1000) == 0 {
+            return 0;  // Delivered
+        }
+        timeout = timeout - 1;
+    }
+    return -1;  // Timeout
+}
+
+// Send an IPI to all CPUs (broadcast).
+pub fn smp_send_ipi_all(vector: i64) -> i64 {
+    // Set low register with "all including self" (0x80000)
+    lapic_write(LAPIC_ICR_LO, vector | LAPIC_ICR_LEVEL_ASSERT | 0x80000);
+    return 0;
+}
+
+// Send an INIT IPI to a CPU (used for AP startup).
+pub fn smp_send_init_ipi(target_apic_id: i64) -> i64 {
+    lapic_write(LAPIC_ICR_HI, (target_apic_id & 0xFF) << 24);
+    lapic_write(LAPIC_ICR_LO, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_ASSERT);
+    return 0;
+}
+
+// Send a STARTUP IPI to a CPU (used for AP startup).
+// trampoline_page: physical page number (address >> 12)
+pub fn smp_send_startup_ipi(target_apic_id: i64, trampoline_page: i64) -> i64 {
+    lapic_write(LAPIC_ICR_HI, (target_apic_id & 0xFF) << 24);
+    lapic_write(LAPIC_ICR_LO, LAPIC_ICR_STARTUP | (trampoline_page & 0xFF));
+    return 0;
+}
+
+// ─── AP startup ─────────────────────────────────────────────────────────
+
+// Start an Application Processor (AP).
+// apic_id: APIC ID of the CPU to start
+// trampoline_phys: physical address of the AP startup code (must be page-aligned, < 1MB)
+// stack: stack pointer for the AP
+// Returns 0 on success, negative on error.
+pub fn smp_start_ap(apic_id: i64, trampoline_phys: i64, stack: i64) -> i64 {
+    if apic_id < 0 || apic_id > 255 {
+        return -1;
+    }
+    if (trampoline_phys & 0xFFF) != 0 {
+        return -2;  // Must be page-aligned
+    }
+
+    // Send INIT IPI
+    smp_send_init_ipi(apic_id);
+
+    // Wait 10ms (PIT delay — caller must implement)
+    p_sleep(10);
+
+    // Send STARTUP IPI (twice, per Intel spec)
+    val page = trampoline_phys >> 12;
+    smp_send_startup_ipi(apic_id, page);
+    p_sleep(2);
+    smp_send_startup_ipi(apic_id, page);
+    p_sleep(2);
+
+    // Mark CPU as starting
+    var i: i64 = 0;
+    while i < cpus.len() {
+        val cpu = cpus.get(i);
+        if cpu.apic_id == apic_id {
+            cpu.state = CPU_STATE_STARTING;
+            cpu.stack_ptr = stack;
+        }
+        i = i + 1;
+    }
+
+    return 0;
+}
+
+// ─── Per-CPU management ────────────────────────────────────────────────
+
+// Register a CPU in the CPU list.
+pub fn smp_register_cpu(apic_id: i64) -> i64 {
+    val cpu = CpuInfo {
+        apic_id: apic_id,
+        state: CPU_STATE_OFFLINE,
+        stack_ptr: 0,
+        idt_ptr: 0,
+        gdt_ptr: 0,
+    };
+    cpus.push(cpu);
+    cpu_count_val = cpu_count_val + 1;
+    return cpu_count_val - 1;
+}
+
+// Get the number of registered CPUs.
+pub fn smp_cpu_count() -> i64 {
+    return cpu_count_val;
+}
+
+// Get CPU info by index.
+pub fn smp_get_cpu(index: i64) -> CpuInfo {
+    return cpus.get(index);
+}
+
+// Mark a CPU as online (called by the AP itself when it starts).
+pub fn smp_mark_online(apic_id: i64) {
+    var i: i64 = 0;
+    while i < cpus.len() {
+        val cpu = cpus.get(i);
+        if cpu.apic_id == apic_id {
+            cpu.state = CPU_STATE_ONLINE;
+        }
+        i = i + 1;
+    }
+}
+
+// Check if a CPU is online.
+pub fn smp_is_online(apic_id: i64) -> bool {
+    var i: i64 = 0;
+    while i < cpus.len() {
+        val cpu = cpus.get(i);
+        if cpu.apic_id == apic_id {
+            return cpu.state == CPU_STATE_ONLINE;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── Initialization ──────────────────────────────────────────────────────
+
+pub fn smp_init() -> i64 {
+    cpus = Vec::new();
+    cpu_count_val = 0;
+
+    // Register the BSP (Bootstrap Processor)
+    val bsp_id = smp_current_cpu_id();
+    smp_register_cpu(bsp_id);
+    smp_mark_online(bsp_id);
+
+    return 0;
+}

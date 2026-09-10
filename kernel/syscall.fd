@@ -1,0 +1,298 @@
+// stdlib/syscall.fd — User mode and syscall interface
+//
+// Provides:
+//   - Ring 0 → Ring 3 transition (user mode entry)
+//   - syscall/sysret setup (MSR STAR/LSTAR/FMASK)
+//   - Syscall table: read, write, open, close, exit, mmap, brk, etc.
+//   - TSS RSP0 for kernel stack on syscall entry
+//   - Syscall dispatch
+//
+// Usage:
+//   use syscall;
+//   syscall_init();
+//   syscall_register(1, sys_write);
+//   syscall_register(60, sys_exit);
+//
+// Only works in --bare or --boot mode.
+
+module syscall;
+
+use vec;
+use string;
+
+// ─── Syscall Numbers ──────────────────────────────────────────────────────
+
+const SYS_READ:    i64 = 0;
+const SYS_WRITE:   i64 = 1;
+const SYS_OPEN:    i64 = 2;
+const SYS_CLOSE:   i64 = 3;
+const SYS_EXIT:    i64 = 60;
+const SYS_MMAP:    i64 = 9;
+const SYS_BRK:     i64 = 12;
+const SYS_GETPID:  i64 = 39;
+const SYS_FORK:    i64 = 57;
+const SYS_EXEC:    i64 = 59;
+const SYS_WAIT:    i64 = 61;
+
+const MAX_SYSCALLS: i64 = 512;
+
+// ─── MSR Addresses ────────────────────────────────────────────────────────
+
+const MSR_STAR:    i64 = 0xC0000081;
+const MSR_LSTAR:   i64 = 0xC0000082;
+const MSR_CSTAR:   i64 = 0xC0000083;
+const MSR_FMASK:   i64 = 0xC0000084;
+const MSR_EFER:    i64 = 0xC0000080;
+
+// EFER bits
+const EFER_SCE:    i64 = 1;     // Syscall enable
+
+// ─── GDT Selectors ────────────────────────────────────────────────────────
+
+const GDT_KERNEL_CODE: i64 = 0x08;
+const GDT_KERNEL_DATA: i64 = 0x10;
+const GDT_USER_CODE:   i64 = 0x1B;  // Ring 3 code (RPL=3)
+const GDT_USER_DATA:   i64 = 0x23;  // Ring 3 data (RPL=3)
+
+// ─── Syscall Handler Table ────────────────────────────────────────────────
+
+var syscall_table: Vec<i64> = Vec::new();
+
+// ─── Initialization ────────────────────────────────────────────────────────
+
+pub fn syscall_init() {
+    // Initialize syscall table
+    syscall_table = Vec::new();
+    var i: i64 = 0;
+    while i < MAX_SYSCALLS {
+        syscall_table.push(0);
+        i = i + 1;
+    }
+
+    // Set up MSRs for syscall/sysret
+    // STAR: [63:48] = user CS, [47:32] = kernel CS
+    var star_val: i64 = (GDT_USER_CODE << 48) | (GDT_KERNEL_CODE << 32);
+    p_msr_write(MSR_STAR, star_val);
+
+    // LSTAR: syscall entry point (the assembly stub)
+    // This must be the address of the syscall entry handler
+    p_msr_write(MSR_LSTAR, syscall_entry_addr());
+
+    // FMASK: clear IF on syscall
+    p_msr_write(MSR_FMASK, 0x200);
+
+    // Enable syscall in EFER
+    var efer: i64 = p_msr_read(MSR_EFER);
+    p_msr_write(MSR_EFER, efer | EFER_SCE);
+}
+
+// ─── Syscall Registration ─────────────────────────────────────────────────
+
+pub fn syscall_register(num: i64, handler: i64) {
+    if num < 0 || num >= MAX_SYSCALLS { return; }
+    syscall_table.set(num, handler);
+}
+
+pub fn syscall_unregister(num: i64) {
+    if num < 0 || num >= MAX_SYSCALLS { return; }
+    syscall_table.set(num, 0);
+}
+
+// ─── Syscall Dispatch ─────────────────────────────────────────────────────
+
+// Called by the syscall entry stub.
+// Args: syscall number in rax, args in rdi, rsi, rdx, r10, r8, r9
+// Returns: result in rax
+pub fn syscall_dispatch(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, arg5: i64) -> i64 {
+    if num < 0 || num >= MAX_SYSCALLS { return -1; }
+
+    var handler: i64 = syscall_table.get(num);
+    if handler == 0 { return -1; }
+
+    // Call the handler function pointer
+    // In bare-metal mode: ((i64(*)(i64,i64,i64,i64,i64,i64))handler)(arg1, arg2, arg3, arg4, arg5)
+    // For now, we return -1 as we can't call function pointers directly
+    return -1;
+}
+
+// ─── Ring 3 Entry ─────────────────────────────────────────────────────────
+
+// Enter user mode (ring 3) and jump to a user program.
+// This sets up the user stack and entry point, then uses
+// sysret to transition to ring 3.
+pub fn syscall_enter_ring3(entry: i64, stack: i64, arg: i64) {
+    // Set up TSS RSP0 for kernel stack on syscall
+    // p_tss_set_rsp0(kernel_stack);
+
+    // Set up user mode:
+    // 1. Push user SS (0x23)
+    // 2. Push user RSP
+    // 3. Push RFLAGS (with IF set)
+    // 4. Push user CS (0x1B)
+    // 5. Push user RIP (entry point)
+    // 6. Set RAX = arg
+    // 7. Execute IRETQ or SYSRETQ
+
+    // In bare-metal mode, this would be inline asm:
+    //   mov ax, 0x23
+    //   mov ds, ax
+    //   mov es, ax
+    //   mov fs, ax
+    //   mov gs, ax
+    //   push 0x23        ; SS
+    //   push stack       ; RSP
+    //   push 0x202       ; RFLAGS (IF=1)
+    //   push 0x1B        ; CS
+    //   push entry       ; RIP
+    //   mov rax, arg
+    //   iretq
+
+    // For now, use the builtin
+    p_ring3_enter(entry, stack, arg);
+}
+
+// ─── Standard Syscall Implementations ────────────────────────────────────
+
+// These are stubs that a real OS would implement
+
+pub fn sys_write(fd: i64, buf: i64, count: i64) -> i64 {
+    // Write to file descriptor
+    // fd=1 (stdout), fd=2 (stderr) → serial output
+    if fd == 1 || fd == 2 {
+        var i: i64 = 0;
+        while i < count {
+            var c: i64 = p_phys_read8(buf + i);
+            p_serial_putc(c);
+            i = i + 1;
+        }
+        return count;
+    }
+    return -1;
+}
+
+pub fn sys_read(fd: i64, buf: i64, count: i64) -> i64 {
+    // Read from file descriptor
+    // fd=0 (stdin) → keyboard
+    if fd == 0 {
+        // Read from keyboard (blocking)
+        var i: i64 = 0;
+        while i < count {
+            // Wait for key
+            p_hlt();
+            // Read key and store in buffer
+            i = i + 1;
+        }
+        return count;
+    }
+    return -1;
+}
+
+pub fn sys_exit(code: i64) -> i64 {
+    // Terminate current process
+    // In a real OS, this would:
+    // 1. Clean up resources
+    // 2. Switch to scheduler
+    // For now, just halt
+    p_cli();
+    p_hlt();
+    return code;
+}
+
+pub fn sys_getpid() -> i64 {
+    // Return current process ID
+    return 1;  // stub
+}
+
+// ─── Syscall Entry Address ────────────────────────────────────────────────
+
+// This returns the address of the syscall entry assembly stub.
+// The stub saves registers, calls syscall_dispatch, and returns via sysret.
+// In a real implementation, this would be a label in the kernel's
+// assembly code.
+fn syscall_entry_addr() -> i64 {
+    // The actual address would be set by the linker or runtime.
+    // For now, return 0 — the real address must be registered.
+    return 0;
+}
+
+pub fn syscall_set_entry(addr: i64) {
+    p_msr_write(MSR_LSTAR, addr);
+}
+
+// ─── User Mode Helpers ────────────────────────────────────────────────────
+
+// Set up user segment selectors
+pub fn syscall_setup_user_segments() {
+    // In bare-metal mode:
+    //   mov ax, 0x23  ; user data segment
+    //   mov ds, ax
+    //   mov es, ax
+    //   mov fs, ax
+    //   mov gs, ax
+    // For now, this is a stub
+}
+
+// Check if we're in ring 0 (kernel mode)
+pub fn syscall_is_kernel() -> bool {
+    var cs: i64 = 0;
+    // Read CS register
+    // In bare-metal mode: asm!("mov %cs, %0" : "=r"(cs));
+    return (cs & 3) == 0;
+}
+
+// ─── File Descriptor Table ────────────────────────────────────────────────
+
+const MAX_FDS: i64 = 256;
+
+pub struct FileDescriptor {
+    pub used: bool,
+    pub type: i64,     // 0=stdin, 1=stdout, 2=stderr, 3=file, 4=pipe, 5=socket
+    pub data: i64,    // type-specific data (file offset, pipe id, etc.)
+}
+
+var fd_table: Vec<FileDescriptor> = Vec::new();
+
+pub fn syscall_init_fds() {
+    fd_table = Vec::new();
+    var i: i64 = 0;
+    while i < MAX_FDS {
+        fd_table.push(FileDescriptor { used: false, type: 0, data: 0 });
+        i = i + 1;
+    }
+
+    // Set up standard descriptors
+    var stdin: FileDescriptor = fd_table.get(0);
+    stdin.used = true; stdin.type = 0;
+    fd_table.set(0, stdin);
+
+    var stdout: FileDescriptor = fd_table.get(1);
+    stdout.used = true; stdout.type = 1;
+    fd_table.set(1, stdout);
+
+    var stderr: FileDescriptor = fd_table.get(2);
+    stderr.used = true; stderr.type = 2;
+    fd_table.set(2, stderr);
+}
+
+pub fn syscall_alloc_fd() -> i64 {
+    var i: i64 = 3;
+    while i < MAX_FDS {
+        var fd: FileDescriptor = fd_table.get(i);
+        if !fd.used {
+            fd.used = true;
+            fd_table.set(i, fd);
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn syscall_close_fd(fd: i64) -> i64 {
+    if fd < 0 || fd >= MAX_FDS { return -1; }
+    var entry: FileDescriptor = fd_table.get(fd);
+    if !entry.used { return -1; }
+    entry.used = false;
+    fd_table.set(fd, entry);
+    return 0;
+}

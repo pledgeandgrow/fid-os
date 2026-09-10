@@ -1,0 +1,692 @@
+// stdlib/kernel.fd — Bare-metal OS development helpers
+//
+// Provides structs and helper functions for:
+// - GDT (Global Descriptor Table) setup
+// - IDT (Interrupt Descriptor Table) setup
+// - Page table management (4-level paging)
+// - Serial port I/O (COM1)
+// - Interrupt control (cli/sti/hlt)
+//
+// These are thin wrappers around the p_* bare-metal builtins.
+// They only work in --bare or --boot mode (no OS, no stdlib).
+
+// ─── GDT (Global Descriptor Table) ─────────────────────────────────────────
+
+// GDT descriptor: 2-byte limit + 8-byte base address (10 bytes total)
+struct GdtDescriptor {
+    limit: i16,
+    base: i64,
+}
+
+// GDT entry flags (access byte)
+const GDT_CODE: i64 = 0x9A;       // Present | ring 0 | code | executable | readable
+const GDT_DATA: i64 = 0x92;       // Present | ring 0 | data | writable
+const GDT_TSS:  i64 = 0x89;       // Present | ring 0 | TSS
+
+// GDT entry flags (granularity byte, shifted left 8)
+const GDT_GRAN_4K: i64 = 0x0C00;  // 4KB granularity, 32-bit protected mode
+
+// Initialize a flat GDT with null + code + data segments.
+// gdt_ptr: pointer to a 24-byte buffer (3 entries x 8 bytes)
+pub fn gdt_init_flat(gdt_ptr: i64) {
+    // Entry 0: null descriptor
+    p_gdt_set_entry(gdt_ptr, 0, 0, 0, 0);
+    // Entry 1: kernel code segment (base=0, limit=0xFFFFF, flags=0x9A | 0x0C00)
+    p_gdt_set_entry(gdt_ptr, 1, 0, 0xFFFFF, GDT_CODE | GDT_GRAN_4K);
+    // Entry 2: kernel data segment (base=0, limit=0xFFFFF, flags=0x92 | 0x0C00)
+    p_gdt_set_entry(gdt_ptr, 2, 0, 0xFFFFF, GDT_DATA | GDT_GRAN_4K);
+}
+
+// GDT/IDT descriptor register format (10 bytes):
+//   bytes 0-1: limit (u16) — size of table minus 1
+//   bytes 2-9: base  (u64) — linear address of table
+// We build this descriptor in a buffer and pass its address to lgdt/lidt.
+
+// Load the GDT and reload segment registers.
+// gdt_ptr: pointer to GDT entries, num_entries: number of entries
+// desc_ptr: pointer to a 10-byte buffer for the GDTR descriptor
+pub fn gdt_load(gdt_ptr: i64, num_entries: i64, desc_ptr: i64) {
+    // Build the 10-byte GDTR descriptor: [limit: u16][base: u64]
+    val limit = num_entries * 8 - 1;
+    // Write limit (2 bytes, little-endian)
+    p_phys_write8(desc_ptr, limit & 0xFF);
+    p_phys_write8(desc_ptr + 1, (limit >> 8) & 0xFF);
+    // Write base (8 bytes, little-endian)
+    p_phys_write8(desc_ptr + 2, gdt_ptr & 0xFF);
+    p_phys_write8(desc_ptr + 3, (gdt_ptr >> 8) & 0xFF);
+    p_phys_write8(desc_ptr + 4, (gdt_ptr >> 16) & 0xFF);
+    p_phys_write8(desc_ptr + 5, (gdt_ptr >> 24) & 0xFF);
+    p_phys_write8(desc_ptr + 6, (gdt_ptr >> 32) & 0xFF);
+    p_phys_write8(desc_ptr + 7, (gdt_ptr >> 40) & 0xFF);
+    p_phys_write8(desc_ptr + 8, (gdt_ptr >> 48) & 0xFF);
+    p_phys_write8(desc_ptr + 9, (gdt_ptr >> 56) & 0xFF);
+    // Load GDT register from the descriptor
+    asm!("lgdt [rax]",
+        in("rax") desc_ptr,
+    );
+    // Reload data segment registers with selector 0x10 (entry 2 = data)
+    asm!("mov ax, 0x10");
+    asm!("mov ds, ax");
+    asm!("mov es, ax");
+    asm!("mov fs, ax");
+    asm!("mov gs, ax");
+    asm!("mov ss, ax");
+    // Far jump to reload CS with selector 0x08 (entry 1 = code)
+    // Use a far return: push 0x08, push return_addr, retfq
+    // This is the standard technique when direct far jumps aren't available
+    asm!("push 0x08");
+    asm!("lea rax, [rip + 1f]");
+    asm!("push rax");
+    asm!("retfq");
+    asm!("1:");
+}
+
+// ─── IDT (Interrupt Descriptor Table) ──────────────────────────────────────
+
+// IDT descriptor: 2-byte limit + 8-byte base address (10 bytes total)
+struct IdtDescriptor {
+    limit: i16,
+    base: i64,
+}
+
+// IDT entry flags
+const IDT_PRESENT: i64 = 0x80;    // Present bit
+const IDT_INTERRUPT: i64 = 0x0E;  // Interrupt gate
+const IDT_TRAP: i64 = 0x0F;       // Trap gate
+
+// Set an interrupt handler for a given vector.
+// idt_ptr: pointer to IDT entries (256 entries x 16 bytes = 4096 bytes)
+// vector: interrupt vector number (0-255)
+// handler: address of the interrupt handler function
+pub fn idt_set_handler(idt_ptr: i64, vector: i64, handler: i64) {
+    p_idt_set_entry(idt_ptr, vector, handler, IDT_PRESENT | IDT_INTERRUPT);
+}
+
+// Load the IDT.
+// idt_ptr: pointer to IDT entries, num_entries: number of entries
+// desc_ptr: pointer to a 10-byte buffer for the IDTR descriptor
+pub fn idt_load(idt_ptr: i64, num_entries: i64, desc_ptr: i64) {
+    val limit = num_entries * 16 - 1;
+    // Build the 10-byte IDTR descriptor: [limit: u16][base: u64]
+    p_phys_write8(desc_ptr, limit & 0xFF);
+    p_phys_write8(desc_ptr + 1, (limit >> 8) & 0xFF);
+    p_phys_write8(desc_ptr + 2, idt_ptr & 0xFF);
+    p_phys_write8(desc_ptr + 3, (idt_ptr >> 8) & 0xFF);
+    p_phys_write8(desc_ptr + 4, (idt_ptr >> 16) & 0xFF);
+    p_phys_write8(desc_ptr + 5, (idt_ptr >> 24) & 0xFF);
+    p_phys_write8(desc_ptr + 6, (idt_ptr >> 32) & 0xFF);
+    p_phys_write8(desc_ptr + 7, (idt_ptr >> 40) & 0xFF);
+    p_phys_write8(desc_ptr + 8, (idt_ptr >> 48) & 0xFF);
+    p_phys_write8(desc_ptr + 9, (idt_ptr >> 56) & 0xFF);
+    // Load IDT register from the descriptor
+    asm!("lidt [rax]",
+        in("rax") desc_ptr,
+    );
+}
+
+// ─── Paging (4-level page tables) ──────────────────────────────────────────
+
+// Page table entry flags
+const PAGE_PRESENT: i64 = 1;      // Present bit
+const PAGE_WRITABLE: i64 = 2;     // Read/write
+const PAGE_USER: i64 = 4;         // User-accessible
+const PAGE_WRITE_THROUGH: i64 = 8; // Write-through caching
+const PAGE_CACHE_DISABLE: i64 = 16; // Cache disabled
+const PAGE_ACCESSED: i64 = 32;    // Accessed
+const PAGE_DIRTY: i64 = 64;       // Dirty
+const PAGE_HUGE: i64 = 128;       // Huge page (2MB at PD level)
+const PAGE_GLOBAL: i64 = 256;     // Global page
+const PAGE_NX: i64 = 0x8000000000000000; // No-execute (bit 63)
+
+// Default kernel page flags: present + writable
+const PAGE_KERNEL: i64 = PAGE_PRESENT | PAGE_WRITABLE;
+
+// Map a virtual page to a physical page.
+// pml4: PML4 table base address (must be 4KB-aligned)
+// virt: virtual address to map (will be page-aligned)
+// phys: physical address to map to (will be page-aligned)
+pub fn page_map(pml4: i64, virt: i64, phys: i64) {
+    p_page_map(pml4, virt, phys, PAGE_KERNEL);
+}
+
+// Map a virtual page with custom flags.
+pub fn page_map_flags(pml4: i64, virt: i64, phys: i64, flags: i64) {
+    p_page_map(pml4, virt, phys, flags);
+}
+
+// Unmap a virtual page.
+pub fn page_unmap(pml4: i64, virt: i64) {
+    p_page_unmap(pml4, virt);
+}
+
+// Identity-map a range of pages (virt == phys).
+// pml4: PML4 base, start: starting address, num_pages: number of 4KB pages
+pub fn page_identity_map_range(pml4: i64, start: i64, num_pages: i64) {
+    var i = 0;
+    while i < num_pages {
+        val addr = start + i * 4096;
+        p_page_map(pml4, addr, addr, PAGE_KERNEL);
+        i += 1;
+    }
+}
+
+// ─── Serial Port (COM1) ────────────────────────────────────────────────────
+
+const COM1_PORT: i64 = 0x3F8;
+
+// Initialize COM1 serial port (115200 baud, 8N1)
+pub fn serial_init() {
+    p_serial_init();
+}
+
+// Write a single byte to COM1
+pub fn serial_putc(c: i64) {
+    p_serial_write(c);
+}
+
+// Write a null-terminated string to COM1
+// str_ptr: pointer to string data (null-terminated)
+pub fn serial_puts(str_ptr: i64) {
+    var ptr = str_ptr;
+    while true {
+        val c = p_phys_read64(ptr);
+        if c == 0 {
+            break;
+        }
+        p_serial_write(c & 0xFF);
+        ptr += 1;
+    }
+}
+
+// Write a string to COM1 (Fides string type)
+pub fn serial_print(s: str) {
+    var i = 0;
+    val len = p_str_length(s);
+    while i < len {
+        val c = p_str_byte_at(s, i);
+        p_serial_write(c);
+        i += 1;
+    }
+}
+
+// Write an integer as decimal to COM1
+pub fn serial_print_int(n: i64) {
+    if n == 0 {
+        p_serial_write(48); // '0'
+        return;
+    }
+    var num = n;
+    if num < 0 {
+        p_serial_write(45); // '-'
+        num = -num;
+    }
+    // Extract digits in reverse
+    var digits = Vec::new();
+    while num > 0 {
+        digits.push(num % 10 + 48); // '0' = 48
+        num = num / 10;
+    }
+    // Print in correct order
+    var i = digits.len() - 1;
+    while i >= 0 {
+        p_serial_write(digits.get(i));
+        i -= 1;
+    }
+}
+
+// Check if serial data is available to read
+pub fn serial_available() -> bool {
+    return p_serial_ready() != 0;
+}
+
+// Read a byte from COM1 (blocks until data available)
+pub fn serial_getc() -> i64 {
+    return p_serial_read();
+}
+
+// ─── Interrupt Control ─────────────────────────────────────────────────────
+
+// Disable interrupts
+pub fn cli() {
+    p_cli();
+}
+
+// Enable interrupts
+pub fn sti() {
+    p_sti();
+}
+
+// Halt the CPU (wait for next interrupt)
+pub fn hlt() {
+    p_hlt();
+}
+
+// Halt and catch fire — infinite loop with hlt
+pub fn halt_forever() {
+    while true {
+        p_hlt();
+    }
+}
+
+// ─── I/O Port Access ───────────────────────────────────────────────────────
+
+// Read a byte from an I/O port
+pub fn inb(port: i64) -> i64 {
+    return p_inb(port);
+}
+
+// Write a byte to an I/O port
+pub fn outb(port: i64, val: i64) {
+    p_outb(port, val);
+}
+
+// ─── Physical Memory Access ────────────────────────────────────────────────
+
+// Read 1 byte from a physical address (uses read-modify-write on 64-bit builtin)
+pub fn phys_read8(addr: i64) -> i64 {
+    // Read the 8-byte aligned qword, extract the byte
+    val aligned = addr & ~7;
+    val byte_offset = addr & 7;
+    val qword = p_phys_read64(aligned);
+    return (qword >> (byte_offset * 8)) & 0xFF;
+}
+
+// Read 8 bytes from a physical address
+pub fn phys_read64(addr: i64) -> i64 {
+    return p_phys_read64(addr);
+}
+
+// Write 1 byte to a physical address (read-modify-write on 64-bit builtin)
+pub fn phys_write8(addr: i64, val: i64) {
+    val aligned = addr & ~7;
+    val byte_offset = addr & 7;
+    val shift = byte_offset * 8;
+    // Read existing qword, clear the byte, set new value
+    val old = p_phys_read64(aligned);
+    val mask = ~(0xFF << shift);
+    val new_val = (old & mask) | ((val & 0xFF) << shift);
+    p_phys_write64(aligned, new_val);
+}
+
+// Write 8 bytes to a physical address
+pub fn phys_write64(addr: i64, val: i64) {
+    p_phys_write64(addr, val);
+}
+
+// ─── CPU Register Access ───────────────────────────────────────────────────
+
+pub fn cr0_read() -> i64 { return p_cr0_read(); }
+pub fn cr0_write(val: i64) { p_cr0_write(val); }
+pub fn cr3_read() -> i64 { return p_cr3_read(); }
+pub fn cr3_write(val: i64) { p_cr3_write(val); }
+pub fn cr4_read() -> i64 { return p_cr4_read(); }
+pub fn cr4_write(val: i64) { p_cr4_write(val); }
+pub fn invlpg(addr: i64) { p_invlpg(addr); }
+
+// ─── TSS (Task State Segment) ──────────────────────────────────────────────
+
+// TSS structure for x86-64 (104 bytes minimum)
+// The 64-bit TSS is used for ring 0 stack pointers (RSP0), IST, and I/O bitmap.
+struct Tss {
+    reserved0: i32,       // 0-3: reserved
+    rsp0: i64,            // 4-11: RSP for ring 0
+    rsp1: i64,            // 12-19: RSP for ring 1
+    rsp2: i64,            // 20-27: RSP for ring 2
+    reserved1: i32,       // 28-31: reserved
+    ist1: i64,            // 32-39: IST 1
+    ist2: i64,            // 40-47: IST 2
+    ist3: i64,            // 48-55: IST 3
+    ist4: i64,            // 56-63: IST 4
+    ist5: i64,            // 64-71: IST 5
+    ist6: i64,            // 72-79: IST 6
+    ist7: i64,            // 80-87: IST 7
+    reserved2: i64,       // 88-95: reserved
+    reserved3: i16,       // 96-97: reserved
+    iomap_base: i16,      // 98-99: I/O map base
+}
+
+// Initialize a TSS with zeroed fields and set RSP0.
+// tss_ptr: pointer to a Tss struct (at least 104 bytes)
+// rsp0: kernel stack pointer for ring 0
+pub fn tss_init(tss_ptr: i64, rsp0: i64) {
+    // Zero the TSS (104 bytes = 13 * 8)
+    var i = 0;
+    while i < 13 {
+        p_phys_write64(tss_ptr + i * 8, 0);
+        i += 1;
+    }
+    // Set RSP0 at offset 4
+    p_phys_write64(tss_ptr + 4, rsp0);
+}
+
+// Load a TSS into the Task Register.
+// selector: GDT selector for the TSS entry (e.g., 0x18 for entry 3)
+pub fn tss_load(selector: i64) {
+    asm!("ltr ax",
+        in("ax") selector,
+    );
+}
+
+// Add a TSS entry to the GDT.
+// gdt_ptr: pointer to GDT entries
+// index: GDT entry index for the TSS (e.g., 3)
+// tss_ptr: pointer to the TSS struct
+pub fn gdt_set_tss(gdt_ptr: i64, index: i64, tss_ptr: i64) {
+    // TSS descriptor in 64-bit mode: 16 bytes (two GDT entries)
+    // Base = tss_ptr, Limit = 103 (104 bytes - 1)
+    // Access = 0x89 (Present | TSS available)
+    // Flags = 0x0 (byte granularity)
+    val entry = gdt_ptr + index * 8;
+    val limit = 103;
+    // Entry 1 (lower 8 bytes):
+    //   [limit_low:16][base_low:24][access:8][flags+limit_high:8][base_mid:8]
+    p_phys_write8(entry, limit & 0xFF);
+    p_phys_write8(entry + 1, (limit >> 8) & 0xFF);
+    p_phys_write8(entry + 2, tss_ptr & 0xFF);
+    p_phys_write8(entry + 3, (tss_ptr >> 8) & 0xFF);
+    p_phys_write8(entry + 4, (tss_ptr >> 16) & 0xFF);
+    p_phys_write8(entry + 5, 0x89); // Present | TSS available
+    p_phys_write8(entry + 6, ((limit >> 16) & 0x0F) | 0x00); // flags=0, limit high
+    p_phys_write8(entry + 7, (tss_ptr >> 24) & 0xFF);
+    // Entry 2 (upper 8 bytes): base high 32 bits + reserved
+    p_phys_write8(entry + 8, (tss_ptr >> 32) & 0xFF);
+    p_phys_write8(entry + 9, (tss_ptr >> 40) & 0xFF);
+    p_phys_write8(entry + 10, (tss_ptr >> 48) & 0xFF);
+    p_phys_write8(entry + 11, (tss_ptr >> 56) & 0xFF);
+    p_phys_write8(entry + 12, 0);
+    p_phys_write8(entry + 13, 0);
+    p_phys_write8(entry + 14, 0);
+    p_phys_write8(entry + 15, 0);
+}
+
+// ─── CPUID ──────────────────────────────────────────────────────────────────
+
+// CPUID result: all four registers
+struct CpuidResult {
+    eax: i64,
+    ebx: i64,
+    ecx: i64,
+    edx: i64,
+}
+
+// Execute CPUID.
+// leaf: EAX input. Returns EAX/EBX/ECX/EDX in a struct.
+pub fn cpuid(leaf: i64) -> CpuidResult {
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var c: i64 = 0;
+    var d: i64 = 0;
+    asm!("cpuid",
+        in("eax") leaf,
+        out("eax") a,
+        out("ebx") b,
+        out("ecx") c,
+        out("edx") d,
+    );
+    return CpuidResult { eax: a, ebx: b, ecx: c, edx: d };
+}
+
+// CPUID with subleaf (ECX input).
+pub fn cpuid_subleaf(leaf: i64, subleaf: i64) -> CpuidResult {
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var c: i64 = 0;
+    var d: i64 = 0;
+    asm!("cpuid",
+        in("eax") leaf,
+        in("ecx") subleaf,
+        out("eax") a,
+        out("ebx") b,
+        out("ecx") c,
+        out("edx") d,
+    );
+    return CpuidResult { eax: a, ebx: b, ecx: c, edx: d };
+}
+
+// Get CPU vendor string (12 bytes, from CPUID leaf 0).
+// buf: pointer to a 13-byte buffer (12 chars + null)
+pub fn cpu_vendor(buf: i64) {
+    val r = cpuid(0);
+    // EBX, EDX, ECX contain the vendor string
+    p_phys_write64(buf, r.ebx);
+    p_phys_write64(buf + 4, r.edx & 0xFFFFFFFF | (r.ecx << 32));
+    p_phys_write8(buf + 12, 0);
+}
+
+// Check if CPU supports RDTSCP (CPUID leaf 0x80000001, EDX bit 27)
+pub fn cpu_has_rdtscp() -> bool {
+    val r = cpuid(0x80000001);
+    return (r.edx & (1 << 27)) != 0;
+}
+
+// ─── MSR (Model-Specific Registers) ─────────────────────────────────────────
+
+// Common MSR addresses
+const MSR_EFER: i64 = 0xC0000080;          // Extended Feature Enable Register
+const MSR_STAR: i64 = 0xC0000081;          // Syscall target segment
+const MSR_LSTAR: i64 = 0xC0000082;         // Syscall entry point
+const MSR_SFMASK: i64 = 0xC0000084;        // Syscall RFLAGS mask
+const MSR_KERNEL_GS_BASE: i64 = 0xC0000102; // Kernel GS base
+const MSR_FS_BASE: i64 = 0xC0000100;       // FS base
+
+// Read an MSR.
+pub fn msr_read(addr: i64) -> i64 {
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    asm!("rdmsr",
+        in("ecx") addr,
+        out("eax") lo,
+        out("edx") hi,
+    );
+    return lo | (hi << 32);
+}
+
+// Write an MSR.
+pub fn msr_write(addr: i64, val: i64) {
+    asm!("wrmsr",
+        in("ecx") addr,
+        in("eax") val & 0xFFFFFFFF,
+        in("edx") val >> 32,
+    );
+}
+
+// ─── Syscall Setup ──────────────────────────────────────────────────────────
+
+// Initialize syscall/sysret for x86-64.
+// entry: address of the syscall handler function.
+// kernel_cs: kernel code segment selector (e.g., 0x08)
+// kernel_ss: kernel stack segment selector (e.g., 0x10)
+pub fn syscall_init(entry: i64, kernel_cs: i64, kernel_ss: i64) {
+    // Enable SYSCALL in EFER (bit 0 = SCE)
+    val efer = msr_read(MSR_EFER);
+    msr_write(MSR_EFER, efer | 1);
+
+    // STAR: [63:48] = SYSRET CS, [47:32] = SYSCALL CS
+    // SYSCALL CS = kernel_cs, SYSRET CS = kernel_cs + 16 (user code)
+    // The SS is implicitly CS + 8.
+    val star = (kernel_cs << 32) | ((kernel_cs + 16) << 48);
+    msr_write(MSR_STAR, star);
+
+    // LSTAR: syscall entry point
+    msr_write(MSR_LSTAR, entry);
+
+    // SFMASK: mask RFLAGS on syscall entry (mask IF to disable interrupts)
+    // Bit 9 = IF (interrupt flag), bit 8 = TF (trap flag)
+    msr_write(MSR_SFMASK, (1 << 9) | (1 << 8));
+}
+
+// ─── Context Switching ──────────────────────────────────────────────────────
+
+// Saved CPU state for a thread (callee-saved registers).
+// We save/restore: RSP, RBX, RBP, R12, R13, R14, R15, RIP
+struct ThreadContext {
+    rsp: i64,
+    rbx: i64,
+    rbp: i64,
+    r12: i64,
+    r13: i64,
+    r14: i64,
+    r15: i64,
+    rip: i64,
+}
+
+// Save current context into old_ctx and switch to new_ctx.
+// This uses inline asm to save callee-saved registers and swap stacks.
+// old_ctx: pointer to store the current context
+// new_ctx: pointer to the context to switch to
+pub fn switch_context(old_ctx: i64, new_ctx: i64) {
+    // We need to save RIP (return address) and RSP, plus callee-saved regs.
+    // The standard approach: push regs, save RSP to old_ctx, load RSP from
+    // new_ctx, pop regs, ret (which pops RIP from the new stack).
+    //
+    // Since we can't do arbitrary label-based control flow in inline asm,
+    // we use a helper that:
+    // 1. Saves callee-saved regs to old_ctx
+    // 2. Loads RSP from new_ctx
+    // 3. Restores callee-saved regs from new_ctx
+    // 4. Returns (pops RIP from new stack)
+
+    // Save callee-saved registers to old context
+    asm!("mov [rax], rsp",
+        in("rax") old_ctx,
+    );
+    asm!("mov [rax + 8], rbx",
+        in("rax") old_ctx,
+    );
+    asm!("mov [rax + 16], rbp",
+        in("rax") old_ctx,
+    );
+    asm!("mov [rax + 24], r12",
+        in("rax") old_ctx,
+    );
+    asm!("mov [rax + 32], r13",
+        in("rax") old_ctx,
+    );
+    asm!("mov [rax + 40], r14",
+        in("rax") old_ctx,
+    );
+    asm!("mov [rax + 48], r15",
+        in("rax") old_ctx,
+    );
+    // Save return address (RIP) — it's on the stack
+    asm!("mov rdx, [rsp]");
+    asm!("mov [rax + 56], rdx",
+        in("rax") old_ctx,
+    );
+
+    // Load new RSP
+    asm!("mov rsp, [rax]",
+        in("rax") new_ctx,
+    );
+    // Restore callee-saved registers
+    asm!("mov rbx, [rax + 8]",
+        in("rax") new_ctx,
+    );
+    asm!("mov rbp, [rax + 16]",
+        in("rax") new_ctx,
+    );
+    asm!("mov r12, [rax + 24]",
+        in("rax") new_ctx,
+    );
+    asm!("mov r13, [rax + 32]",
+        in("rax") new_ctx,
+    );
+    asm!("mov r14, [rax + 40]",
+        in("rax") new_ctx,
+    );
+    asm!("mov r15, [rax + 48]",
+        in("rax") new_ctx,
+    );
+    // Push new RIP onto stack and return to it
+    asm!("mov rdx, [rax + 56]",
+        in("rax") new_ctx,
+    );
+    asm!("push rdx");
+    asm!("ret");
+}
+
+// ─── Wider I/O Port Access ──────────────────────────────────────────────────
+
+// Read a 16-bit word from an I/O port
+pub fn inw(port: i64) -> i64 {
+    var v: i64 = 0;
+    asm!("in ax, dx",
+        in("dx") port,
+        out("ax") v,
+    );
+    return v;
+}
+
+// Write a 16-bit word to an I/O port
+pub fn outw(port: i64, val: i64) {
+    asm!("out dx, ax",
+        in("dx") port,
+        in("ax") val,
+    );
+}
+
+// Read a 32-bit dword from an I/O port
+pub fn inl(port: i64) -> i64 {
+    var v: i64 = 0;
+    asm!("in eax, dx",
+        in("dx") port,
+        out("eax") v,
+    );
+    return v;
+}
+
+// Write a 32-bit dword to an I/O port
+pub fn outl(port: i64, val: i64) {
+    asm!("out dx, eax",
+        in("dx") port,
+        in("eax") val,
+    );
+}
+
+// ─── Memory Fences ──────────────────────────────────────────────────────────
+
+pub fn mfence() {
+    asm!("mfence");
+}
+
+pub fn lfence() {
+    asm!("lfence");
+}
+
+pub fn sfence() {
+    asm!("sfence");
+}
+
+// ─── Timestamp Counter ─────────────────────────────────────────────────────
+
+// Read the timestamp counter (RDTSC)
+pub fn rdtsc() -> i64 {
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    asm!("rdtsc",
+        out("eax") lo,
+        out("edx") hi,
+    );
+    return lo | (hi << 32);
+}
+
+// ─── Cache Control ──────────────────────────────────────────────────────────
+
+// Write back and invalidate all caches
+pub fn wbinvd() {
+    asm!("wbinvd");
+}
+
+// ─── Interrupt Control (additional) ──────────────────────────────────────────
+
+// Generate a software interrupt
+pub fn int_n(n: i64) {
+    asm!("int 0x00",
+        in("al") n,
+    );
+}
+
+// Return from interrupt (IRETQ in 64-bit mode)
+pub fn iretq() {
+    asm!("iretq");
+}

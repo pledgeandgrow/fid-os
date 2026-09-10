@@ -1,0 +1,52 @@
+// kernel/minimal.fd — Minimal bootable Fides OS kernel
+//
+// This is the simplest kernel that boots and produces output.
+// The compiler's --boot mode generates the multiboot2 header and entry point.
+// We just need a main() function.
+//
+// Output: "Hello from Fides OS!" on COM1 serial port
+
+module minimal;
+
+// ─── Serial I/O ──────────────────────────────────────────────────────────
+
+// Write one character to COM1 serial port
+fn serial_putc(c: i64) -> void {
+    var ready: i64 = 0;
+    while ready == 0 {
+        ready = p_inb(0x3FD) & 0x20;
+    }
+    p_outb(0x3F8, c);
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────
+
+pub fn main() -> void {
+    // Print "Hello from Fides OS!\n" via COM1 serial
+    serial_putc(72);   // H
+    serial_putc(101);  // e
+    serial_putc(108);  // l
+    serial_putc(108);  // l
+    serial_putc(111);  // o
+    serial_putc(32);   // (space)
+    serial_putc(102);  // f
+    serial_putc(114);  // r
+    serial_putc(111);  // o
+    serial_putc(109);  // m
+    serial_putc(32);   // (space)
+    serial_putc(70);   // F
+    serial_putc(105);  // i
+    serial_putc(100);  // d
+    serial_putc(101);  // e
+    serial_putc(115);  // s
+    serial_putc(32);   // (space)
+    serial_putc(79);   // O
+    serial_putc(83);   // S
+    serial_putc(33);   // !
+    serial_putc(10);   // \n
+
+    // Halt forever
+    while true {
+        p_hlt();
+    }
+}

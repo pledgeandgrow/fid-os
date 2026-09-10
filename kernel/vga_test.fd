@@ -1,0 +1,24 @@
+// vga_test.fd — Test multi-module boot mode
+// Imports vga_helper.fd and calls its functions
+
+use vga_helper;
+
+pub fn main() -> void {
+    p_serial_init();
+    // Write "OK" to serial to prove we booted
+    p_serial_write(79);   // O
+    p_serial_write(75);   // K
+    p_serial_write(10);   // newline
+    // Now test VGA via imported module
+    vga_clear();
+    vga_putc(72);  // H
+    vga_putc(73);  // I
+    vga_putc(10);  // newline
+    // Write "DONE" to serial
+    p_serial_write(68);   // D
+    p_serial_write(79);   // O
+    p_serial_write(78);   // N
+    p_serial_write(69);   // E
+    p_serial_write(10);   // newline
+    while true { p_hlt(); }
+}

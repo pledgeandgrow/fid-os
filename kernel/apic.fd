@@ -1,0 +1,327 @@
+// stdlib/apic.fd — Local APIC (LAPIC) support for x86-64 bare-metal OS
+//
+// Provides functions for:
+// - LAPIC base address detection and enable/disable via IA32_APIC_BASE MSR
+// - MMIO register read/write (at physical 0xFEE00000)
+// - End-Of-Interrupt (EOI) signalling
+// - APIC ID and version retrieval
+// - Spurious vector configuration
+// - LAPIC timer (one-shot and periodic modes)
+// - Inter-Processor Interrupts (IPI) and SMP boot (INIT/SIPI)
+// - LVT entry mask/unmask
+// - Error status reset and task priority control
+//
+// These are thin wrappers around the p_* bare-metal builtins and inline asm.
+// They only work in --bare or --boot mode (no OS, no stdlib).
+
+// ─── LAPIC Register Offsets (MMIO at physical 0xFEE00000) ─────────────────────
+
+const APIC_ID:             i64 = 0x020;  // Local APIC ID register
+const APIC_VERSION:        i64 = 0x030;  // Local APIC version register
+const TASK_PRIORITY:       i64 = 0x080;  // Task priority register (TPR)
+const ERROR_STATUS:         i64 = 0x280;  // Error status register
+const LVT_TIMER:           i64 = 0x320;  // LVT timer entry
+const LVT_LINT0:            i64 = 0x350;  // LVT LINT0 entry
+const LVT_LINT1:            i64 = 0x360;  // LVT LINT1 entry
+const LVT_ERROR:            i64 = 0x370;  // LVT error entry
+const TIMER_INITIAL:        i64 = 0x380;  // Timer initial count
+const TIMER_CURRENT:        i64 = 0x390;  // Timer current count
+const TIMER_DIVIDE:         i64 = 0x3E0;  // Timer divide configuration
+const EOI:                  i64 = 0x0B0;  // End-Of-Interrupt register
+const SPURIOUS_VECTOR:      i64 = 0x0F0;  // Spurious interrupt vector register
+const ICR_LOW:              i64 = 0x300;  // Interrupt Command Register (low)
+const ICR_HIGH:             i64 = 0x310;  // Interrupt Command Register (high)
+const DFR:                  i64 = 0x0E0;  // Destination Format Register
+const LDR:                  i64 = 0x0D0;  // Logical Destination Register
+
+// ─── IA32_APIC_BASE MSR Constants ───────────────────────────────────────────
+
+const APIC_BASE_MSR:        i64 = 0x1B;   // IA32_APIC_BASE MSR address
+const APIC_BASE_ENABLE:     i64 = 1 << 11; // Bit 11: APIC global enable
+const APIC_BASE_X2APIC:     i64 = 1 << 10; // Bit 10: x2APIC enable
+const APIC_BASE_BSP:        i64 = 1 << 8;  // Bit 8:  BSP flag (read-only)
+const APIC_BASE_ADDR_MASK:  i64 = 0xFFFFF000; // Bits 12-35: MMIO base address mask
+
+// Spurious vector register bit 8: APIC software enable
+const SPURIOUS_ENABLE:      i64 = 1 << 8;
+
+// ─── Timer Mode Constants ──────────────────────────────────────────────────
+
+const TIMER_ONE_SHOT:       i64 = 0;       // One-shot timer mode
+const TIMER_PERIODIC:       i64 = 1 << 17; // Periodic timer mode (bit 17)
+
+// Timer divide configuration values (bits 0-3 of TIMER_DIVIDE)
+const TIMER_DIVIDE_1:       i64 = 0x0B;    // Divide by 1
+const TIMER_DIVIDE_2:       i64 = 0x00;    // Divide by 2
+const TIMER_DIVIDE_4:       i64 = 0x01;    // Divide by 4
+const TIMER_DIVIDE_8:       i64 = 0x02;    // Divide by 8
+const TIMER_DIVIDE_16:      i64 = 0x03;    // Divide by 16
+const TIMER_DIVIDE_32:      i64 = 0x08;    // Divide by 32
+const TIMER_DIVIDE_64:      i64 = 0x09;    // Divide by 64
+const TIMER_DIVIDE_128:     i64 = 0x0A;    // Divide by 128
+
+// ─── LVT Constants ──────────────────────────────────────────────────────────
+
+const LVT_MASK:             i64 = 1 << 16; // LVT mask bit (bit 16)
+
+// ─── ICR (Interrupt Command Register) Constants ────────────────────────────
+
+const ICR_DELIVERY_FIXED:   i64 = 0x00000; // Fixed delivery mode
+const ICR_DELIVERY_INIT:    i64 = 0x05000; // INIT delivery mode
+const ICR_DELIVERY_STARTUP: i64 = 0x06000; // Startup (SIPI) delivery mode
+const ICR_LEVEL_ASSERT:     i64 = 1 << 14; // Assert level
+const ICR_DEST_PHYSICAL:    i64 = 0x00000; // Physical destination mode
+const ICR_DEST_LOGICAL:     i64 = 1 << 11; // Logical destination mode
+const ICR_STATUS_PENDING:   i64 = 1 << 12; // Delivery status pending bit
+
+// ─── MSR Access ──────────────────────────────────────────────────────────────
+
+// Read IA32_APIC_BASE MSR (0x1B).
+// Returns the full 64-bit MSR value.
+// Bits 12-35 contain the MMIO base address; bit 11 is APIC enable;
+// bit 10 is x2APIC enable; bit 8 is the BSP flag.
+pub fn apic_base_msr_read() -> i64 {
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    asm!("rdmsr",
+        in("ecx") APIC_BASE_MSR,
+        out("eax") lo,
+        out("edx") hi,
+    );
+    return lo | (hi << 32);
+}
+
+// Write IA32_APIC_BASE MSR (0x1B).
+// val: the full 64-bit value to write.
+pub fn apic_base_msr_write(val: i64) {
+    asm!("wrmsr",
+        in("ecx") APIC_BASE_MSR,
+        in("eax") val & 0xFFFFFFFF,
+        in("edx") val >> 32,
+    );
+}
+
+// ─── LAPIC Base Address ─────────────────────────────────────────────────────
+
+// Extract the MMIO base address from IA32_APIC_BASE MSR.
+// The base address is in bits 12-35, masked to a page-aligned physical address.
+// Returns the physical address of the LAPIC register block (default 0xFEE00000).
+pub fn apic_get_base() -> i64 {
+    val msr = apic_base_msr_read();
+    return msr & APIC_BASE_ADDR_MASK;
+}
+
+// ─── APIC Enable/Disable ────────────────────────────────────────────────────
+
+// Enable the Local APIC.
+// Sets the APIC enable bit in IA32_APIC_BASE MSR (bit 11) and the spurious
+// vector register's APIC software enable bit (bit 8). The spurious vector
+// itself is preserved; only the enable bit is set.
+pub fn apic_enable() {
+    // Enable APIC in the MSR (bit 11)
+    val msr = apic_base_msr_read();
+    apic_base_msr_write(msr | APIC_BASE_ENABLE);
+    // Enable APIC in the spurious vector register (bit 8)
+    val spur = apic_read(SPURIOUS_VECTOR);
+    apic_write(SPURIOUS_VECTOR, spur | SPURIOUS_ENABLE);
+}
+
+// Disable the Local APIC.
+// Clears the APIC enable bit in IA32_APIC_BASE MSR (bit 11) and the spurious
+// vector register's software enable bit (bit 8).
+pub fn apic_disable() {
+    // Disable APIC in the spurious vector register (clear bit 8)
+    val spur = apic_read(SPURIOUS_VECTOR);
+    apic_write(SPURIOUS_VECTOR, spur & ~SPURIOUS_ENABLE);
+    // Disable APIC in the MSR (clear bit 11)
+    val msr = apic_base_msr_read();
+    apic_base_msr_write(msr & ~APIC_BASE_ENABLE);
+}
+
+// ─── MMIO Register Access ───────────────────────────────────────────────────
+
+// Read a 32-bit LAPIC register via MMIO.
+// offset: register offset from the LAPIC base address (e.g., APIC_ID).
+// Returns the 32-bit register value (zero-extended to 64 bits).
+// Uses p_phys_read64 for volatile load — the LAPIC registers are 32-bit wide
+// but aligned on 16-byte boundaries, so a 64-bit read is safe.
+pub fn apic_read(offset: i64) -> i64 {
+    val base = apic_get_base();
+    return p_phys_read64(base + offset) & 0xFFFFFFFF;
+}
+
+// Write a 32-bit LAPIC register via MMIO.
+// offset: register offset from the LAPIC base address.
+// val: the 32-bit value to write.
+// Uses p_phys_write64 for volatile store.
+pub fn apic_write(offset: i64, val: i64) {
+    val base = apic_get_base();
+    p_phys_write64(base + offset, val & 0xFFFFFFFF);
+}
+
+// ─── End-Of-Interrupt ────────────────────────────────────────────────────────
+
+// Send End-Of-Interrupt (EOI) to the Local APIC.
+// This signals that the current interrupt has been fully handled.
+// Must be called by the interrupt handler before returning (IRETQ).
+pub fn apic_eoi() {
+    apic_write(EOI, 0);
+}
+
+// ─── APIC ID and Version ────────────────────────────────────────────────────
+
+// Get the Local APIC ID of this processor.
+// Returns the 8-bit APIC ID (bits 24-31 of the APIC_ID register).
+pub fn apic_id() -> i64 {
+    return (apic_read(APIC_ID) >> 24) & 0xFF;
+}
+
+// Get the Local APIC version.
+// Bits 0-7 contain the version number (e.g., 0x14 for modern APICs).
+// Bits 8-15 contain the maximum LVT entry count minus 1.
+pub fn apic_version() -> i64 {
+    return apic_read(APIC_VERSION) & 0xFF;
+}
+
+// ─── Spurious Vector ────────────────────────────────────────────────────────
+
+// Set the spurious interrupt vector number.
+// This also preserves the APIC enable bit (bit 8) if already set.
+// vector: spurious interrupt vector number (0-255).
+pub fn apic_set_spurious_vector(vector: i64) {
+    val cur = apic_read(SPURIOUS_VECTOR);
+    // Preserve the enable bit, replace the vector (bits 0-7)
+    apic_write(SPURIOUS_VECTOR, (cur & ~0xFF) | (vector & 0xFF) | SPURIOUS_ENABLE);
+}
+
+// ─── LAPIC Timer ───────────────────────────────────────────────────────────
+
+// Initialize the LAPIC timer with full configuration.
+// vector: interrupt vector number for the timer.
+// initial_count: initial countdown count.
+// divide: timer divide value (use TIMER_DIVIDE_* constants).
+// periodic: true for periodic mode, false for one-shot mode.
+pub fn apic_timer_init(vector: i64, initial_count: i64, divide: i64, periodic: bool) {
+    // Set the divide configuration first
+    apic_write(TIMER_DIVIDE, divide);
+    // Configure the LVT timer entry: vector + mode
+    val mode = TIMER_ONE_SHOT;
+    if periodic {
+        mode = TIMER_PERIODIC;
+    }
+    apic_write(LVT_TIMER, (vector & 0xFF) | mode);
+    // Set the initial count (starts the timer)
+    apic_write(TIMER_INITIAL, initial_count);
+}
+
+// Configure the LAPIC timer in one-shot mode.
+// vector: interrupt vector number for the timer.
+// count: initial countdown count.
+pub fn apic_timer_one_shot(vector: i64, count: i64) {
+    apic_timer_init(vector, count, TIMER_DIVIDE_1, false);
+}
+
+// Configure the LAPIC timer in periodic mode.
+// vector: interrupt vector number for the timer.
+// count: initial countdown count (reloaded each period).
+pub fn apic_timer_periodic(vector: i64, count: i64) {
+    apic_timer_init(vector, count, TIMER_DIVIDE_1, true);
+}
+
+// Stop the LAPIC timer by masking the LVT timer entry and zeroing the count.
+pub fn apic_timer_stop() {
+    // Mask the timer LVT entry
+    apic_write(LVT_TIMER, LVT_MASK);
+    // Zero the initial count
+    apic_write(TIMER_INITIAL, 0);
+}
+
+// ─── Inter-Processor Interrupts (IPI) ───────────────────────────────────────
+
+// Send an Inter-Processor Interrupt (IPI) to a target CPU.
+// target_cpu: destination APIC ID of the target CPU.
+// vector: interrupt vector number.
+// The ICR is written in two parts: high (destination) then low (command).
+// We wait for the delivery status to clear before sending.
+pub fn apic_send_ipi(target_cpu: i64, vector: i64) {
+    // Wait for any previous IPI to finish (delivery status bit 12 clear)
+    while (apic_read(ICR_LOW) & ICR_STATUS_PENDING) != 0 {
+        // Spin until not pending
+    }
+    // Set the destination APIC ID in ICR_HIGH (bits 24-31)
+    apic_write(ICR_HIGH, (target_cpu & 0xFF) << 24);
+    // Send the IPI: fixed delivery, physical destination, assert level
+    apic_write(ICR_LOW, ICR_DELIVERY_FIXED | ICR_LEVEL_ASSERT | (vector & 0xFF));
+}
+
+// Send an INIT IPI to a target CPU (used for SMP boot sequence).
+// target_cpu: destination APIC ID of the target CPU.
+// This asserts an INIT interrupt to bring the target CPU to a known state.
+pub fn apic_send_init(target_cpu: i64) {
+    // Wait for any previous IPI to finish
+    while (apic_read(ICR_LOW) & ICR_STATUS_PENDING) != 0 {
+        // Spin until not pending
+    }
+    // Set the destination APIC ID in ICR_HIGH (bits 24-31)
+    apic_write(ICR_HIGH, (target_cpu & 0xFF) << 24);
+    // Send INIT IPI: delivery mode INIT, assert level, physical destination
+    apic_write(ICR_LOW, ICR_DELIVERY_INIT | ICR_LEVEL_ASSERT | ICR_DEST_PHYSICAL);
+}
+
+// Send a Startup IPI (SIPI) to a target CPU (used for SMP boot sequence).
+// target_cpu: destination APIC ID of the target CPU.
+// page: physical page number of the trampoline code (e.g., 0x08 for 0x08000).
+// The target CPU starts executing at physical address (page << 12).
+pub fn apic_send_startup(target_cpu: i64, page: i64) {
+    // Wait for any previous IPI to finish
+    while (apic_read(ICR_LOW) & ICR_STATUS_PENDING) != 0 {
+        // Spin until not pending
+    }
+    // Set the destination APIC ID in ICR_HIGH (bits 24-31)
+    apic_write(ICR_HIGH, (target_cpu & 0xFF) << 24);
+    // Send SIPI: delivery mode Startup, vector field holds the page number
+    // The vector field (bits 0-7) contains bits 8-11 of the start address,
+    // i.e., the page number (physical address = vector << 12).
+    apic_write(ICR_LOW, ICR_DELIVERY_STARTUP | ICR_LEVEL_ASSERT | ICR_DEST_PHYSICAL | (page & 0xFF));
+}
+
+// ─── LVT Mask/Unmask ────────────────────────────────────────────────────────
+
+// Mask an LVT entry (disable interrupts from that source).
+// offset: LVT register offset (e.g., LVT_TIMER, LVT_LINT0, LVT_ERROR).
+// Sets bit 16 of the LVT entry to mask the interrupt.
+pub fn apic_lvt_mask(offset: i64) {
+    val cur = apic_read(offset);
+    apic_write(offset, cur | LVT_MASK);
+}
+
+// Unmask an LVT entry (enable interrupts from that source).
+// offset: LVT register offset (e.g., LVT_TIMER, LVT_LINT0, LVT_ERROR).
+// Clears bit 16 of the LVT entry to unmask the interrupt.
+pub fn apic_lvt_unmask(offset: i64) {
+    val cur = apic_read(offset);
+    apic_write(offset, cur & ~LVT_MASK);
+}
+
+// ─── Error Status ───────────────────────────────────────────────────────────
+
+// Reset the APIC error status.
+// The error status register is read-only; to clear it, first write to
+// the error status register, then read it back. The standard sequence is
+// to write to the LVT_ERROR register and then read the error status.
+pub fn apic_error_reset() {
+    // Clear the error status by writing to it (the register is cleared on write)
+    apic_write(ERROR_STATUS, 0);
+    // Read back to drain the error status
+    val _ = apic_read(ERROR_STATUS);
+}
+
+// ─── Task Priority ──────────────────────────────────────────────────────────
+
+// Set the task priority register (TPR).
+// prio: task priority value (bits 0-3 = sub-class, bits 4-7 = priority class).
+// The APIC will only deliver interrupts with a priority higher than the TPR.
+// Setting a high TPR value masks lower-priority interrupts.
+pub fn apic_set_task_priority(prio: i64) {
+    apic_write(TASK_PRIORITY, prio & 0xFF);
+}

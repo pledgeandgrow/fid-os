@@ -1,0 +1,553 @@
+// stdlib/kalloc.fd — Kernel-level memory allocator for bare-metal OS development
+//
+// Provides:
+// - Physical frame allocator (bitmap-based) for 4KB page management
+// - Kernel heap allocator (bump + free list) for kmalloc/kfree
+// - Page frame management helpers
+//
+// These only work in --bare or --boot mode (no OS, no stdlib).
+// Uses p_phys_read64/p_phys_write64 for physical memory access.
+// Uses p_phys_write8 for byte-level access when zeroing memory.
+//
+// Thread safety: NOT thread-safe. Use with interrupts disabled or a spinlock
+// in multi-processor configurations.
+
+module kalloc;
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+
+const PAGE_SIZE: i64 = 4096;
+const PAGE_SHIFT: i64 = 12;
+const FRAMES_PER_BITMAP_ENTRY: i64 = 64;  // 64-bit bitmap entries
+
+// Heap allocation constants
+// Minimum block size: 8 bytes (size header) + 8 bytes (next ptr when freed)
+const HEAP_MIN_BLOCK: i64 = 16;
+// Size of the allocation header (stores block size as i64)
+const HEAP_HEADER_SIZE: i64 = 8;
+
+// ─── Page Frame Management ──────────────────────────────────────────────────
+//
+// Helpers for converting between page frame indices and physical addresses,
+// and for aligning addresses to page boundaries (4KB).
+
+// Convert a page frame index to a physical address.
+pub fn page_frame_to_phys(frame_index: i64) -> i64 {
+    return frame_index << PAGE_SHIFT;
+}
+
+// Convert a physical address to a page frame index.
+pub fn phys_to_page_frame(phys_addr: i64) -> i64 {
+    return phys_addr >> PAGE_SHIFT;
+}
+
+// Align an address down to the nearest page boundary.
+pub fn page_align(addr: i64) -> i64 {
+    return addr & ~(PAGE_SIZE - 1);
+}
+
+// Align an address up to the nearest page boundary.
+pub fn page_align_up(addr: i64) -> i64 {
+    val mask = PAGE_SIZE - 1;
+    if (addr & mask) == 0 {
+        return addr;
+    }
+    return (addr & ~mask) + PAGE_SIZE;
+}
+
+// Check if an address is page-aligned.
+pub fn is_page_aligned(addr: i64) -> bool {
+    return (addr & (PAGE_SIZE - 1)) == 0;
+}
+
+// ─── Physical Frame Allocator (Bitmap-based) ────────────────────────────────
+//
+// Manages physical 4KB frames using a bitmap. Each bit in the bitmap represents
+// one frame: 1 = used/allocated, 0 = free. The bitmap is an array of 64-bit
+// integers (i64), so each entry tracks 64 frames.
+//
+// The caller is responsible for allocating the bitmap memory and passing it
+// to frame_allocator_init. The bitmap size in bytes is:
+//   bitmap_bytes = ((total_frames + 63) / 64) * 8
+
+// Frame allocator state.
+struct FrameAllocator {
+    bitmap: i64,        // pointer to bitmap array (array of 64-bit entries)
+    bitmap_size: i64,   // number of 64-bit entries in the bitmap
+    total_frames: i64,  // total number of 4KB frames managed
+    free_frames: i64,   // number of free (unallocated) frames
+    base_addr: i64,     // physical address of the first frame
+}
+
+// Initialize a frame allocator.
+// alloc: FrameAllocator struct to initialize
+// bitmap_ptr: pointer to a bitmap array (caller-allocated, zeroed by this fn)
+// total_frames: number of 4KB frames to manage
+// base_addr: physical address of the first frame
+pub fn frame_allocator_init(alloc: FrameAllocator, bitmap_ptr: i64, total_frames: i64, base_addr: i64) {
+    // Calculate bitmap size: ceil(total_frames / 64) entries
+    val bitmap_size = (total_frames + FRAMES_PER_BITMAP_ENTRY - 1) / FRAMES_PER_BITMAP_ENTRY;
+    alloc.bitmap = bitmap_ptr;
+    alloc.bitmap_size = bitmap_size;
+    alloc.total_frames = total_frames;
+    alloc.free_frames = total_frames;
+    alloc.base_addr = base_addr;
+    // Zero the bitmap — all frames start free (bit = 0)
+    var i = 0;
+    while i < bitmap_size {
+        p_phys_write64(bitmap_ptr + i * 8, 0);
+        i += 1;
+    }
+}
+
+// Allocate a single 4KB frame.
+// Returns the physical address of the frame, or 0 if out of memory.
+pub fn frame_alloc(alloc: FrameAllocator) -> i64 {
+    if alloc.free_frames == 0 {
+        return 0;
+    }
+    var entry_idx = 0;
+    while entry_idx < alloc.bitmap_size {
+        val entry = p_phys_read64(alloc.bitmap + entry_idx * 8);
+        // Skip full entries (all bits set = all frames used)
+        if entry != -1 {
+            var bit = 0;
+            while bit < FRAMES_PER_BITMAP_ENTRY {
+                val frame_index = entry_idx * FRAMES_PER_BITMAP_ENTRY + bit;
+                if frame_index >= alloc.total_frames {
+                    break;
+                }
+                if (entry & (1 << bit)) == 0 {
+                    // Found a free frame — set the bit to mark it used
+                    p_phys_write64(alloc.bitmap + entry_idx * 8, entry | (1 << bit));
+                    alloc.free_frames -= 1;
+                    return alloc.base_addr + frame_index * PAGE_SIZE;
+                }
+                bit += 1;
+            }
+        }
+        entry_idx += 1;
+    }
+    return 0;
+}
+
+// Free a single 4KB frame.
+// phys_addr: physical address of the frame to free
+pub fn frame_free(alloc: FrameAllocator, phys_addr: i64) {
+    if phys_addr < alloc.base_addr {
+        return;
+    }
+    val frame_index = (phys_addr - alloc.base_addr) / PAGE_SIZE;
+    if frame_index < 0 || frame_index >= alloc.total_frames {
+        return;
+    }
+    val entry_idx = frame_index / FRAMES_PER_BITMAP_ENTRY;
+    val bit = frame_index % FRAMES_PER_BITMAP_ENTRY;
+    val entry = p_phys_read64(alloc.bitmap + entry_idx * 8);
+    // Only decrement if the frame was actually used (prevents double-free)
+    if (entry & (1 << bit)) != 0 {
+        p_phys_write64(alloc.bitmap + entry_idx * 8, entry & ~(1 << bit));
+        alloc.free_frames += 1;
+    }
+}
+
+// Allocate a contiguous range of 4KB frames.
+// count: number of frames to allocate
+// Returns the physical address of the first frame, or 0 on failure.
+pub fn frame_alloc_range(alloc: FrameAllocator, count: i64) -> i64 {
+    if count <= 0 {
+        return 0;
+    }
+    if count == 1 {
+        return frame_alloc(alloc);
+    }
+    if alloc.free_frames < count {
+        return 0;
+    }
+
+    var start = 0;
+    while start <= alloc.total_frames - count {
+        // Check if 'count' consecutive frames starting at 'start' are all free
+        var all_free = true;
+        var i = 0;
+        while i < count && all_free {
+            val frame_index = start + i;
+            val entry_idx = frame_index / FRAMES_PER_BITMAP_ENTRY;
+            val bit = frame_index % FRAMES_PER_BITMAP_ENTRY;
+            val entry = p_phys_read64(alloc.bitmap + entry_idx * 8);
+            if (entry & (1 << bit)) != 0 {
+                all_free = false;
+            }
+            i += 1;
+        }
+        if all_free {
+            // Mark all frames as used
+            i = 0;
+            while i < count {
+                val frame_index = start + i;
+                val entry_idx = frame_index / FRAMES_PER_BITMAP_ENTRY;
+                val bit = frame_index % FRAMES_PER_BITMAP_ENTRY;
+                val entry = p_phys_read64(alloc.bitmap + entry_idx * 8);
+                p_phys_write64(alloc.bitmap + entry_idx * 8, entry | (1 << bit));
+                i += 1;
+            }
+            alloc.free_frames -= count;
+            return alloc.base_addr + start * PAGE_SIZE;
+        }
+        start += 1;
+    }
+    return 0;
+}
+
+// Free a range of 4KB frames.
+// phys_addr: physical address of the first frame
+// count: number of frames to free
+pub fn frame_free_range(alloc: FrameAllocator, phys_addr: i64, count: i64) {
+    if phys_addr < alloc.base_addr {
+        return;
+    }
+    var freed = 0;
+    var i = 0;
+    while i < count {
+        val addr = phys_addr + i * PAGE_SIZE;
+        val frame_index = (addr - alloc.base_addr) / PAGE_SIZE;
+        if frame_index >= 0 && frame_index < alloc.total_frames {
+            val entry_idx = frame_index / FRAMES_PER_BITMAP_ENTRY;
+            val bit = frame_index % FRAMES_PER_BITMAP_ENTRY;
+            val entry = p_phys_read64(alloc.bitmap + entry_idx * 8);
+            // Only clear and count if the bit was set
+            if (entry & (1 << bit)) != 0 {
+                p_phys_write64(alloc.bitmap + entry_idx * 8, entry & ~(1 << bit));
+                freed += 1;
+            }
+        }
+        i += 1;
+    }
+    alloc.free_frames += freed;
+}
+
+// Return the number of free frames.
+pub fn frame_count_free(alloc: FrameAllocator) -> i64 {
+    return alloc.free_frames;
+}
+
+// Return the number of used (allocated) frames.
+pub fn frame_count_used(alloc: FrameAllocator) -> i64 {
+    return alloc.total_frames - alloc.free_frames;
+}
+
+// Check if a specific frame is free (not allocated).
+// frame_index: index of the frame to check (0-based)
+pub fn frame_is_free(alloc: FrameAllocator, frame_index: i64) -> bool {
+    if frame_index < 0 || frame_index >= alloc.total_frames {
+        return false;
+    }
+    val entry_idx = frame_index / FRAMES_PER_BITMAP_ENTRY;
+    val bit = frame_index % FRAMES_PER_BITMAP_ENTRY;
+    val entry = p_phys_read64(alloc.bitmap + entry_idx * 8);
+    return (entry & (1 << bit)) == 0;
+}
+
+// ─── Kernel Heap Allocator (Bump + Free List) ────────────────────────────────
+//
+// A hybrid allocator for kernel heap memory:
+// - New allocations bump a pointer through the heap region
+// - Freed blocks are added to a sorted free list for reuse
+// - Adjacent free blocks are coalesced to reduce fragmentation
+//
+// Block layout:
+//   Allocated: [size: i64 (8 bytes)] [user data...]
+//   Free:      [size: i64 (8 bytes)] [next: i64 (8 bytes)] [unused...]
+//
+// kmalloc returns a pointer to the user data (block_start + 8).
+// kfree takes a pointer to user data and converts to block_start by -8.
+//
+// The free list is maintained in address-sorted order to make coalescing
+// efficient. When a block is freed, it is inserted in sorted position,
+// then adjacent blocks are merged.
+
+// Kernel heap state.
+struct KernelHeap {
+    base: i64,       // start of heap region
+    size: i64,       // total heap size in bytes
+    offset: i64,     // bump pointer (bytes consumed from base)
+    free_list: i64,  // pointer to first free block (0 = empty list)
+}
+
+// Free block header (overlaid on freed block memory).
+// When a block is freed, the first 16 bytes are used as this header.
+// size: total block size including this header
+// next: pointer to next free block in the list (0 = end of list)
+struct FreeBlock {
+    size: i64,
+    next: i64,
+}
+
+// Global heap state — kmalloc/kfree/kcalloc/krealloc use these directly.
+// heap_init sets both the KernelHeap struct parameter and these globals.
+// The stats functions (heap_used/heap_free/heap_stats) read from these globals.
+var g_heap_base: i64 = 0;
+var g_heap_size: i64 = 0;
+var g_heap_offset: i64 = 0;
+var g_heap_free_list: i64 = 0;
+
+// Initialize the kernel heap.
+// heap: KernelHeap struct to initialize (also sets global state)
+// base: start of the heap region (must be valid physical memory)
+// size: total heap size in bytes
+pub fn heap_init(heap: KernelHeap, base: i64, size: i64) {
+    heap.base = base;
+    heap.size = size;
+    heap.offset = 0;
+    heap.free_list = 0;
+    // Set globals — source of truth for kmalloc/kfree
+    g_heap_base = base;
+    g_heap_size = size;
+    g_heap_offset = 0;
+    g_heap_free_list = 0;
+}
+
+// Insert a block into the free list, maintaining address-sorted order.
+// block_addr: pointer to the block (where the size field is stored)
+fn free_list_insert(block_addr: i64) {
+    // Initialize next pointer to 0 (end of list)
+    p_phys_write64(block_addr + 8, 0);
+
+    if g_heap_free_list == 0 {
+        // List is empty — block becomes the head
+        g_heap_free_list = block_addr;
+        return;
+    }
+
+    if block_addr < g_heap_free_list {
+        // Insert at head
+        p_phys_write64(block_addr + 8, g_heap_free_list);
+        g_heap_free_list = block_addr;
+        return;
+    }
+
+    // Walk the list to find the insertion point (keep sorted by address)
+    var prev = g_heap_free_list;
+    var next = p_phys_read64(prev + 8);
+    while next != 0 && next < block_addr {
+        prev = next;
+        next = p_phys_read64(prev + 8);
+    }
+    // Insert between prev and next
+    p_phys_write64(block_addr + 8, next);
+    p_phys_write64(prev + 8, block_addr);
+}
+
+// Coalesce adjacent free blocks in the free list.
+// Walks the sorted list and merges blocks that are physically contiguous.
+fn free_list_coalesce() {
+    var cur = g_heap_free_list;
+    while cur != 0 {
+        val cur_size = p_phys_read64(cur);
+        val next = p_phys_read64(cur + 8);
+        if next != 0 && cur + cur_size == next {
+            // Merge next block into current
+            val next_next = p_phys_read64(next + 8);
+            p_phys_write64(cur, cur_size + p_phys_read64(next));
+            p_phys_write64(cur + 8, next_next);
+            // Don't advance cur — re-check with the new next
+        } else {
+            cur = next;
+        }
+    }
+}
+
+// Compute the total size of all blocks in the free list.
+fn free_list_total() -> i64 {
+    var total = 0;
+    var cur = g_heap_free_list;
+    while cur != 0 {
+        total += p_phys_read64(cur);
+        cur = p_phys_read64(cur + 8);
+    }
+    return total;
+}
+
+// Allocate 'size' bytes from the kernel heap.
+// Returns a pointer to the allocated memory, or 0 on failure.
+// The memory is NOT zeroed — use kcalloc for zeroed memory.
+pub fn kmalloc(size: i64) -> i64 {
+    if size <= 0 {
+        return 0;
+    }
+
+    // Align user size to 8 bytes, add header
+    val aligned_size = (size + 7) & ~7;
+    var block_size = aligned_size + HEAP_HEADER_SIZE;
+    // Enforce minimum block size: header + next pointer (needed when freed)
+    if block_size < HEAP_MIN_BLOCK {
+        block_size = HEAP_MIN_BLOCK;
+    }
+
+    // Search the free list for a fitting block (first-fit)
+    var prev = 0;
+    var cur = g_heap_free_list;
+    while cur != 0 {
+        val cur_size = p_phys_read64(cur);
+        if cur_size >= block_size {
+            val remainder = cur_size - block_size;
+            if remainder >= HEAP_MIN_BLOCK {
+                // Split: allocate the front, add the remainder back to free list
+                val remainder_addr = cur + block_size;
+                p_phys_write64(remainder_addr, remainder);
+                p_phys_write64(remainder_addr + 8, p_phys_read64(cur + 8));
+                if prev == 0 {
+                    g_heap_free_list = remainder_addr;
+                } else {
+                    p_phys_write64(prev + 8, remainder_addr);
+                }
+                // Write the allocated block size
+                p_phys_write64(cur, block_size);
+            } else {
+                // Use the whole block (remainder too small to split)
+                val next = p_phys_read64(cur + 8);
+                if prev == 0 {
+                    g_heap_free_list = next;
+                } else {
+                    p_phys_write64(prev + 8, next);
+                }
+                // cur_size is already stored at cur — no need to update
+            }
+            return cur + HEAP_HEADER_SIZE;
+        }
+        prev = cur;
+        cur = p_phys_read64(cur + 8);
+    }
+
+    // No free block found — bump allocate from the heap region
+    if g_heap_offset + block_size > g_heap_size {
+        return 0; // out of memory
+    }
+    val block_addr = g_heap_base + g_heap_offset;
+    p_phys_write64(block_addr, block_size);
+    g_heap_offset += block_size;
+    return block_addr + HEAP_HEADER_SIZE;
+}
+
+// Free a previously allocated block.
+// ptr: pointer returned by kmalloc/kcalloc (0 = no-op)
+// The block is inserted into the sorted free list and coalesced with
+// any adjacent free blocks.
+pub fn kfree(ptr: i64) {
+    if ptr == 0 {
+        return;
+    }
+    // Convert user pointer to block start
+    val block_addr = ptr - HEAP_HEADER_SIZE;
+    // Insert into the sorted free list, then coalesce adjacent blocks
+    free_list_insert(block_addr);
+    free_list_coalesce();
+}
+
+// Allocate 'count * size' bytes and zero the memory.
+// Returns a pointer to the allocated memory, or 0 on failure.
+pub fn kcalloc(count: i64, size: i64) -> i64 {
+    val total = count * size;
+    val ptr = kmalloc(total);
+    if ptr == 0 {
+        return 0;
+    }
+    // Zero the memory: 8-byte chunks first, then byte-by-byte for remainder
+    var i = 0;
+    while i + 8 <= total {
+        p_phys_write64(ptr + i, 0);
+        i += 8;
+    }
+    while i < total {
+        p_phys_write8(ptr + i, 0);
+        i += 1;
+    }
+    return ptr;
+}
+
+// Reallocate a block to a new size.
+// ptr: pointer returned by kmalloc/kcalloc (0 = equivalent to kmalloc)
+// new_size: requested new size in bytes
+// Returns a pointer to the reallocated memory, or 0 on failure.
+// If new_size fits in the existing block, returns the same pointer.
+// Otherwise, allocates a new block, copies the old data, and frees the old block.
+pub fn krealloc(ptr: i64, new_size: i64) -> i64 {
+    if ptr == 0 {
+        return kmalloc(new_size);
+    }
+    if new_size <= 0 {
+        kfree(ptr);
+        return 0;
+    }
+
+    // Read the old block size from the header
+    val block_addr = ptr - HEAP_HEADER_SIZE;
+    val old_block_size = p_phys_read64(block_addr);
+    val old_data_size = old_block_size - HEAP_HEADER_SIZE;
+
+    // If the new size fits in the existing block, no need to reallocate
+    if new_size <= old_data_size {
+        return ptr;
+    }
+
+    // Allocate a new block
+    val new_ptr = kmalloc(new_size);
+    if new_ptr == 0 {
+        return 0;
+    }
+
+    // Copy old data to new block: 8-byte chunks first, then bytes for remainder
+    var copied = 0;
+    while copied + 8 <= old_data_size {
+        val qword = p_phys_read64(ptr + copied);
+        p_phys_write64(new_ptr + copied, qword);
+        copied += 8;
+    }
+    while copied < old_data_size {
+        // Read byte via read-modify-write on 64-bit aligned access
+        val src = ptr + copied;
+        val aligned = src & ~7;
+        val byte_offset = src & 7;
+        val qword = p_phys_read64(aligned);
+        val byte = (qword >> (byte_offset * 8)) & 0xFF;
+        p_phys_write8(new_ptr + copied, byte);
+        copied += 1;
+    }
+
+    // Free the old block
+    kfree(ptr);
+    return new_ptr;
+}
+
+// Return the number of bytes used in the heap.
+// This is the bump offset minus the total size of free list blocks
+// (free list blocks were allocated then freed, so they're available again).
+// heap: KernelHeap struct (global heap state is used internally)
+pub fn heap_used(heap: KernelHeap) -> i64 {
+    val fl_total = free_list_total();
+    return g_heap_offset - fl_total;
+}
+
+// Return the number of bytes available in the heap.
+// This is the unused bump space plus the total size of free list blocks.
+// heap: KernelHeap struct (global heap state is used internally)
+pub fn heap_free(heap: KernelHeap) -> i64 {
+    val fl_total = free_list_total();
+    return (g_heap_size - g_heap_offset) + fl_total;
+}
+
+// Return heap usage statistics as a string.
+// heap: KernelHeap struct (global heap state is used internally)
+pub fn heap_stats(heap: KernelHeap) -> str {
+    val used = heap_used(heap);
+    val avail = heap_free(heap);
+    var result = "KernelHeap: base=";
+    result = p_str_concat(result, p_to_str(g_heap_base));
+    result = p_str_concat(result, " size=");
+    result = p_str_concat(result, p_to_str(g_heap_size));
+    result = p_str_concat(result, " used=");
+    result = p_str_concat(result, p_to_str(used));
+    result = p_str_concat(result, " free=");
+    result = p_str_concat(result, p_to_str(avail));
+    return result;
+}

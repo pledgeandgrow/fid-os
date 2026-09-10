@@ -1,0 +1,377 @@
+// stdlib/keyboard.fd — PS/2 keyboard input
+//
+// Provides:
+//   - PS/2 keyboard initialization
+//   - IRQ1 handler for keyboard interrupts (port 0x60)
+//   - Scancode Set 1 → ASCII translation
+//   - Shift, Caps Lock, Control, Alt handling
+//   - Key press/release event queue
+//
+// Usage:
+//   use keyboard;
+//   use isr;
+//   keyboard_init();
+//   isr_register_handler(0x21, keyboard_irq_handler);
+//   isr_pic_mask(1, false);  // unmask IRQ1
+//
+//   // In main loop:
+//   if keyboard_has_key() {
+//       var c = keyboard_getc();
+//       fb_print_char(c);
+//   }
+//
+// Only works in --bare or --boot mode.
+
+module keyboard;
+
+use vec;
+use string;
+
+// ─── PS/2 Ports ───────────────────────────────────────────────────────────
+
+const KB_DATA:    i64 = 0x60;  // Data port
+const KB_STATUS:  i64 = 0x64;  // Status register
+const KB_CMD:     i64 = 0x64;  // Command register
+
+// Status register bits
+const KB_STAT_OUT_BUF:  i64 = 0x01;  // Output buffer full
+const KB_STAT_IN_BUF:   i64 = 0x02;  // Input buffer full
+const KB_STAT_SYS_FLAG: i64 = 0x04;  // System flag
+const KB_STAT_CMD_DATA: i64 = 0x08;  // 1=command, 0=data
+
+// ─── Scancode Set 1 ────────────────────────────────────────────────────────
+
+// Special scancodes
+const SC_ESCAPE:     i64 = 0x01;
+const SC_BACKSPACE:  i64 = 0x0E;
+const SC_TAB:        i64 = 0x0F;
+const SC_ENTER:      i64 = 0x1C;
+const SC_LCTRL:      i64 = 0x1D;
+const SC_LSHIFT:     i64 = 0x2A;
+const SC_RSHIFT:     i64 = 0x36;
+const SC_LALT:       i64 = 0x38;
+const SC_CAPSLOCK:   i64 = 0x3A;
+const SC_NUMLOCK:    i64 = 0x45;
+const SC_SCROLLLOCK: i64 = 0x46;
+const SC_F1:         i64 = 0x3B;
+const SC_F12:        i64 = 0x58;
+const SC_HOME:       i64 = 0x47;
+const SC_UP:         i64 = 0x48;
+const SC_PGUP:       i64 = 0x49;
+const SC_LEFT:       i64 = 0x4B;
+const SC_CENTER:     i64 = 0x4C;
+const SC_RIGHT:      i64 = 0x4D;
+const SC_END:        i64 = 0x4F;
+const SC_DOWN:       i64 = 0x50;
+const SC_PGDN:       i64 = 0x51;
+const SC_INS:        i64 = 0x52;
+const SC_DEL:        i64 = 0x53;
+
+const SC_RELEASED:   i64 = 0x80;  // Bit 7 set = key released
+
+// ─── Key State ────────────────────────────────────────────────────────────
+
+var shift_pressed: bool = false;
+var ctrl_pressed: bool = false;
+var alt_pressed: bool = false;
+var caps_lock: bool = false;
+var num_lock: bool = false;
+var scroll_lock: bool = false;
+
+// Key buffer (circular buffer)
+const KB_BUFFER_SIZE: i64 = 256;
+var key_buffer: Vec<i64> = Vec::new();
+var buffer_head: i64 = 0;
+var buffer_tail: i64 = 0;
+var buffer_count: i64 = 0;
+
+// ─── Scancode → ASCII Table (Set 1, no shift) ─────────────────────────────
+
+fn scancode_to_ascii(sc: i64) -> i64 {
+    // Lowercase/no-shift mapping
+    if sc == SC_ESCAPE { return 27; }
+    if sc == SC_BACKSPACE { return 8; }
+    if sc == SC_TAB { return 9; }
+    if sc == SC_ENTER { return 10; }
+    if sc == SC_LCTRL { return 0; }
+    if sc == SC_LSHIFT { return 0; }
+    if sc == SC_RSHIFT { return 0; }
+    if sc == SC_LALT { return 0; }
+    if sc == SC_CAPSLOCK { return 0; }
+    if sc == SC_NUMLOCK { return 0; }
+    if sc == SC_SCROLLLOCK { return 0; }
+
+    // Number row (without shift)
+    if sc == 0x02 { return 49; }
+    if sc == 0x03 { return 50; }
+    if sc == 0x04 { return 51; }
+    if sc == 0x05 { return 52; }
+    if sc == 0x06 { return 53; }
+    if sc == 0x07 { return 54; }
+    if sc == 0x08 { return 55; }
+    if sc == 0x09 { return 56; }
+    if sc == 0x0A { return 57; }
+    if sc == 0x0B { return 48; }
+    if sc == 0x0C { return 45; }
+    if sc == 0x0D { return 61; }
+
+    // Top letter row
+    if sc == 0x10 { return 113; }
+    if sc == 0x11 { return 119; }
+    if sc == 0x12 { return 101; }
+    if sc == 0x13 { return 114; }
+    if sc == 0x14 { return 116; }
+    if sc == 0x15 { return 121; }
+    if sc == 0x16 { return 117; }
+    if sc == 0x17 { return 105; }
+    if sc == 0x18 { return 111; }
+    if sc == 0x19 { return 112; }
+    if sc == 0x1A { return 91; }
+    if sc == 0x1B { return 93; }
+
+    // Middle letter row
+    if sc == 0x1E { return 97; }
+    if sc == 0x1F { return 115; }
+    if sc == 0x20 { return 100; }
+    if sc == 0x21 { return 102; }
+    if sc == 0x22 { return 103; }
+    if sc == 0x23 { return 104; }
+    if sc == 0x24 { return 106; }
+    if sc == 0x25 { return 107; }
+    if sc == 0x26 { return 108; }
+    if sc == 0x27 { return 59; }
+    if sc == 0x28 { return 39; }
+    if sc == 0x29 { return 96; }
+    if sc == 0x2B { return 92; }
+
+    // Bottom letter row
+    if sc == 0x2C { return 122; }
+    if sc == 0x2D { return 120; }
+    if sc == 0x2E { return 99; }
+    if sc == 0x2F { return 118; }
+    if sc == 0x30 { return 98; }
+    if sc == 0x31 { return 110; }
+    if sc == 0x32 { return 109; }
+    if sc == 0x33 { return 44; }
+    if sc == 0x34 { return 46; }
+    if sc == 0x35 { return 47; }
+
+    // Space
+    if sc == 0x39 { return 32; }
+
+    return 0;
+}
+
+fn scancode_to_ascii_shift(sc: i64) -> i64 {
+    // Uppercase/shift mapping
+    if sc == 0x02 { return 33; }
+    if sc == 0x03 { return 64; }
+    if sc == 0x04 { return 35; }
+    if sc == 0x05 { return 36; }
+    if sc == 0x06 { return 37; }
+    if sc == 0x07 { return 94; }
+    if sc == 0x08 { return 38; }
+    if sc == 0x09 { return 42; }
+    if sc == 0x0A { return 40; }
+    if sc == 0x0B { return 41; }
+    if sc == 0x0C { return 95; }
+    if sc == 0x0D { return 43; }
+
+    if sc == 0x10 { return 81; }
+    if sc == 0x11 { return 87; }
+    if sc == 0x12 { return 69; }
+    if sc == 0x13 { return 82; }
+    if sc == 0x14 { return 84; }
+    if sc == 0x15 { return 89; }
+    if sc == 0x16 { return 85; }
+    if sc == 0x17 { return 73; }
+    if sc == 0x18 { return 79; }
+    if sc == 0x19 { return 80; }
+    if sc == 0x1A { return 123; }
+    if sc == 0x1B { return 125; }
+
+    if sc == 0x1E { return 65; }
+    if sc == 0x1F { return 83; }
+    if sc == 0x20 { return 68; }
+    if sc == 0x21 { return 70; }
+    if sc == 0x22 { return 71; }
+    if sc == 0x23 { return 72; }
+    if sc == 0x24 { return 74; }
+    if sc == 0x25 { return 75; }
+    if sc == 0x26 { return 76; }
+    if sc == 0x27 { return 58; }
+    if sc == 0x28 { return 34; }
+    if sc == 0x29 { return 126; }
+    if sc == 0x2B { return 124; }
+
+    if sc == 0x2C { return 90; }
+    if sc == 0x2D { return 88; }
+    if sc == 0x2E { return 67; }
+    if sc == 0x2F { return 86; }
+    if sc == 0x30 { return 66; }
+    if sc == 0x31 { return 78; }
+    if sc == 0x32 { return 77; }
+    if sc == 0x33 { return 60; }
+    if sc == 0x34 { return 62; }
+    if sc == 0x35 { return 63; }
+
+    return scancode_to_ascii(sc);
+}
+
+// ─── Initialization ────────────────────────────────────────────────────────
+
+pub fn keyboard_init() {
+    // Initialize key buffer
+    key_buffer = Vec::new();
+    var i: i64 = 0;
+    while i < KB_BUFFER_SIZE {
+        key_buffer.push(0);
+        i = i + 1;
+    }
+    buffer_head = 0;
+    buffer_tail = 0;
+    buffer_count = 0;
+
+    shift_pressed = false;
+    ctrl_pressed = false;
+    alt_pressed = false;
+    caps_lock = false;
+    num_lock = false;
+    scroll_lock = false;
+
+    // Enable PS/2 keyboard (first port)
+    // Send command 0xAE to controller to enable first port
+    p_outb(KB_CMD, 0xAE);
+
+    // Flush output buffer
+    while (p_inb(KB_STATUS) & KB_STAT_OUT_BUF) != 0 {
+        p_inb(KB_DATA);
+    }
+}
+
+// ─── IRQ Handler ──────────────────────────────────────────────────────────
+
+// This function is called when IRQ1 fires (keyboard interrupt).
+// It reads the scancode from port 0x60 and processes it.
+pub fn keyboard_irq_handler() {
+    var scancode: i64 = p_inb(KB_DATA);
+    keyboard_process_scancode(scancode);
+}
+
+pub fn keyboard_process_scancode(sc: i64) {
+    // Check for key release (bit 7 set)
+    if (sc & SC_RELEASED) != 0 {
+        var released: i64 = sc & ~SC_RELEASED;
+        if released == SC_LSHIFT || released == SC_RSHIFT {
+            shift_pressed = false;
+        } else if released == SC_LCTRL {
+            ctrl_pressed = false;
+        } else if released == SC_LALT {
+            alt_pressed = false;
+        }
+        return;
+    }
+
+    // Key press
+    if sc == SC_LSHIFT || sc == SC_RSHIFT {
+        shift_pressed = true;
+        return;
+    }
+    if sc == SC_LCTRL {
+        ctrl_pressed = true;
+        return;
+    }
+    if sc == SC_LALT {
+        alt_pressed = true;
+        return;
+    }
+    if sc == SC_CAPSLOCK {
+        caps_lock = !caps_lock;
+        return;
+    }
+    if sc == SC_NUMLOCK {
+        num_lock = !num_lock;
+        return;
+    }
+    if sc == SC_SCROLLLOCK {
+        scroll_lock = !scroll_lock;
+        return;
+    }
+
+    // Convert to ASCII
+    var ascii: i64 = 0;
+    if shift_pressed {
+        ascii = scancode_to_ascii_shift(sc);
+    } else {
+        ascii = scancode_to_ascii(sc);
+    }
+
+    // Apply caps lock to letters
+    if caps_lock && ascii >= 97 && ascii <= 122 {
+        ascii = ascii - 32;
+    } else if caps_lock && ascii >= 65 && ascii <= 90 && !shift_pressed {
+        ascii = ascii + 32;
+    }
+
+    // Control key combinations
+    if ctrl_pressed && ascii >= 97 && ascii <= 122 {
+        ascii = ascii - 96;  // Ctrl+A = 1, Ctrl+B = 2, etc.
+    }
+
+    if ascii != 0 {
+        keyboard_buffer_push(ascii);
+    }
+}
+
+// ─── Key Buffer ───────────────────────────────────────────────────────────
+
+fn keyboard_buffer_push(key: i64) {
+    if buffer_count >= KB_BUFFER_SIZE { return; }
+    key_buffer.set(buffer_head, key);
+    buffer_head = (buffer_head + 1) % KB_BUFFER_SIZE;
+    buffer_count = buffer_count + 1;
+}
+
+pub fn keyboard_has_key() -> bool {
+    return buffer_count > 0;
+}
+
+pub fn keyboard_getc() -> i64 {
+    if buffer_count == 0 { return 0; }
+    var key: i64 = key_buffer.get(buffer_tail);
+    buffer_tail = (buffer_tail + 1) % KB_BUFFER_SIZE;
+    buffer_count = buffer_count - 1;
+    return key;
+}
+
+pub fn keyboard_getc_block() -> i64 {
+    while buffer_count == 0 {
+        p_hlt();
+    }
+    return keyboard_getc();
+}
+
+pub fn keyboard_read_line() -> str {
+    var line: str = "";
+    while true {
+        var c: i64 = keyboard_getc_block();
+        if c == 10 { return line; }
+        if c == 8 { // backspace
+            if str_len(line) > 0 {
+                line = str_slice(line, 0, str_len(line) - 1);
+            }
+        } else if c >= 32 && c < 127 {
+            line = line + char_to_str(c);
+        }
+    }
+    return line;
+}
+
+// ─── Key State Queries ────────────────────────────────────────────────────
+
+pub fn keyboard_shift_pressed() -> bool { return shift_pressed; }
+pub fn keyboard_ctrl_pressed() -> bool { return ctrl_pressed; }
+pub fn keyboard_alt_pressed() -> bool { return alt_pressed; }
+pub fn keyboard_caps_lock() -> bool { return caps_lock; }
+pub fn keyboard_num_lock() -> bool { return num_lock; }
+pub fn keyboard_scroll_lock() -> bool { return scroll_lock; }

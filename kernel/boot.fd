@@ -1,0 +1,56 @@
+// kernel/boot.fd — Kernel entry point
+//
+// This is the first code that runs after GRUB loads the kernel.
+// It sets up the stack, saves the multiboot info pointer, and
+// calls kernel_main.
+//
+// This file uses @naked because we need full control over the
+// prologue — we're setting up the stack before any function calls.
+//
+// Multiboot2 contract:
+//   RAX = 0x36d76289 (magic)
+//   RBX = pointer to multiboot info structure
+//
+// We use inline asm to set up the stack and jump to kernel_main.
+
+module boot;
+
+use multiboot;
+
+// Boot stack — 16KB, aligned to 16 bytes
+// In bare-metal mode, this is placed in .bss
+const BOOT_STACK_SIZE: i64 = 16384;
+
+// Entry point. This is the symbol the linker script points to.
+// GRUB jumps here after loading the kernel.
+@naked
+@no-mangle
+pub fn _start() -> void {
+    // Set up stack pointer
+    // The stack is at the top of the .bss section
+    // We use a fixed stack address defined in the linker script
+    asm!("mov rsp, 0x90000");
+    asm!("mov rbp, rsp");
+
+    // Save multiboot info pointer (RBX) before any function calls clobber it
+    asm!("mov [multiboot_ptr], rbx");
+
+    // Clear direction flag (required by System V ABI)
+    asm!("cld");
+
+    // Call kernel_main
+    asm!("call kernel_main");
+
+    // If kernel_main returns, halt
+    asm!("cli");
+    asm!("1: hlt");
+    asm!("jmp 1b");
+}
+
+// Global variable to store the multiboot info pointer
+// Set by _start, read by kernel_main
+var multiboot_ptr: i64 = 0;
+
+pub fn boot_get_multiboot_ptr() -> i64 {
+    return multiboot_ptr;
+}

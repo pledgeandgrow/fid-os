@@ -1,0 +1,47 @@
+// kernel/multiboot_header.fd — Multiboot2 header
+//
+// GRUB needs a Multiboot2 header in the first 32KB of the kernel binary.
+// This file emits the header as raw bytes in a special section.
+//
+// The header is:
+//   magic:      0xE85250D6 (Multiboot2)
+//   architecture: 0 (i386 protected mode)
+//   length:     24 (header + end tag)
+//   checksum:   -(magic + arch + length)
+//   end tag:    type=0, flags=0, size=8
+
+module multiboot_header;
+
+// Multiboot2 magic number
+const MB2_MAGIC: i64 = 0xE85250D6;
+const MB2_ARCH_I386: i64 = 0;
+const MB2_HEADER_LEN: i64 = 24;
+const MB2_CHECKSUM: i64 = -(0xE85250D6 + 0 + 24);
+
+// Emit the header in the .multiboot2 section
+// The linker script places this section first
+@no-mangle
+@section(".multiboot2")
+@packed
+struct Multiboot2Header {
+    magic: i32,
+    architecture: i32,
+    length: i32,
+    checksum: i32,
+    // End tag
+    end_type: i16,
+    end_flags: i16,
+    end_size: i32,
+}
+
+@no-mangle
+@section(".multiboot2")
+var mb2_header: Multiboot2Header = Multiboot2Header {
+    magic: MB2_MAGIC as i32,
+    architecture: MB2_ARCH_I386 as i32,
+    length: MB2_HEADER_LEN as i32,
+    checksum: MB2_CHECKSUM as i32,
+    end_type: 0,
+    end_flags: 0,
+    end_size: 8,
+};

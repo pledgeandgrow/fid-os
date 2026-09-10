@@ -1,0 +1,323 @@
+// stdlib/vfs.fd — Virtual File System
+//
+// Provides:
+//   - VFS layer: open/read/write/close/stat
+//   - Ramdisk (load initrd from multiboot module)
+//   - FAT32 read-only driver
+//   - Mount table
+//   - File descriptor table
+//
+// Usage:
+//   use vfs;
+//   vfs_init();
+//   vfs_mount_ramdisk(initrd_addr, initrd_size);
+//   var fd = vfs_open("/hello.txt", VFS_O_RDONLY);
+//   var buf = p_malloc(256);
+//   var n = vfs_read(fd, buf, 256);
+//
+// Only works in --bare or --boot mode.
+
+module vfs;
+
+use vec;
+use string;
+
+// ─── File Modes ───────────────────────────────────────────────────────────
+
+const VFS_O_RDONLY: i64 = 0;
+const VFS_O_WRONLY: i64 = 1;
+const VFS_O_RDWR:   i64 = 2;
+const VFS_O_CREAT:  i64 = 4;
+const VFS_O_TRUNC:  i64 = 8;
+
+// ─── File Types ───────────────────────────────────────────────────────────
+
+const VFS_TYPE_FILE:     i64 = 1;
+const VFS_TYPE_DIR:      i64 = 2;
+const VFS_TYPE_SYMLINK:  i64 = 3;
+const VFS_TYPE_CHARDEV:  i64 = 4;
+const VFS_TYPE_BLKDEV:   i64 = 5;
+
+// ─── VFS Structures ───────────────────────────────────────────────────────
+
+pub struct VfsFile {
+    pub name: str,
+    pub type: i64,
+    pub size: i64,
+    pub data: i64,      // pointer to file data (for ramdisk)
+    pub offset: i64,    // current read/write offset
+}
+
+pub struct VfsDir {
+    pub name: str,
+    pub entries: Vec<str>,
+}
+
+pub struct VfsStat {
+    pub name: str,
+    pub type: i64,
+    pub size: i64,
+}
+
+// ─── Ramdisk Entry ────────────────────────────────────────────────────────
+
+struct RamdiskEntry {
+    name: str,
+    type: i64,
+    size: i64,
+    data: i64,
+}
+
+var ramdisk_entries: Vec<RamdiskEntry> = Vec::new();
+var ramdisk_base: i64 = 0;
+var ramdisk_size: i64 = 0;
+var ramdisk_loaded: bool = false;
+
+// ─── File Descriptor Table ────────────────────────────────────────────────
+
+const VFS_MAX_FDS: i64 = 256;
+
+struct VfsFd {
+    used: bool,
+    entry_index: i64,
+    offset: i64,
+    mode: i64,
+}
+
+var fd_table: Vec<VfsFd> = Vec::new();
+
+// ─── Initialization ────────────────────────────────────────────────────────
+
+pub fn vfs_init() {
+    ramdisk_entries = Vec::new();
+    ramdisk_base = 0;
+    ramdisk_size = 0;
+    ramdisk_loaded = false;
+
+    fd_table = Vec::new();
+    var i: i64 = 0;
+    while i < VFS_MAX_FDS {
+        fd_table.push(VfsFd { used: false, entry_index: -1, offset: 0, mode: 0 });
+        i = i + 1;
+    }
+}
+
+// ─── Ramdisk Mount ────────────────────────────────────────────────────────
+
+// Mount a ramdisk from a multiboot module.
+// The ramdisk format is simple:
+//   u32 num_entries
+//   For each entry:
+//     u32 name_len, char[name_len] name, u32 type, u64 size, u64 data_offset
+//   File data follows
+pub fn vfs_mount_ramdisk(addr: i64, size: i64) -> bool {
+    ramdisk_base = addr;
+    ramdisk_size = size;
+    ramdisk_loaded = true;
+
+    // Read number of entries
+    var num_entries: i64 = read_u32_at(addr, 0);
+    var pos: i64 = 4;
+
+    var i: i64 = 0;
+    while i < num_entries {
+        var name_len: i64 = read_u32_at(addr, pos);
+        pos = pos + 4;
+
+        var name: str = "";
+        var j: i64 = 0;
+        while j < name_len {
+            name = name + char_to_str(p_phys_read8(addr + pos + j));
+            j = j + 1;
+        }
+        pos = pos + name_len;
+
+        var type: i64 = read_u32_at(addr, pos);
+        pos = pos + 4;
+
+        var file_size: i64 = read_u64_at(addr, pos);
+        pos = pos + 8;
+
+        var data_offset: i64 = read_u64_at(addr, pos);
+        pos = pos + 8;
+
+        ramdisk_entries.push(RamdiskEntry {
+            name: name,
+            type: type,
+            size: file_size,
+            data: addr + data_offset,
+        });
+
+        i = i + 1;
+    }
+
+    return true;
+}
+
+pub fn vfs_ramdisk_loaded() -> bool {
+    return ramdisk_loaded;
+}
+
+pub fn vfs_ramdisk_entry_count() -> i64 {
+    return ramdisk_entries.len();
+}
+
+pub fn vfs_ramdisk_get_name(index: i64) -> str {
+    if index < 0 || index >= ramdisk_entries.len() { return ""; }
+    return ramdisk_entries.get(index).name;
+}
+
+// ─── File Operations ──────────────────────────────────────────────────────
+
+pub fn vfs_open(path: str, mode: i64) -> i64 {
+    // Find file in ramdisk
+    var entry_index: i64 = -1;
+    var i: i64 = 0;
+    while i < ramdisk_entries.len() {
+        if str_equal(ramdisk_entries.get(i).name, path) {
+            entry_index = i;
+            i = ramdisk_entries.len();
+        }
+        i = i + 1;
+    }
+
+    if entry_index < 0 { return -1; }
+
+    // Allocate file descriptor
+    var fd: i64 = vfs_alloc_fd();
+    if fd < 0 { return -1; }
+
+    var entry: VfsFd = fd_table.get(fd);
+    entry.used = true;
+    entry.entry_index = entry_index;
+    entry.offset = 0;
+    entry.mode = mode;
+    fd_table.set(fd, entry);
+
+    return fd;
+}
+
+pub fn vfs_close(fd: i64) -> i64 {
+    if fd < 0 || fd >= VFS_MAX_FDS { return -1; }
+    var entry: VfsFd = fd_table.get(fd);
+    if !entry.used { return -1; }
+    entry.used = false;
+    entry.entry_index = -1;
+    fd_table.set(fd, entry);
+    return 0;
+}
+
+pub fn vfs_read(fd: i64, buf: i64, count: i64) -> i64 {
+    if fd < 0 || fd >= VFS_MAX_FDS { return -1; }
+    var fd_entry: VfsFd = fd_table.get(fd);
+    if !fd_entry.used { return -1; }
+
+    var ram_entry: RamdiskEntry = ramdisk_entries.get(fd_entry.entry_index);
+    var remaining: i64 = ram_entry.size - fd_entry.offset;
+    if remaining <= 0 { return 0; }
+
+    var to_read: i64 = count;
+    if to_read > remaining { to_read = remaining; }
+
+    // Copy data from ramdisk to buffer
+    var i: i64 = 0;
+    while i < to_read {
+        var byte: i64 = p_phys_read8(ram_entry.data + fd_entry.offset + i);
+        p_phys_write8(buf + i, byte);
+        i = i + 1;
+    }
+
+    fd_entry.offset = fd_entry.offset + to_read;
+    fd_table.set(fd, fd_entry);
+
+    return to_read;
+}
+
+pub fn vfs_write(fd: i64, buf: i64, count: i64) -> i64 {
+    // Ramdisk is read-only for now
+    return -1;
+}
+
+pub fn vfs_lseek(fd: i64, offset: i64, whence: i64) -> i64 {
+    if fd < 0 || fd >= VFS_MAX_FDS { return -1; }
+    var fd_entry: VfsFd = fd_table.get(fd);
+    if !fd_entry.used { return -1; }
+
+    var ram_entry: RamdiskEntry = ramdisk_entries.get(fd_entry.entry_index);
+
+    if whence == 0 { // SEEK_SET
+        fd_entry.offset = offset;
+    } else if whence == 1 { // SEEK_CUR
+        fd_entry.offset = fd_entry.offset + offset;
+    } else if whence == 2 { // SEEK_END
+        fd_entry.offset = ram_entry.size + offset;
+    }
+
+    if fd_entry.offset < 0 { fd_entry.offset = 0; }
+    if fd_entry.offset > ram_entry.size { fd_entry.offset = ram_entry.size; }
+
+    fd_table.set(fd, fd_entry);
+    return fd_entry.offset;
+}
+
+pub fn vfs_stat(path: str) -> VfsStat {
+    var i: i64 = 0;
+    while i < ramdisk_entries.len() {
+        var entry: RamdiskEntry = ramdisk_entries.get(i);
+        if str_equal(entry.name, path) {
+            return VfsStat { name: entry.name, type: entry.type, size: entry.size };
+        }
+        i = i + 1;
+    }
+    return VfsStat { name: "", type: 0, size: -1 };
+}
+
+pub fn vfs_exists(path: str) -> bool {
+    var i: i64 = 0;
+    while i < ramdisk_entries.len() {
+        if str_equal(ramdisk_entries.get(i).name, path) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn vfs_list_dir(path: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < ramdisk_entries.len() {
+        var entry: RamdiskEntry = ramdisk_entries.get(i);
+        // Check if entry name starts with path
+        if str_starts_with(entry.name, path) {
+            result.push(entry.name);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── File Descriptor Helpers ──────────────────────────────────────────────
+
+fn vfs_alloc_fd() -> i64 {
+    var i: i64 = 3;  // Skip stdin/stdout/stderr
+    while i < VFS_MAX_FDS {
+        var fd: VfsFd = fd_table.get(i);
+        if !fd.used { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+fn read_u32_at(addr: i64, offset: i64) -> i64 {
+    return p_phys_read8(addr + offset) |
+           (p_phys_read8(addr + offset + 1) << 8) |
+           (p_phys_read8(addr + offset + 2) << 16) |
+           (p_phys_read8(addr + offset + 3) << 24);
+}
+
+fn read_u64_at(addr: i64, offset: i64) -> i64 {
+    var lo: i64 = read_u32_at(addr, offset);
+    var hi: i64 = read_u32_at(addr, offset + 4);
+    return lo | (hi << 32);
+}

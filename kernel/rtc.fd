@@ -1,0 +1,290 @@
+// stdlib/rtc.fd — CMOS/RTC (Real-Time Clock)
+//
+// Provides:
+//   - Read time/date from CMOS (ports 0x70/0x71)
+//   - BCD → binary conversion
+//   - Unix epoch time calculation
+//   - Simple date/time formatting
+//
+// Usage:
+//   use rtc;
+//   var time = rtc_read();
+//   fb_print(rtc_format(time));
+//
+// Only works in --bare or --boot mode.
+
+module rtc;
+
+use string;
+
+// ─── CMOS Ports ───────────────────────────────────────────────────────────
+
+const CMOS_ADDR: i64 = 0x70;
+const CMOS_DATA: i64 = 0x71;
+
+// ─── CMOS Register Addresses ──────────────────────────────────────────────
+
+const RTC_SECONDS: i64 = 0x00;
+const RTC_MINUTES: i64 = 0x02;
+const RTC_HOURS:   i64 = 0x04;
+const RTC_DAY:     i64 = 0x07;
+const RTC_MONTH:   i64 = 0x08;
+const RTC_YEAR:    i64 = 0x09;
+const RTC_CENTURY: i64 = 0x32;
+const RTC_STATUS_A: i64 = 0x0A;
+const RTC_STATUS_B: i64 = 0x0B;
+
+// Status A bits
+const RTC_UIP: i64 = 0x80;  // Update in progress
+
+// Status B bits
+const RTC_DM:  i64 = 0x04;  // 1=binary, 0=BCD
+const RTC_24H: i64 = 0x02;  // 1=24-hour, 0=12-hour
+
+// ─── Time Structure ────────────────────────────────────────────────────────
+
+pub struct RtcTime {
+    pub seconds: i64,
+    pub minutes: i64,
+    pub hours: i64,
+    pub day: i64,
+    pub month: i64,
+    pub year: i64,
+    pub century: i64,
+}
+
+// ─── CMOS Read/Write ──────────────────────────────────────────────────────
+
+fn cmos_read(reg: i64) -> i64 {
+    p_outb(CMOS_ADDR, reg);
+    return p_inb(CMOS_DATA);
+}
+
+fn cmos_write(reg: i64, val: i64) {
+    p_outb(CMOS_ADDR, reg);
+    p_outb(CMOS_DATA, val);
+}
+
+// ─── BCD Conversion ────────────────────────────────────────────────────────
+
+fn bcd_to_binary(bcd: i64) -> i64 {
+    return ((bcd & 0xF0) >> 4) * 10 + (bcd & 0x0F);
+}
+
+fn is_bcd_mode() -> bool {
+    var status_b: i64 = cmos_read(RTC_STATUS_B);
+    return (status_b & RTC_DM) == 0;
+}
+
+fn is_24h_mode() -> bool {
+    var status_b: i64 = cmos_read(RTC_STATUS_B);
+    return (status_b & RTC_24H) != 0;
+}
+
+// ─── RTC Read ──────────────────────────────────────────────────────────────
+
+// Wait for RTC to not be updating
+fn rtc_wait_for_update() {
+    while (cmos_read(RTC_STATUS_A) & RTC_UIP) != 0 {
+        // Wait
+    }
+}
+
+pub fn rtc_read() -> RtcTime {
+    // Read twice to avoid update race
+    var time1: RtcTime = rtc_read_raw();
+    var time2: RtcTime = rtc_read_raw();
+
+    // Keep reading until two consecutive reads match
+    var attempts: i64 = 0;
+    while !rtc_equal(time1, time2) && attempts < 10 {
+        time1 = time2;
+        time2 = rtc_read_raw();
+        attempts = attempts + 1;
+    }
+
+    return time1;
+}
+
+fn rtc_read_raw() -> RtcTime {
+    rtc_wait_for_update();
+
+    var bcd: bool = is_bcd_mode();
+    var h24: bool = is_24h_mode();
+
+    var sec: i64 = cmos_read(RTC_SECONDS);
+    var min: i64 = cmos_read(RTC_MINUTES);
+    var hour: i64 = cmos_read(RTC_HOURS);
+    var day: i64 = cmos_read(RTC_DAY);
+    var mon: i64 = cmos_read(RTC_MONTH);
+    var year: i64 = cmos_read(RTC_YEAR);
+    var century: i64 = cmos_read(RTC_CENTURY);
+
+    if bcd {
+        sec = bcd_to_binary(sec);
+        min = bcd_to_binary(min);
+        hour = bcd_to_binary(hour);
+        day = bcd_to_binary(day);
+        mon = bcd_to_binary(mon);
+        year = bcd_to_binary(year);
+        if century != 0 { century = bcd_to_binary(century); }
+    }
+
+    // Handle 12-hour format
+    if !h24 {
+        if (hour & 0x80) != 0 {
+            hour = hour & 0x7F;
+            hour = hour + 12;
+        }
+    }
+
+    if century == 0 { century = 20; }
+    var full_year: i64 = century * 100 + year;
+
+    return RtcTime {
+        seconds: sec,
+        minutes: min,
+        hours: hour,
+        day: day,
+        month: mon,
+        year: full_year,
+        century: century,
+    };
+}
+
+fn rtc_equal(a: RtcTime, b: RtcTime) -> bool {
+    return a.seconds == b.seconds &&
+           a.minutes == b.minutes &&
+           a.hours == b.hours &&
+           a.day == b.day &&
+           a.month == b.month &&
+           a.year == b.year;
+}
+
+// ─── Unix Epoch ────────────────────────────────────────────────────────────
+
+// Days per month (non-leap year)
+fn days_in_month(month: i64, year: i64) -> i64 {
+    if month == 1 { return 31; }
+    if month == 2 {
+        if is_leap_year(year) { return 29; }
+        return 28;
+    }
+    if month == 3 { return 31; }
+    if month == 4 { return 30; }
+    if month == 5 { return 31; }
+    if month == 6 { return 30; }
+    if month == 7 { return 31; }
+    if month == 8 { return 31; }
+    if month == 9 { return 30; }
+    if month == 10 { return 31; }
+    if month == 11 { return 30; }
+    if month == 12 { return 31; }
+    return 30;
+}
+
+fn is_leap_year(year: i64) -> bool {
+    if (year % 4) != 0 { return false; }
+    if (year % 100) != 0 { return true; }
+    if (year % 400) != 0 { return false; }
+    return true;
+}
+
+fn days_from_epoch(year: i64, month: i64, day: i64) -> i64 {
+    var total: i64 = 0;
+    var y: i64 = 1970;
+    while y < year {
+        if is_leap_year(y) {
+            total = total + 366;
+        } else {
+            total = total + 365;
+        }
+        y = y + 1;
+    }
+
+    var m: i64 = 1;
+    while m < month {
+        total = total + days_in_month(m, year);
+        m = m + 1;
+    }
+
+    total = total + day - 1;
+    return total;
+}
+
+pub fn rtc_to_unix(time: RtcTime) -> i64 {
+    var days: i64 = days_from_epoch(time.year, time.month, time.day);
+    var seconds: i64 = time.hours * 3600 + time.minutes * 60 + time.seconds;
+    return days * 86400 + seconds;
+}
+
+// ─── Formatting ────────────────────────────────────────────────────────────
+
+fn pad2(n: i64) -> str {
+    if n < 10 { return "0" + int_to_str(n); }
+    return int_to_str(n);
+}
+
+fn pad4(n: i64) -> str {
+    if n < 10 { return "000" + int_to_str(n); }
+    if n < 100 { return "00" + int_to_str(n); }
+    if n < 1000 { return "0" + int_to_str(n); }
+    return int_to_str(n);
+}
+
+pub fn rtc_format(time: RtcTime) -> str {
+    return pad4(time.year) + "-" + pad2(time.month) + "-" + pad2(time.day) +
+           " " + pad2(time.hours) + ":" + pad2(time.minutes) + ":" + pad2(time.seconds);
+}
+
+pub fn rtc_format_date(time: RtcTime) -> str {
+    return pad4(time.year) + "-" + pad2(time.month) + "-" + pad2(time.day);
+}
+
+pub fn rtc_format_time(time: RtcTime) -> str {
+    return pad2(time.hours) + ":" + pad2(time.minutes) + ":" + pad2(time.seconds);
+}
+
+pub fn rtc_now_string() -> str {
+    return rtc_format(rtc_read());
+}
+
+// ─── Month Names ───────────────────────────────────────────────────────────
+
+pub fn rtc_month_name(month: i64) -> str {
+    if month == 1 { return "January"; }
+    if month == 2 { return "February"; }
+    if month == 3 { return "March"; }
+    if month == 4 { return "April"; }
+    if month == 5 { return "May"; }
+    if month == 6 { return "June"; }
+    if month == 7 { return "July"; }
+    if month == 8 { return "August"; }
+    if month == 9 { return "September"; }
+    if month == 10 { return "October"; }
+    if month == 11 { return "November"; }
+    if month == 12 { return "December"; }
+    return "Unknown";
+}
+
+pub fn rtc_day_name(year: i64, month: i64, day: i64) -> str {
+    // Zeller's congruence
+    var y: i64 = year;
+    var m: i64 = month;
+    if m < 3 {
+        m = m + 12;
+        y = y - 1;
+    }
+    var k: i64 = y % 100;
+    var j: i64 = y / 100;
+    var h: i64 = (day + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+    // h: 0=Saturday, 1=Sunday, ..., 6=Friday
+    if h == 0 { return "Saturday"; }
+    if h == 1 { return "Sunday"; }
+    if h == 2 { return "Monday"; }
+    if h == 3 { return "Tuesday"; }
+    if h == 4 { return "Wednesday"; }
+    if h == 5 { return "Thursday"; }
+    if h == 6 { return "Friday"; }
+    return "Unknown";
+}

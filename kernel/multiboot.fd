@@ -1,0 +1,285 @@
+// stdlib/multiboot.fd — Multiboot2 info structure parsing
+//
+// After GRUB loads a Multiboot2 kernel, it passes a pointer to the
+// Multiboot2 info structure in RBX. This module parses the tag chain
+// to extract:
+//   - Memory map (available RAM regions)
+//   - Framebuffer info (pitch, width, height, bpp, address)
+//   - Boot modules (initrd, ramdisk)
+//   - Command line
+//   - Boot loader name
+//   - EFI system table (for UEFI boots)
+//
+// Usage:
+//   use multiboot;
+//   var info = multiboot_parse(mbi_ptr);
+//   var i = 0;
+//   while i < info.mmap.len() {
+//       var entry = info.mmap.get(i);
+//       if entry.type == 1 { /* available RAM */ }
+//       i = i + 1;
+//   }
+//
+// Only works in --bare or --boot mode (no OS, no stdlib).
+
+module multiboot;
+
+use vec;
+use string;
+
+// ─── Multiboot2 Tag Types ─────────────────────────────────────────────────
+
+const MB_TAG_END:             i64 = 0;
+const MB_TAG_CMDLINE:         i64 = 1;
+const MB_TAG_BOOT_LOADER:     i64 = 2;
+const MB_TAG_MODULE:          i64 = 3;
+const MB_TAG_BASIC_MEM:       i64 = 4;
+const MB_TAG_BIOS_BOOT_DEV:   i64 = 5;
+const MB_TAG_MMAP:            i64 = 6;
+const MB_TAG_VBE:             i64 = 7;
+const MB_TAG_FRAMEBUFFER:     i64 = 8;
+const MB_TAG_ELF_SECTIONS:    i64 = 9;
+const MB_TAG_APM_TABLE:       i64 = 10;
+const MB_TAG_EFI32:           i64 = 11;
+const MB_TAG_EFI64:           i64 = 12;
+const MB_TAG_SMBIOS:          i64 = 13;
+const MB_TAG_ACPI_OLD:        i64 = 14;
+const MB_TAG_ACPI_NEW:        i64 = 15;
+const MB_TAG_NETWORK:         i64 = 16;
+const MB_TAG_EFI_MMAP:        i64 = 17;
+const MB_TAG_EFI_BS_HANDLE:   i64 = 18;
+const MB_TAG_EFI64_IMAGE:     i64 = 19;
+const MB_TAG_IMAGE_LOAD_BASE: i64 = 20;
+
+// ─── Memory Map Entry Types ───────────────────────────────────────────────
+
+const MMAP_AVAILABLE:  i64 = 1;
+const MMAP_RESERVED:   i64 = 2;
+const MMAP_ACPI_RECL:  i64 = 3;
+const MMAP_ACPI_NVS:   i64 = 4;
+const MMAP_BAD_MEM:    i64 = 5;
+
+// ─── Structures ───────────────────────────────────────────────────────────
+
+pub struct MmapEntry {
+    pub base_addr: i64,
+    pub length: i64,
+    pub type: i64,
+}
+
+pub struct ModuleEntry {
+    pub start: i64,
+    pub end: i64,
+    pub cmdline: str,
+}
+
+pub struct FramebufferInfo {
+    pub addr: i64,
+    pub pitch: i64,
+    pub width: i64,
+    pub height: i64,
+    pub bpp: i64,
+    pub type: i64,
+}
+
+pub struct MultibootInfo {
+    pub cmdline: str,
+    pub loader_name: str,
+    pub mmap: Vec<MmapEntry>,
+    pub modules: Vec<ModuleEntry>,
+    pub framebuffer: FramebufferInfo,
+    pub mem_lower: i64,
+    pub mem_upper: i64,
+    pub has_framebuffer: bool,
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+fn read_u32_at(addr: i64, offset: i64) -> i64 {
+    var b0: i64 = p_phys_read8(addr + offset);
+    var b1: i64 = p_phys_read8(addr + offset + 1);
+    var b2: i64 = p_phys_read8(addr + offset + 2);
+    var b3: i64 = p_phys_read8(addr + offset + 3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn read_u64_at(addr: i64, offset: i64) -> i64 {
+    var lo: i64 = read_u32_at(addr, offset);
+    var hi: i64 = read_u32_at(addr, offset + 4);
+    return lo | (hi << 32);
+}
+
+fn read_cstr_at(addr: i64, offset: i64) -> str {
+    var result: str = "";
+    var pos: i64 = offset;
+    var c: i64 = p_phys_read8(addr + pos);
+    while c != 0 {
+        result = result + char_to_str(c);
+        pos = pos + 1;
+        c = p_phys_read8(addr + pos);
+    }
+    return result;
+}
+
+// Align to next 8 bytes (Multiboot2 tags are 8-byte aligned)
+fn align_up_8(val: i64) -> i64 {
+    return (val + 7) & (-8);
+}
+
+// ─── Main Parser ──────────────────────────────────────────────────────────
+
+pub fn multiboot_parse(mbi_addr: i64) -> MultibootInfo {
+    var info: MultibootInfo = MultibootInfo {
+        cmdline: "",
+        loader_name: "",
+        mmap: Vec::new(),
+        modules: Vec::new(),
+        framebuffer: FramebufferInfo { addr: 0, pitch: 0, width: 0, height: 0, bpp: 0, type: 0 },
+        mem_lower: 0,
+        mem_upper: 0,
+        has_framebuffer: false,
+    };
+
+    // Multiboot2 info structure starts with:
+    //   u32 total_size
+    //   u32 reserved
+    var total_size: i64 = read_u32_at(mbi_addr, 0);
+    var pos: i64 = 8; // Skip header
+
+    while pos < total_size {
+        var tag_type: i64 = read_u32_at(mbi_addr, pos);
+        var tag_size: i64 = read_u32_at(mbi_addr, pos + 4);
+
+        if tag_type == MB_TAG_END {
+            pos = total_size;
+        } else if tag_type == MB_TAG_CMDLINE {
+            info.cmdline = read_cstr_at(mbi_addr, pos + 8);
+        } else if tag_type == MB_TAG_BOOT_LOADER {
+            info.loader_name = read_cstr_at(mbi_addr, pos + 8);
+        } else if tag_type == MB_TAG_BASIC_MEM {
+            info.mem_lower = read_u32_at(mbi_addr, pos + 8);
+            info.mem_upper = read_u32_at(mbi_addr, pos + 12);
+        } else if tag_type == MB_TAG_MMAP {
+            parse_mmap_tag(mbi_addr, pos, tag_size, &info);
+        } else if tag_type == MB_TAG_MODULE {
+            parse_module_tag(mbi_addr, pos, &info);
+        } else if tag_type == MB_TAG_FRAMEBUFFER {
+            parse_framebuffer_tag(mbi_addr, pos, &info);
+        }
+
+        // Advance to next tag (8-byte aligned)
+        pos = pos + align_up_8(tag_size);
+        if tag_size == 0 { pos = total_size; }
+    }
+
+    return info;
+}
+
+fn parse_mmap_tag(base: i64, tag_pos: i64, tag_size: i64, info: &mut MultibootInfo) {
+    // MMAP tag layout:
+    //   u32 type=6, u32 size
+    //   u32 entry_size, u32 entry_version
+    //   entry[] — each entry is entry_size bytes
+    var entry_size: i64 = read_u32_at(base, tag_pos + 8);
+    var entry_version: i64 = read_u32_at(base, tag_pos + 12);
+    var entries_start: i64 = tag_pos + 16;
+    var data_size: i64 = tag_size - 16;
+    var num_entries: i64 = data_size / entry_size;
+
+    var i: i64 = 0;
+    while i < num_entries {
+        var offset: i64 = entries_start + i * entry_size;
+        var base_addr: i64 = read_u64_at(base, offset);
+        var length: i64 = read_u64_at(base, offset + 8);
+        var type: i64 = read_u32_at(base, offset + 16);
+        info.mmap.push(MmapEntry {
+            base_addr: base_addr,
+            length: length,
+            type: type,
+        });
+        i = i + 1;
+    }
+}
+
+fn parse_module_tag(base: i64, tag_pos: i64, info: &mut MultibootInfo) {
+    // Module tag layout:
+    //   u32 type=3, u32 size
+    //   u32 mod_start, u32 mod_end
+    //   char[] cmdline
+    var mod_start: i64 = read_u32_at(base, tag_pos + 8);
+    var mod_end: i64 = read_u32_at(base, tag_pos + 12);
+    var cmdline: str = read_cstr_at(base, tag_pos + 16);
+    info.modules.push(ModuleEntry {
+        start: mod_start,
+        end: mod_end,
+        cmdline: cmdline,
+    });
+}
+
+fn parse_framebuffer_tag(base: i64, tag_pos: i64, info: &mut MultibootInfo) {
+    // Framebuffer tag layout:
+    //   u32 type=8, u32 size
+    //   u64 framebuffer_addr
+    //   u32 framebuffer_pitch
+    //   u32 framebuffer_width
+    //   u32 framebuffer_height
+    //   u8  framebuffer_bpp
+    //   u8  framebuffer_type
+    //   u8  color_info[]
+    info.framebuffer.addr = read_u64_at(base, tag_pos + 8);
+    info.framebuffer.pitch = read_u32_at(base, tag_pos + 16);
+    info.framebuffer.width = read_u32_at(base, tag_pos + 20);
+    info.framebuffer.height = read_u32_at(base, tag_pos + 24);
+    info.framebuffer.bpp = p_phys_read8(base + tag_pos + 28);
+    info.framebuffer.type = p_phys_read8(base + tag_pos + 29);
+    info.has_framebuffer = true;
+}
+
+// ─── Utility Functions ────────────────────────────────────────────────────
+
+pub fn multiboot_total_ram(info: MultibootInfo) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < info.mmap.len() {
+        var entry: MmapEntry = info.mmap.get(i);
+        if entry.type == MMAP_AVAILABLE {
+            total = total + entry.length;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+pub fn multiboot_first_module(info: MultibootInfo) -> ModuleEntry {
+    if info.modules.len() > 0 {
+        return info.modules.get(0);
+    }
+    return ModuleEntry { start: 0, end: 0, cmdline: "" };
+}
+
+pub fn multiboot_module_count(info: MultibootInfo) -> i64 {
+    return info.modules.len();
+}
+
+pub fn multiboot_mmap_count(info: MultibootInfo) -> i64 {
+    return info.mmap.len();
+}
+
+pub fn multiboot_mmap_get(info: MultibootInfo, index: i64) -> MmapEntry {
+    return info.mmap.get(index);
+}
+
+pub fn multiboot_is_available(info: MultibootInfo, addr: i64, size: i64) -> bool {
+    var i: i64 = 0;
+    while i < info.mmap.len() {
+        var entry: MmapEntry = info.mmap.get(i);
+        if entry.type == MMAP_AVAILABLE {
+            var end: i64 = entry.base_addr + entry.length;
+            if addr >= entry.base_addr && (addr + size) <= end {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}

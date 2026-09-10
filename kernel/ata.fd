@@ -1,0 +1,332 @@
+// stdlib/ata.fd — ATA/IDE block device driver (PIO mode)
+//
+// Provides:
+//   - ATA/IDE PIO mode read/write (port 0x1F0)
+//   - LBA28 sector addressing
+//   - Partition table parsing (MBR)
+//   - Block device interface (read_block/write_block)
+//
+// Usage:
+//   use ata;
+//   ata_init();
+//   var buf = p_malloc(512);
+//   ata_read_sector(0, buf);
+//   // buf now contains 512 bytes of sector 0 (MBR)
+//
+// Only works in --bare or --boot mode.
+
+module ata;
+
+use vec;
+use string;
+
+// ─── ATA/IDE Port Addresses ───────────────────────────────────────────────
+
+const ATA_PRIMARY_DATA:     i64 = 0x1F0;
+const ATA_PRIMARY_ERROR:    i64 = 0x1F1;
+const ATA_PRIMARY_COUNT:   i64 = 0x1F2;
+const ATA_PRIMARY_LBA_LO:  i64 = 0x1F3;
+const ATA_PRIMARY_LBA_MID: i64 = 0x1F4;
+const ATA_PRIMARY_LBA_HI:  i64 = 0x1F5;
+const ATA_PRIMARY_DEVICE:  i64 = 0x1F6;
+const ATA_PRIMARY_STATUS:  i64 = 0x1F7;
+const ATA_PRIMARY_COMMAND: i64 = 0x1F7;
+
+const ATA_SECONDARY_DATA:     i64 = 0x170;
+const ATA_SECONDARY_ERROR:    i64 = 0x171;
+const ATA_SECONDARY_COUNT:   i64 = 0x172;
+const ATA_SECONDARY_LBA_LO:  i64 = 0x173;
+const ATA_SECONDARY_LBA_MID: i64 = 0x174;
+const ATA_SECONDARY_LBA_HI:  i64 = 0x175;
+const ATA_SECONDARY_DEVICE:  i64 = 0x176;
+const ATA_SECONDARY_STATUS:  i64 = 0x177;
+const ATA_SECONDARY_COMMAND: i64 = 0x177;
+
+// ─── ATA Commands ────────────────────────────────────────────────────────
+
+const ATA_CMD_READ_PIO:    i64 = 0x20;
+const ATA_CMD_READ_DMA:   i64 = 0xC8;
+const ATA_CMD_WRITE_PIO:  i64 = 0x30;
+const ATA_CMD_WRITE_DMA:  i64 = 0xCA;
+const ATA_CMD_IDENTIFY:   i64 = 0xEC;
+const ATA_CMD_FLUSH:      i64 = 0xE7;
+
+// ─── ATA Status Bits ──────────────────────────────────────────────────────
+
+const ATA_STAT_ERR:   i64 = 0x01;
+const ATA_STAT_DRQ:   i64 = 0x08;
+const ATA_STAT_SRV:   i64 = 0x10;
+const ATA_STAT_DF:    i64 = 0x20;
+const ATA_STAT_RDY:   i64 = 0x40;
+const ATA_STAT_BSY:   i64 = 0x80;
+
+// ─── Device Selection ──────────────────────────────────────────────────────
+
+const ATA_MASTER: i64 = 0x00;
+const ATA_SLAVE:  i64 = 0x10;
+const ATA_LBA:    i64 = 0x40;
+
+// ─── MBR Structure ────────────────────────────────────────────────────────
+
+const MBR_SIGNATURE: i64 = 0xAA55;
+const MBR_PARTITION_OFFSET: i64 = 446;
+const MBR_PARTITION_SIZE: i64 = 16;
+
+pub struct PartitionEntry {
+    pub bootable: bool,
+    pub start_lba: i64,
+    pub num_sectors: i64,
+    pub type: i64,
+}
+
+var ata_initialized: bool = false;
+
+// ─── Initialization ────────────────────────────────────────────────────────
+
+pub fn ata_init() {
+    ata_initialized = true;
+}
+
+// ─── Wait for Status ──────────────────────────────────────────────────────
+
+fn ata_wait_status(base: i64, mask: i64, value: i64) -> bool {
+    var attempts: i64 = 0;
+    while attempts < 1000000 {
+        var status: i64 = p_inb(base + 7);  // status port
+        if (status & mask) == value { return true; }
+        attempts = attempts + 1;
+    }
+    return false;
+}
+
+fn ata_wait_not_busy(base: i64) -> bool {
+    return ata_wait_status(base, ATA_STAT_BSY, 0);
+}
+
+fn ata_wait_drq(base: i64) -> bool {
+    return ata_wait_status(base, ATA_STAT_DRQ, ATA_STAT_DRQ);
+}
+
+// ─── Read Sector (LBA28) ──────────────────────────────────────────────────
+
+pub fn ata_read_sector(lba: i64, buf: i64) -> bool {
+    return ata_read_sector_pio(ATA_PRIMARY_DATA, ATA_MASTER, lba, buf);
+}
+
+pub fn ata_read_sector_pio(base: i64, dev: i64, lba: i64, buf: i64) -> bool {
+    if !ata_initialized { return false; }
+
+    // Select device with LBA mode
+    p_outb(base + 6, ATA_LBA | dev | ((lba >> 24) & 0x0F));
+
+    // Set sector count = 1
+    p_outb(base + 2, 1);
+
+    // Set LBA address
+    p_outb(base + 3, lba & 0xFF);
+    p_outb(base + 4, (lba >> 8) & 0xFF);
+    p_outb(base + 5, (lba >> 16) & 0xFF);
+
+    // Send READ command
+    p_outb(base + 7, ATA_CMD_READ_PIO);
+
+    // Wait for data ready
+    if !ata_wait_not_busy(base) { return false; }
+    if !ata_wait_drq(base) { return false; }
+
+    // Check for error
+    var status: i64 = p_inb(base + 7);
+    if (status & ATA_STAT_ERR) != 0 { return false; }
+
+    // Read 256 16-bit words (512 bytes)
+    var i: i64 = 0;
+    while i < 256 {
+        var data: i64 = p_inw(base);
+        p_phys_write8(buf + i * 2, data & 0xFF);
+        p_phys_write8(buf + i * 2 + 1, (data >> 8) & 0xFF);
+        i = i + 1;
+    }
+
+    return true;
+}
+
+// ─── Write Sector (LBA28) ─────────────────────────────────────────────────
+
+pub fn ata_write_sector(lba: i64, buf: i64) -> bool {
+    return ata_write_sector_pio(ATA_PRIMARY_DATA, ATA_MASTER, lba, buf);
+}
+
+pub fn ata_write_sector_pio(base: i64, dev: i64, lba: i64, buf: i64) -> bool {
+    if !ata_initialized { return false; }
+
+    // Select device with LBA mode
+    p_outb(base + 6, ATA_LBA | dev | ((lba >> 24) & 0x0F));
+
+    // Set sector count = 1
+    p_outb(base + 2, 1);
+
+    // Set LBA address
+    p_outb(base + 3, lba & 0xFF);
+    p_outb(base + 4, (lba >> 8) & 0xFF);
+    p_outb(base + 5, (lba >> 16) & 0xFF);
+
+    // Send WRITE command
+    p_outb(base + 7, ATA_CMD_WRITE_PIO);
+
+    // Wait for data ready
+    if !ata_wait_not_busy(base) { return false; }
+    if !ata_wait_drq(base) { return false; }
+
+    // Write 256 16-bit words (512 bytes)
+    var i: i64 = 0;
+    while i < 256 {
+        var lo: i64 = p_phys_read8(buf + i * 2);
+        var hi: i64 = p_phys_read8(buf + i * 2 + 1);
+        var data: i64 = lo | (hi << 8);
+        p_outw(base, data);
+        i = i + 1;
+    }
+
+    // Flush cache
+    p_outb(base + 7, ATA_CMD_FLUSH);
+    ata_wait_not_busy(base);
+
+    return true;
+}
+
+// ─── Read Multiple Sectors ────────────────────────────────────────────────
+
+pub fn ata_read_blocks(start_lba: i64, count: i64, buf: i64) -> bool {
+    var i: i64 = 0;
+    while i < count {
+        if !ata_read_sector(start_lba + i, buf + i * 512) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn ata_write_blocks(start_lba: i64, count: i64, buf: i64) -> bool {
+    var i: i64 = 0;
+    while i < count {
+        if !ata_write_sector(start_lba + i, buf + i * 512) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ─── Identify Device ──────────────────────────────────────────────────────
+
+pub fn ata_identify(base: i64, dev: i64, buf: i64) -> bool {
+    p_outb(base + 6, dev);
+    p_outb(base + 7, ATA_CMD_IDENTIFY);
+
+    // Wait for DRQ
+    if !ata_wait_not_busy(base) { return false; }
+    if !ata_wait_drq(base) { return false; }
+
+    var status: i64 = p_inb(base + 7);
+    if status == 0 { return false; }
+    if (status & ATA_STAT_ERR) != 0 { return false; }
+
+    // Read 256 words (512 bytes)
+    var i: i64 = 0;
+    while i < 256 {
+        var data: i64 = p_inw(base);
+        p_phys_write8(buf + i * 2, data & 0xFF);
+        p_phys_write8(buf + i * 2 + 1, (data >> 8) & 0xFF);
+        i = i + 1;
+    }
+
+    return true;
+}
+
+// ─── MBR Partition Table Parsing ─────────────────────────────────────────
+
+pub fn ata_read_mbr(buf: i64) -> bool {
+    return ata_read_sector(0, buf);
+}
+
+pub fn ata_parse_partitions(buf: i64) -> Vec<PartitionEntry> {
+    var partitions: Vec<PartitionEntry> = Vec::new();
+
+    // Check MBR signature
+    var sig: i64 = p_phys_read8(buf + 510) | (p_phys_read8(buf + 511) << 8);
+    if sig != MBR_SIGNATURE { return partitions; }
+
+    // Parse 4 partition entries
+    var i: i64 = 0;
+    while i < 4 {
+        var offset: i64 = MBR_PARTITION_OFFSET + i * MBR_PARTITION_SIZE;
+
+        var boot_flag: i64 = p_phys_read8(buf + offset);
+        var type: i64 = p_phys_read8(buf + offset + 4);
+
+        // Start LBA (32-bit little-endian at offset+8)
+        var start_lba: i64 = p_phys_read8(buf + offset + 8) |
+                            (p_phys_read8(buf + offset + 9) << 8) |
+                            (p_phys_read8(buf + offset + 10) << 16) |
+                            (p_phys_read8(buf + offset + 11) << 24);
+
+        // Number of sectors (32-bit little-endian at offset+12)
+        var num_sectors: i64 = p_phys_read8(buf + offset + 12) |
+                              (p_phys_read8(buf + offset + 13) << 8) |
+                              (p_phys_read8(buf + offset + 14) << 16) |
+                              (p_phys_read8(buf + offset + 15) << 24);
+
+        if type != 0 && num_sectors > 0 {
+            partitions.push(PartitionEntry {
+                bootable: boot_flag == 0x80,
+                start_lba: start_lba,
+                num_sectors: num_sectors,
+                type: type,
+            });
+        }
+
+        i = i + 1;
+    }
+
+    return partitions;
+}
+
+pub fn ata_partition_type_name(type: i64) -> str {
+    if type == 0x01 { return "FAT12"; }
+    if type == 0x06 { return "FAT16"; }
+    if type == 0x0B { return "FAT32"; }
+    if type == 0x07 { return "NTFS/exFAT"; }
+    if type == 0x83 { return "Linux"; }
+    if type == 0x82 { return "Linux Swap"; }
+    if type == 0xEE { return "GPT Protective"; }
+    if type == 0x05 || type == 0x0F { return "Extended"; }
+    return "Unknown (0x" + int_to_hex(type) + ")";
+}
+
+fn int_to_hex(val: i64) -> str {
+    var hex: str = "0123456789ABCDEF";
+    var result: str = "";
+    if val == 0 { return "0"; }
+    var v: i64 = val;
+    while v > 0 {
+        var digit: i64 = v & 0xF;
+        result = str_slice(hex, digit, digit + 1) + result;
+        v = v >> 4;
+    }
+    return result;
+}
+
+// ─── Block Device Interface ───────────────────────────────────────────────
+
+pub fn ata_block_size() -> i64 {
+    return 512;
+}
+
+pub fn ata_read_block(block: i64, buf: i64) -> bool {
+    return ata_read_sector(block, buf);
+}
+
+pub fn ata_write_block(block: i64, buf: i64) -> bool {
+    return ata_write_sector(block, buf);
+}

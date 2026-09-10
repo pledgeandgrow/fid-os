@@ -1,0 +1,223 @@
+// kernel/main.fd — ASPIRATIONAL modular kernel design (NOT CURRENTLY BUILT)
+//
+// This file and its dependent modules (isr.fd, keyboard.fd, sched.fd, vfs.fd,
+// acpi.fd, etc.) represent a more ambitious modular kernel architecture.
+//
+// HOWEVER: The current build uses kernel/shell.fd as the canonical kernel.
+// The Makefile builds shell.fd directly:
+//   $(FIDES) emit $(KERNEL_DIR)/shell.fd --boot -o $(KERNEL_RAW)
+//
+// shell.fd is a self-contained kernel that includes:
+//   - Exception handlers (GP, PF, DF)
+//   - Timer interrupt (IRQ0)
+//   - Interrupt-driven keyboard with Shift/CapsLock
+//   - Page-frame memory allocator
+//   - Page table isolation (separate kernel/user PML4)
+//   - ELF64 loader
+//   - Process scheduler (round-robin, 8 slots)
+//   - ATA/PIO disk reads
+//   - User-mode program loading (ring 3)
+//   - VGA text mode console
+//   - COM1 serial output
+//
+// The modular design in this file uses `use` imports and stdlib types
+// (Vec, String, structs) that are not yet available in bare-metal mode.
+// To activate this path, the following would be needed:
+//   1. Multi-module linking support in the PE backend for --boot mode
+//   2. Bare-metal compatible Vec/String implementations
+//   3. Framebuffer support (currently using VGA text mode)
+//   4. ACPI/APIC support (currently using legacy PIC)
+//
+// Until then, shell.fd is the working kernel.
+
+module main;
+
+use multiboot;
+use isr;
+use framebuffer;
+use keyboard;
+use rtc;
+use sched;
+use vfs;
+use acpi;
+
+pub fn kernel_main() -> void {
+    // 1. Parse multiboot info (memory map, framebuffer, modules)
+    var mbi_ptr: i64 = boot_get_multiboot_ptr();
+    var info: MultibootInfo = multiboot_parse(mbi_ptr);
+
+    // 2. Initialize serial console (for debugging)
+    p_serial_init();
+
+    serial_print("[kernel] Fides OS booting...\n");
+    serial_print("[kernel] Memory: ");
+    serial_print_int(multiboot_total_ram(info) / 1024 / 1024);
+    serial_print(" MB\n");
+
+    // 3. Initialize framebuffer (if available)
+    if info.has_framebuffer {
+        fb_init(info.framebuffer.addr, info.framebuffer.pitch,
+                info.framebuffer.width, info.framebuffer.height,
+                info.framebuffer.bpp);
+        fb_clear(FB_COLOR_BLUE);
+        fb_set_text_color(FB_COLOR_WHITE, FB_COLOR_BLUE);
+        fb_print("Fides OS\n");
+        fb_print("========\n\n");
+        fb_print("Memory: ");
+        fb_print_int(multiboot_total_ram(info) / 1024 / 1024);
+        fb_print(" MB\n\n");
+    }
+
+    // 4. Set up GDT, IDT, and interrupts
+    isr_init();
+    isr_pic_remap();
+    serial_print("[kernel] Interrupts initialized\n");
+
+    // 5. Initialize keyboard
+    keyboard_init();
+    serial_print("[kernel] Keyboard initialized\n");
+
+    // 6. Initialize RTC
+    var time: RtcTime = rtc_read();
+    serial_print("[kernel] Time: ");
+    serial_print(rtc_format(time));
+    serial_print("\n");
+
+    // 7. Initialize scheduler
+    sched_init();
+    serial_print("[kernel] Scheduler initialized\n");
+
+    // 8. Mount ramdisk (if modules loaded)
+    if multiboot_module_count(info) > 0 {
+        var mod1: ModuleEntry = multiboot_first_module(info);
+        if vfs_mount_ramdisk(mod1.start, mod1.end - mod1.start) {
+            serial_print("[kernel] Ramdisk mounted (");
+            serial_print_int(vfs_ramdisk_entry_count());
+            serial_print(" files)\n");
+            fb_print("Ramdisk: ");
+            fb_print_int(vfs_ramdisk_entry_count());
+            fb_print(" files\n\n");
+        }
+    }
+
+    // 9. Initialize ACPI (for power off)
+    if acpi_init() {
+        serial_print("[kernel] ACPI initialized\n");
+    }
+
+    // 10. Start shell
+    serial_print("[kernel] Starting shell...\n");
+    fb_print("Type 'help' for commands.\n\n");
+    shell_start();
+
+    // Should never reach here
+    serial_print("[kernel] PANIC: shell returned\n");
+    halt_forever();
+}
+
+// ─── Shell ─────────────────────────────────────────────────────────────────
+
+fn shell_start() -> void {
+    fb_print("> ");
+    var cmd: str = "";
+    while true {
+        if keyboard_has_key() {
+            var c: i64 = keyboard_getc();
+            if c == 10 { // Enter
+                fb_putc(10);
+                shell_execute(cmd);
+                cmd = "";
+                fb_print("> ");
+            } else if c == 8 { // Backspace
+                if str_len(cmd) > 0 {
+                    cmd = str_slice(cmd, 0, str_len(cmd) - 1);
+                    fb_putc(8);
+                }
+            } else if c >= 32 && c < 127 {
+                cmd = cmd + char_to_str(c);
+                fb_putc(c);
+            }
+        }
+        p_hlt();
+    }
+}
+
+fn shell_execute(cmd: str) -> void {
+    if str_equal(cmd, "help") {
+        fb_print("Commands:\n");
+        fb_print("  help     - show this help\n");
+        fb_print("  mem      - show memory info\n");
+        fb_print("  time     - show current time\n");
+        fb_print("  ls       - list ramdisk files\n");
+        fb_print("  clear    - clear screen\n");
+        fb_print("  reboot   - reboot system\n");
+        fb_print("  poweroff - power off\n");
+        return;
+    }
+    if str_equal(cmd, "mem") {
+        var info: MultibootInfo = multiboot_parse(boot_get_multiboot_ptr());
+        fb_print("Total RAM: ");
+        fb_print_int(multiboot_total_ram(info) / 1024 / 1024);
+        fb_print(" MB\n");
+        return;
+    }
+    if str_equal(cmd, "time") {
+        var t: RtcTime = rtc_read();
+        fb_print(rtc_format(t));
+        fb_print("\n");
+        return;
+    }
+    if str_equal(cmd, "ls") {
+        var i: i64 = 0;
+        var count: i64 = vfs_ramdisk_entry_count();
+        while i < count {
+            fb_print("  ");
+            fb_print(vfs_ramdisk_get_name(i));
+            fb_print("\n");
+            i = i + 1;
+        }
+        if count == 0 { fb_print("No ramdisk mounted\n"); }
+        return;
+    }
+    if str_equal(cmd, "clear") {
+        fb_clear(FB_COLOR_BLUE);
+        return;
+    }
+    if str_equal(cmd, "reboot") {
+        fb_print("Rebooting...\n");
+        acpi_reboot();
+        return;
+    }
+    if str_equal(cmd, "poweroff") {
+        fb_print("Powering off...\n");
+        acpi_power_off();
+        return;
+    }
+    if str_len(cmd) > 0 {
+        fb_print("Unknown command: ");
+        fb_print(cmd);
+        fb_print("\n");
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+fn serial_print(s: str) -> void {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        p_serial_putc(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+fn serial_print_int(n: i64) -> void {
+    serial_print(int_to_str(n));
+}
+
+fn halt_forever() -> void {
+    p_cli();
+    while true {
+        p_hlt();
+    }
+    return;
+}

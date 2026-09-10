@@ -1,0 +1,380 @@
+// stdlib/elf_loader.fd — ELF64 executable loader
+//
+// Provides:
+//   - Parse ELF64 header, program headers
+//   - Load PT_LOAD segments into user address space
+//   - Set up user stack with argv/envp
+//   - Jump to entry point in ring 3
+//
+// Usage:
+//   use elf_loader;
+//   var entry = elf_load(binary_addr, binary_size);
+//   if entry > 0 {
+//       elf_run(entry, stack_top);
+//   }
+//
+// Only works in --bare or --boot mode.
+
+module elf_loader;
+
+use vec;
+use string;
+
+// ─── ELF Constants ────────────────────────────────────────────────────────
+
+const ELF_MAGIC:        i64 = 0x464C457F;  // \x7FELF
+const ELF_CLASS_64:     i64 = 2;
+const ELF_DATA_LE:      i64 = 1;
+const ELF_TYPE_EXEC:    i64 = 2;
+const ELF_TYPE_DYN:    i64 = 3;
+const ELF_MACHINE_X86_64: i64 = 62;
+
+// Program header types
+const PT_NULL:    i64 = 0;
+const PT_LOAD:    i64 = 1;
+const PT_DYNAMIC: i64 = 2;
+const PT_INTERP:  i64 = 3;
+const PT_NOTE:    i64 = 4;
+const PT_TLS:     i64 = 7;
+const PT_GNU_STACK: i64 = 0x6474E551;
+const PT_GNU_RELRO: i64 = 0x6474E552;
+
+// Program header flags
+const PF_X: i64 = 1;
+const PF_W: i64 = 2;
+const PF_R: i64 = 4;
+
+// ─── ELF64 Header Structure ───────────────────────────────────────────────
+
+pub struct Elf64Header {
+    pub ident: Vec<i64>,   // 16 bytes
+    pub type: i64,
+    pub machine: i64,
+    pub version: i64,
+    pub entry: i64,
+    pub phoff: i64,
+    pub shoff: i64,
+    pub flags: i64,
+    pub ehsize: i64,
+    pub phentsize: i64,
+    pub phnum: i64,
+    pub shentsize: i64,
+    pub shnum: i64,
+    pub shstrndx: i64,
+}
+
+pub struct Elf64Phdr {
+    pub type: i64,
+    pub flags: i64,
+    pub offset: i64,
+    pub vaddr: i64,
+    pub paddr: i64,
+    pub filesz: i64,
+    pub memsz: i64,
+    pub align: i64,
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+fn read_u8_at(buf: i64, offset: i64) -> i64 {
+    return p_phys_read8(buf + offset);
+}
+
+fn read_u16_at(buf: i64, offset: i64) -> i64 {
+    var b0: i64 = p_phys_read8(buf + offset);
+    var b1: i64 = p_phys_read8(buf + offset + 1);
+    return b0 | (b1 << 8);
+}
+
+fn read_u32_at(buf: i64, offset: i64) -> i64 {
+    var b0: i64 = p_phys_read8(buf + offset);
+    var b1: i64 = p_phys_read8(buf + offset + 1);
+    var b2: i64 = p_phys_read8(buf + offset + 2);
+    var b3: i64 = p_phys_read8(buf + offset + 3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn read_u64_at(buf: i64, offset: i64) -> i64 {
+    var lo: i64 = read_u32_at(buf, offset);
+    var hi: i64 = read_u32_at(buf, offset + 4);
+    return lo | (hi << 32);
+}
+
+// ─── ELF Header Parsing ───────────────────────────────────────────────────
+
+pub fn elf_parse_header(buf: i64) -> Elf64Header {
+    var header: Elf64Header = Elf64Header {
+        ident: Vec::new(),
+        type: 0,
+        machine: 0,
+        version: 0,
+        entry: 0,
+        phoff: 0,
+        shoff: 0,
+        flags: 0,
+        ehsize: 0,
+        phentsize: 0,
+        phnum: 0,
+        shentsize: 0,
+        shnum: 0,
+        shstrndx: 0,
+    };
+
+    // Read ident (16 bytes)
+    var i: i64 = 0;
+    while i < 16 {
+        header.ident.push(read_u8_at(buf, i));
+        i = i + 1;
+    }
+
+    header.type = read_u16_at(buf, 16);
+    header.machine = read_u16_at(buf, 18);
+    header.version = read_u32_at(buf, 20);
+    header.entry = read_u64_at(buf, 24);
+    header.phoff = read_u64_at(buf, 32);
+    header.shoff = read_u64_at(buf, 40);
+    header.flags = read_u32_at(buf, 48);
+    header.ehsize = read_u16_at(buf, 52);
+    header.phentsize = read_u16_at(buf, 54);
+    header.phnum = read_u16_at(buf, 56);
+    header.shentsize = read_u16_at(buf, 58);
+    header.shnum = read_u16_at(buf, 60);
+    header.shstrndx = read_u16_at(buf, 62);
+
+    return header;
+}
+
+pub fn elf_is_valid(header: Elf64Header) -> bool {
+    if header.ident.len() < 4 { return false; }
+    // Check magic: 0x7F 'E' 'L' 'F'
+    if header.ident.get(0) != 0x7F { return false; }
+    if header.ident.get(1) != 0x45 { return false; }  // 'E'
+    if header.ident.get(2) != 0x4C { return false; }  // 'L'
+    if header.ident.get(3) != 0x46 { return false; }  // 'F'
+    // Check class (64-bit)
+    if header.ident.get(4) != ELF_CLASS_64 { return false; }
+    // Check machine
+    if header.machine != ELF_MACHINE_X86_64 { return false; }
+    return true;
+}
+
+// ─── Program Header Parsing ───────────────────────────────────────────────
+
+pub fn elf_parse_phdr(buf: i64, offset: i64) -> Elf64Phdr {
+    var phdr: Elf64Phdr = Elf64Phdr {
+        type: 0,
+        flags: 0,
+        offset: 0,
+        vaddr: 0,
+        paddr: 0,
+        filesz: 0,
+        memsz: 0,
+        align: 0,
+    };
+
+    phdr.type = read_u32_at(buf, offset);
+    phdr.flags = read_u32_at(buf, offset + 4);
+    phdr.offset = read_u64_at(buf, offset + 8);
+    phdr.vaddr = read_u64_at(buf, offset + 16);
+    phdr.paddr = read_u64_at(buf, offset + 24);
+    phdr.filesz = read_u64_at(buf, offset + 32);
+    phdr.memsz = read_u64_at(buf, offset + 40);
+    phdr.align = read_u64_at(buf, offset + 48);
+
+    return phdr;
+}
+
+// ─── Segment Loading ──────────────────────────────────────────────────────
+
+pub fn elf_load_segment(buf: i64, phdr: Elf64Phdr) -> i64 {
+    if phdr.type != PT_LOAD { return -1; }
+
+    // Map pages for the segment
+    var vaddr: i64 = phdr.vaddr;
+    var memsz: i64 = phdr.memsz;
+    var filesz: i64 = phdr.filesz;
+    var offset: i64 = phdr.offset;
+
+    // Calculate number of pages needed
+    var page_start: i64 = vaddr & ~0xFFF;
+    var page_end: i64 = (vaddr + memsz + 0xFFF) & ~0xFFF;
+    var num_pages: i64 = (page_end - page_start) / 4096;
+
+    // Map pages (in bare-metal mode, this uses the page table)
+    var flags: i64 = 0;
+    if (phdr.flags & PF_R) != 0 { flags = flags | 1; }
+    if (phdr.flags & PF_W) != 0 { flags = flags | 2; }
+    if (phdr.flags & PF_X) != 0 { flags = flags | 4; }
+
+    var i: i64 = 0;
+    while i < num_pages {
+        // Map page at page_start + i*4096 to a physical page
+        // p_page_map(cr3, page_start + i*4096, phys_page, flags);
+        i = i + 1;
+    }
+
+    // Copy file contents to virtual address
+    var j: i64 = 0;
+    while j < filesz {
+        var byte: i64 = read_u8_at(buf, offset + j);
+        p_phys_write8(vaddr + j, byte);
+        j = j + 1;
+    }
+
+    // Zero out BSS (memsz - filesz)
+    var k: i64 = filesz;
+    while k < memsz {
+        p_phys_write8(vaddr + k, 0);
+        k = k + 1;
+    }
+
+    return vaddr;
+}
+
+// ─── Full ELF Load ────────────────────────────────────────────────────────
+
+pub fn elf_load(buf: i64) -> i64 {
+    var header: Elf64Header = elf_parse_header(buf);
+
+    if !elf_is_valid(header) { return -1; }
+
+    // Load all PT_LOAD segments
+    var i: i64 = 0;
+    while i < header.phnum {
+        var phdr_offset: i64 = header.phoff + i * header.phentsize;
+        var phdr: Elf64Phdr = elf_parse_phdr(buf, phdr_offset);
+
+        if phdr.type == PT_LOAD {
+            elf_load_segment(buf, phdr);
+        }
+
+        i = i + 1;
+    }
+
+    return header.entry;
+}
+
+// ─── User Stack Setup ──────────────────────────────────────────────────────
+
+pub fn elf_setup_stack(stack_top: i64, argv: Vec<str>, envp: Vec<str>) -> i64 {
+    var sp: i64 = stack_top;
+
+    // Push environment strings
+    var env_ptrs: Vec<i64> = Vec::new();
+    var i: i64 = envp.len() - 1;
+    while i >= 0 {
+        var s: str = envp.get(i);
+        var len: i64 = str_len(s) + 1;
+        sp = sp - len;
+        var j: i64 = 0;
+        while j < str_len(s) {
+            p_phys_write8(sp + j, str_byte_at(s, j));
+            j = j + 1;
+        }
+        p_phys_write8(sp + str_len(s), 0);
+        env_ptrs.push(sp);
+        i = i - 1;
+    }
+
+    // Push argument strings
+    var argv_ptrs: Vec<i64> = Vec::new();
+    i = argv.len() - 1;
+    while i >= 0 {
+        var s: str = argv.get(i);
+        var len: i64 = str_len(s) + 1;
+        sp = sp - len;
+        var j: i64 = 0;
+        while j < str_len(s) {
+            p_phys_write8(sp + j, str_byte_at(s, j));
+            j = j + 1;
+        }
+        p_phys_write8(sp + str_len(s), 0);
+        argv_ptrs.push(sp);
+        i = i - 1;
+    }
+
+    // Align stack to 16 bytes
+    sp = sp & ~0xF;
+
+    // Build the initial stack frame:
+    //   argc, argv[0], argv[1], ..., 0, envp[0], ..., 0, auxv (null)
+
+    // Push null auxv
+    sp = sp - 16;
+    p_phys_write8(sp, 0);
+    p_phys_write8(sp + 8, 0);
+
+    // Push null envp terminator
+    sp = sp - 8;
+    p_phys_write8(sp, 0);
+
+    // Push envp pointers
+    i = 0;
+    while i < env_ptrs.len() {
+        sp = sp - 8;
+        var ptr: i64 = env_ptrs.get(i);
+        p_phys_write8(sp, ptr & 0xFF);
+        p_phys_write8(sp + 1, (ptr >> 8) & 0xFF);
+        p_phys_write8(sp + 2, (ptr >> 16) & 0xFF);
+        p_phys_write8(sp + 3, (ptr >> 24) & 0xFF);
+        p_phys_write8(sp + 4, (ptr >> 32) & 0xFF);
+        p_phys_write8(sp + 5, (ptr >> 40) & 0xFF);
+        p_phys_write8(sp + 6, (ptr >> 48) & 0xFF);
+        p_phys_write8(sp + 7, (ptr >> 56) & 0xFF);
+        i = i + 1;
+    }
+
+    // Push null argv terminator
+    sp = sp - 8;
+    p_phys_write8(sp, 0);
+
+    // Push argv pointers
+    i = 0;
+    while i < argv_ptrs.len() {
+        sp = sp - 8;
+        var ptr: i64 = argv_ptrs.get(i);
+        p_phys_write8(sp, ptr & 0xFF);
+        p_phys_write8(sp + 1, (ptr >> 8) & 0xFF);
+        p_phys_write8(sp + 2, (ptr >> 16) & 0xFF);
+        p_phys_write8(sp + 3, (ptr >> 24) & 0xFF);
+        p_phys_write8(sp + 4, (ptr >> 32) & 0xFF);
+        p_phys_write8(sp + 5, (ptr >> 40) & 0xFF);
+        p_phys_write8(sp + 6, (ptr >> 48) & 0xFF);
+        p_phys_write8(sp + 7, (ptr >> 56) & 0xFF);
+        i = i + 1;
+    }
+
+    // Push argc
+    sp = sp - 8;
+    var argc: i64 = argv_ptrs.len();
+    p_phys_write8(sp, argc & 0xFF);
+    p_phys_write8(sp + 1, (argc >> 8) & 0xFF);
+    p_phys_write8(sp + 2, (argc >> 16) & 0xFF);
+    p_phys_write8(sp + 3, (argc >> 24) & 0xFF);
+    p_phys_write8(sp + 4, (argc >> 32) & 0xFF);
+    p_phys_write8(sp + 5, (argc >> 40) & 0xFF);
+    p_phys_write8(sp + 6, (argc >> 48) & 0xFF);
+    p_phys_write8(sp + 7, (argc >> 56) & 0xFF);
+
+    return sp;
+}
+
+// ─── Run ELF ──────────────────────────────────────────────────────────────
+
+pub fn elf_run(entry: i64, stack: i64) {
+    // Enter ring 3 to run the program
+    // In bare-metal mode:
+    //   syscall_enter_ring3(entry, stack, 0);
+    p_ring3_enter(entry, stack, 0);
+}
+
+// ─── Load and Run ─────────────────────────────────────────────────────────
+
+pub fn elf_load_and_run(buf: i64, stack_top: i64, argv: Vec<str>, envp: Vec<str>) -> i64 {
+    var entry: i64 = elf_load(buf);
+    if entry < 0 { return -1; }
+
+    var sp: i64 = elf_setup_stack(stack_top, argv, envp);
+    elf_run(entry, sp);
+    return 0;
+}

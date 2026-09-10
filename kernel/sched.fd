@@ -1,0 +1,349 @@
+// stdlib/sched.fd — Preemptive scheduler and thread management
+//
+// Provides:
+//   - Thread Control Block (TCB) with saved registers, stack, state
+//   - Round-robin scheduler
+//   - Context switch (save/restore RAX-R15, RIP, RSP, RBP)
+//   - Timer IRQ-driven preemption
+//   - Thread create/exit/join
+//   - Sleep/yield
+//
+// Usage:
+//   use sched;
+//   sched_init();
+//   var tid = sched_create_thread(my_thread_func, 0);
+//   sched_start();  // begins scheduling, never returns
+//
+// Only works in --bare or --boot mode.
+
+module sched;
+
+use vec;
+use string;
+
+// ─── Thread States ─────────────────────────────────────────────────────────
+
+const THREAD_READY:    i64 = 0;
+const THREAD_RUNNING:  i64 = 1;
+const THREAD_BLOCKED:  i64 = 2;
+const THREAD_SLEEPING: i64 = 3;
+const THREAD_DEAD:     i64 = 4;
+
+// ─── Constants ────────────────────────────────────────────────────────────
+
+const MAX_THREADS: i64 = 64;
+const STACK_SIZE:  i64 = 16384;  // 16KB per thread
+const QUANTUM:     i64 = 10;     // timer ticks per quantum
+
+// ─── Saved CPU State ──────────────────────────────────────────────────────
+
+pub struct CpuState {
+    pub rax: i64,
+    pub rbx: i64,
+    pub rcx: i64,
+    pub rdx: i64,
+    pub rsi: i64,
+    pub rdi: i64,
+    pub rbp: i64,
+    pub rsp: i64,
+    pub r8: i64,
+    pub r9: i64,
+    pub r10: i64,
+    pub r11: i64,
+    pub r12: i64,
+    pub r13: i64,
+    pub r14: i64,
+    pub r15: i64,
+    pub rip: i64,
+    pub rflags: i64,
+}
+
+// ─── Thread Control Block ─────────────────────────────────────────────────
+
+pub struct Tcb {
+    pub tid: i64,
+    pub state: i64,
+    pub stack_base: i64,
+    pub stack_size: i64,
+    pub saved_state: CpuState,
+    pub wake_time: i64,    // tick count when thread should wake
+    pub exit_code: i64,
+    pub join_tid: i64,     // thread waiting for this to exit (-1 = none)
+}
+
+// ─── Scheduler State ───────────────────────────────────────────────────────
+
+var threads: Vec<Tcb> = Vec::new();
+var current_tid: i64 = 0;
+var next_tid: i64 = 1;
+var tick_count: i64 = 0;
+var scheduler_started: bool = false;
+
+// ─── Initialization ────────────────────────────────────────────────────────
+
+pub fn sched_init() {
+    threads = Vec::new();
+    current_tid = 0;
+    next_tid = 1;
+    tick_count = 0;
+    scheduler_started = false;
+
+    // Create thread 0 (kernel main thread)
+    var main_thread: Tcb = Tcb {
+        tid: 0,
+        state: THREAD_RUNNING,
+        stack_base: 0,  // uses current stack
+        stack_size: 0,
+        saved_state: CpuState { rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0, rsp: 0, r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: 0, rflags: 0 },
+        wake_time: 0,
+        exit_code: 0,
+        join_tid: -1,
+    };
+    threads.push(main_thread);
+}
+
+// ─── Thread Creation ───────────────────────────────────────────────────────
+
+pub fn sched_create_thread(entry: i64, arg: i64) -> i64 {
+    if threads.len() >= MAX_THREADS { return -1; }
+
+    var tid: i64 = next_tid;
+    next_tid = next_tid + 1;
+
+    // Allocate stack (in bare-metal mode, this would use the kernel allocator)
+    // For now, we use a placeholder stack address
+    var stack_base: i64 = 0;  // Must be allocated via kalloc
+    var stack_top: i64 = stack_base + STACK_SIZE;
+
+    // Set up initial CPU state for the new thread
+    var state: CpuState = CpuState {
+        rax: 0, rbx: 0, rcx: 0, rdx: 0,
+        rsi: arg, rdi: arg,  // first arg in rdi (System V ABI)
+        rbp: stack_top,
+        rsp: stack_top - 8,  // leave room for return address
+        r8: 0, r9: 0, r10: 0, r11: 0,
+        r12: 0, r13: 0, r14: 0, r15: 0,
+        rip: entry,
+        rflags: 0x202,  // IF flag set
+    };
+
+    var tcb: Tcb = Tcb {
+        tid: tid,
+        state: THREAD_READY,
+        stack_base: stack_base,
+        stack_size: STACK_SIZE,
+        saved_state: state,
+        wake_time: 0,
+        exit_code: 0,
+        join_tid: -1,
+    };
+
+    threads.push(tcb);
+    return tid;
+}
+
+// ─── Thread Exit ──────────────────────────────────────────────────────────
+
+pub fn sched_exit(code: i64) {
+    if current_tid < 0 || current_tid >= threads.len() { return; }
+
+    var tcb: Tcb = threads.get(current_tid);
+    tcb.state = THREAD_DEAD;
+    tcb.exit_code = code;
+
+    // Wake up any thread waiting to join
+    if tcb.join_tid >= 0 && tcb.join_tid < threads.len() {
+        var waiter: Tcb = threads.get(tcb.join_tid);
+        if waiter.state == THREAD_BLOCKED {
+            waiter.state = THREAD_READY;
+            threads.set(tcb.join_tid, waiter);
+        }
+    }
+
+    threads.set(current_tid, tcb);
+
+    // Yield to scheduler (never returns)
+    sched_yield();
+}
+
+// ─── Thread Join ───────────────────────────────────────────────────────────
+
+pub fn sched_join(tid: i64) -> i64 {
+    if tid < 0 || tid >= threads.len() { return -1; }
+
+    var target: Tcb = threads.get(tid);
+    if target.state == THREAD_DEAD {
+        return target.exit_code;
+    }
+
+    // Block current thread until target exits
+    var current: Tcb = threads.get(current_tid);
+    current.state = THREAD_BLOCKED;
+    current.join_tid = -1;
+    threads.set(current_tid, current);
+
+    target.join_tid = current_tid;
+    threads.set(tid, target);
+
+    sched_yield();
+
+    // When we resume, the target should be dead
+    target = threads.get(tid);
+    return target.exit_code;
+}
+
+// ─── Sleep ────────────────────────────────────────────────────────────────
+
+pub fn sched_sleep(ticks: i64) {
+    if current_tid < 0 || current_tid >= threads.len() { return; }
+
+    var tcb: Tcb = threads.get(current_tid);
+    tcb.state = THREAD_SLEEPING;
+    tcb.wake_time = tick_count + ticks;
+    threads.set(current_tid, tcb);
+
+    sched_yield();
+}
+
+// ─── Yield ─────────────────────────────────────────────────────────────────
+
+pub fn sched_yield() {
+    // Trigger a context switch via the timer IRQ
+    // In bare-metal mode, this would:
+    // 1. Save current state
+    // 2. Call scheduler to pick next thread
+    // 3. Restore next thread's state
+    // For now, we just call the scheduler
+    sched_schedule();
+}
+
+// ─── Scheduler ────────────────────────────────────────────────────────────
+
+pub fn sched_schedule() {
+    if threads.len() == 0 { return; }
+
+    // Save current thread's state
+    if current_tid >= 0 && current_tid < threads.len() {
+        var current: Tcb = threads.get(current_tid);
+        if current.state == THREAD_RUNNING {
+            current.state = THREAD_READY;
+        }
+        // In bare-metal mode, we'd save registers here
+        // saved_state = current saved CPU state
+        threads.set(current_tid, current);
+    }
+
+    // Find next ready thread (round-robin)
+    var next: i64 = current_tid + 1;
+    var found: bool = false;
+    var attempts: i64 = 0;
+
+    while !found && attempts < threads.len() {
+        if next >= threads.len() { next = 0; }
+
+        var tcb: Tcb = threads.get(next);
+
+        // Check if sleeping thread should wake
+        if tcb.state == THREAD_SLEEPING && tick_count >= tcb.wake_time {
+            tcb.state = THREAD_READY;
+            threads.set(next, tcb);
+        }
+
+        if tcb.state == THREAD_READY {
+            found = true;
+        } else {
+            next = next + 1;
+            attempts = attempts + 1;
+        }
+    }
+
+    if !found {
+        // No ready threads — idle
+        return;
+    }
+
+    // Switch to next thread
+    var tcb: Tcb = threads.get(next);
+    tcb.state = THREAD_RUNNING;
+    threads.set(next, tcb);
+
+    current_tid = next;
+
+    // In bare-metal mode, we'd restore registers here
+    // p_context_restore(&tcb.saved_state)
+}
+
+// ─── Timer IRQ Handler ────────────────────────────────────────────────────
+
+// Called by the timer IRQ handler (vector 0x20)
+pub fn sched_timer_irq() {
+    tick_count = tick_count + 1;
+
+    // Check if current thread's quantum expired
+    if (tick_count % QUANTUM) == 0 {
+        sched_schedule();
+    }
+}
+
+// ─── Start Scheduler ──────────────────────────────────────────────────────
+
+pub fn sched_start() {
+    scheduler_started = true;
+    // Enable timer IRQ and interrupts
+    // In bare-metal mode:
+    //   isr_pic_mask(0, false);  // unmask timer IRQ
+    //   p_sti();
+    // Then halt — the timer will fire and start scheduling
+    p_hlt();
+}
+
+// ─── Query Functions ──────────────────────────────────────────────────────
+
+pub fn sched_current_tid() -> i64 {
+    return current_tid;
+}
+
+pub fn sched_thread_count() -> i64 {
+    return threads.len();
+}
+
+pub fn sched_get_state(tid: i64) -> i64 {
+    if tid < 0 || tid >= threads.len() { return THREAD_DEAD; }
+    return threads.get(tid).state;
+}
+
+pub fn sched_tick_count() -> i64 {
+    return tick_count;
+}
+
+// ─── Context Switch (inline asm) ──────────────────────────────────────────
+
+// In bare-metal mode, context switch would be:
+//   save rax-r15, rsp, rip, rflags to TCB
+//   switch to new stack
+//   restore rax-r15, rsp, rip, rflags from new TCB
+//
+// This is typically done in assembly:
+//   sched_switch:
+//     push rbp
+//     push rbx
+//     push r12
+//     push r13
+//     push r14
+//     push r15
+//     mov [rdi + OFFSET_RSP], rsp   ; save rsp to old TCB
+//     mov rsp, [rsi + OFFSET_RSP]   ; load rsp from new TCB
+//     pop r15
+//     pop r14
+//     pop r13
+//     pop r12
+//     pop rbx
+//     pop rbp
+//     ret
+//
+// For now, this is a stub — the actual context switch is done
+// by the runtime via inline asm when running bare-metal.
+pub fn sched_context_switch(old_tcb: i64, new_tcb: i64) {
+    // p_context_save(old_tcb);
+    // p_context_restore(new_tcb);
+}
