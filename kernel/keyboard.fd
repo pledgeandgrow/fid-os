@@ -42,78 +42,108 @@ interrupt fn irq1_handler() -> void {
     // Send EOI to master PIC
     p_outb(0x20, 0x20);
 }
+
 // Read a scancode from the buffer. Returns -1 if no scancode available.
 // Uses hlt to wait for interrupts (CPU sleeps until a key is pressed).
 // The interrupt handler stores the raw scancode at KBD_RAW_SCANCODE and
 // sets KBD_SCANCODE_READY. This function reads the raw scancode and
 // returns it. Scancode processing (shift, caps, extended) is done in
 // scancode_to_ascii().
+//
+// NOTE: No `return` inside `if` blocks — PE backend generates incorrect
+// label resolutions for that pattern, causing jumps to land in the middle
+// of instructions and crash with page faults.
 pub fn kbd_read_scancode() -> i64 {
-    while true {
-        // Check if a new scancode is ready (non-zero = ready)
-        var sc: i64 = p_mem_read8(KBD_RAW_SCANCODE);
-        if sc != 0 {
-            // Clear the scancode (0 = no key)
-            p_mem_write8(KBD_RAW_SCANCODE, 0);
-            return sc;
+    var sc: i64 = 0;
+    while sc == 0 {
+        sc = p_mem_read8(KBD_RAW_SCANCODE);
+        if sc == 0 {
+            p_hlt();
         }
-        // No data — sleep until next interrupt
-        p_hlt();
     }
-    return -1;
+    // Clear the scancode (0 = no key)
+    p_mem_write8(KBD_RAW_SCANCODE, 0);
+    return sc;
 }
 
 // Process shift/caps/extended state from a raw scancode.
 // Returns -1 if the scancode is a modifier (shift, caps, extended)
 // and should be consumed (not returned to the caller).
 // Returns the scancode unchanged if it's a regular key.
+//
+// NOTE: No `return` inside `if` blocks — PE backend limitation.
 pub fn kbd_process_modifiers(sc: i64) -> i64 {
+    var result: i64 = sc;
+
     // Handle 0xE0 extended key prefix
     if sc == 0xE0 {
         p_mem_write8(KBD_EXTENDED, 1);
-        return -1;
+        result = -1;
     }
 
     // If extended flag is set, add 0x100 to distinguish extended keys
     var ext: i64 = p_mem_read8(KBD_EXTENDED);
     if ext == 1 {
-        p_mem_write8(KBD_EXTENDED, 0);
-        return sc + 256;
+        if sc != 0xE0 {
+            p_mem_write8(KBD_EXTENDED, 0);
+            result = sc + 256;
+        }
     }
 
     // Track Shift state
-    if sc == 0x2A || sc == 0x36 {
+    if sc == 0x2A {
         p_mem_write8(KBD_SHIFT, 1);
-        return -1;
+        result = -1;
     }
-    if sc == 0xAA || sc == 0xB6 {
+    if sc == 0x36 {
+        p_mem_write8(KBD_SHIFT, 1);
+        result = -1;
+    }
+    if sc == 0xAA {
         p_mem_write8(KBD_SHIFT, 0);
-        return -1;
+        result = -1;
+    }
+    if sc == 0xB6 {
+        p_mem_write8(KBD_SHIFT, 0);
+        result = -1;
     }
 
     // Toggle CapsLock on 0x3A
     if sc == 0x3A {
         var caps: i64 = p_mem_read8(KBD_CAPS);
-        if caps == 0 { p_mem_write8(KBD_CAPS, 1); }
-        else { p_mem_write8(KBD_CAPS, 0); }
-        return -1;
+        if caps == 0 {
+            p_mem_write8(KBD_CAPS, 1);
+        }
+        if caps != 0 {
+            p_mem_write8(KBD_CAPS, 0);
+        }
+        result = -1;
     }
 
-    return sc;
+    return result;
 }
 
 // Convert scancode to ASCII, respecting Shift and CapsLock state.
+//
+// NOTE: No `return` inside `if` blocks — PE backend generates incorrect
+// label resolutions for that pattern, causing jumps to land in the middle
+// of instructions and crash with page faults. All results are stored in
+// a single `result` variable and returned at the end.
 pub fn scancode_to_ascii(sc: i64) -> i64 {
+    var result: i64 = -1;
+
     // Release codes (bit 7 set) are not characters
-    if (sc & 0x80) != 0 { return -1; }
+    if (sc & 0x80) != 0 {
+        result = -1;
+    }
 
     var shift: i64 = p_mem_read8(KBD_SHIFT);
     var caps: i64 = p_mem_read8(KBD_CAPS);
 
     // Special keys
-    if sc == 0x1C { return 10; }  // Enter
-    if sc == 0x39 { return 32; }  // Space
-    if sc == 0x0E { return 8;  }  // Backspace
+    if sc == 0x1C { result = 10; }  // Enter
+    if sc == 0x39 { result = 32; }  // Space
+    if sc == 0x0E { result = 8;  }  // Backspace
 
     // Letters (a-z): apply Shift or CapsLock for uppercase
     var letter: i64 = -1;
@@ -132,38 +162,43 @@ pub fn scancode_to_ascii(sc: i64) -> i64 {
     if sc == 0x15 { letter = 121; } if sc == 0x2C { letter = 122; }
     if letter != -1 {
         // Uppercase if (shift XOR caps) for letters
-        if (shift != 0) != (caps != 0) {
-            return letter - 32; // to uppercase
+        var upper: i64 = 0;
+        if shift != 0 { upper = 1; }
+        if caps != 0 { upper = 1 - upper; }
+        if upper != 0 {
+            result = letter - 32; // to uppercase
         }
-        return letter;
+        if upper == 0 {
+            result = letter;
+        }
     }
 
     // Number row: shifted gives symbols
-    if sc == 0x02 { if shift != 0 { return 33; }  return 49; }  // 1 or !
-    if sc == 0x03 { if shift != 0 { return 64; }  return 50; }  // 2 or @
-    if sc == 0x04 { if shift != 0 { return 35; }  return 51; }  // 3 or #
-    if sc == 0x05 { if shift != 0 { return 36; }  return 52; }  // 4 or $
-    if sc == 0x06 { if shift != 0 { return 37; }  return 53; }  // 5 or %
-    if sc == 0x07 { if shift != 0 { return 94; }  return 54; }  // 6 or ^
-    if sc == 0x08 { if shift != 0 { return 38; }  return 55; }  // 7 or &
-    if sc == 0x09 { if shift != 0 { return 42; }  return 56; }  // 8 or *
-    if sc == 0x0A { if shift != 0 { return 40; }  return 57; }  // 9 or (
-    if sc == 0x0B { if shift != 0 { return 41; }  return 48; }  // 0 or )
+    if sc == 0x02 { if shift != 0 { result = 33; } if shift == 0 { result = 49; } }  // 1 or !
+    if sc == 0x03 { if shift != 0 { result = 64; } if shift == 0 { result = 50; } }  // 2 or @
+    if sc == 0x04 { if shift != 0 { result = 35; } if shift == 0 { result = 51; } }  // 3 or #
+    if sc == 0x05 { if shift != 0 { result = 36; } if shift == 0 { result = 52; } }  // 4 or $
+    if sc == 0x06 { if shift != 0 { result = 37; } if shift == 0 { result = 53; } }  // 5 or %
+    if sc == 0x07 { if shift != 0 { result = 94; } if shift == 0 { result = 54; } }  // 6 or ^
+    if sc == 0x08 { if shift != 0 { result = 38; } if shift == 0 { result = 55; } }  // 7 or &
+    if sc == 0x09 { if shift != 0 { result = 42; } if shift == 0 { result = 56; } }  // 8 or *
+    if sc == 0x0A { if shift != 0 { result = 40; } if shift == 0 { result = 57; } }  // 9 or (
+    if sc == 0x0B { if shift != 0 { result = 41; } if shift == 0 { result = 48; } }  // 0 or )
 
     // Punctuation (unshifted)
-    if sc == 0x0C { if shift != 0 { return 95; }  return 45; }  // - or _
-    if sc == 0x0D { if shift != 0 { return 43; }  return 61; }  // = or +
-    if sc == 0x33 { if shift != 0 { return 60; }  return 44; }  // , or <
-    if sc == 0x34 { if shift != 0 { return 62; }  return 46; }  // . or >
-    if sc == 0x35 { if shift != 0 { return 63; }  return 47; }  // / or ?
+    if sc == 0x0C { if shift != 0 { result = 95; } if shift == 0 { result = 45; } }  // - or _
+    if sc == 0x0D { if shift != 0 { result = 43; } if shift == 0 { result = 61; } }  // = or +
+    if sc == 0x33 { if shift != 0 { result = 60; } if shift == 0 { result = 44; } }  // , or <
+    if sc == 0x34 { if shift != 0 { result = 62; } if shift == 0 { result = 46; } }  // . or >
+    if sc == 0x35 { if shift != 0 { result = 63; } if shift == 0 { result = 47; } }  // / or ?
 
     // Additional keys
-    if sc == 0x27 { if shift != 0 { return 123; } return 59; }  // ; or {
-    if sc == 0x28 { if shift != 0 { return 125; } return 39; }  // ' or }
-    if sc == 0x29 { if shift != 0 { return 126; } return 96; }  // ` or ~
-    if sc == 0x2B { if shift != 0 { return 124; } return 92; }  // \ or |
-    if sc == 0x1A { if shift != 0 { return 123; } return 91; }  // [ or {
-    if sc == 0x1B { if shift != 0 { return 125; } return 93; }  // ] or }
+    if sc == 0x27 { if shift != 0 { result = 123; } if shift == 0 { result = 59; } }  // ; or {
+    if sc == 0x28 { if shift != 0 { result = 125; } if shift == 0 { result = 39; } }  // ' or }
+    if sc == 0x29 { if shift != 0 { result = 126; } if shift == 0 { result = 96; } }  // ` or ~
+    if sc == 0x2B { if shift != 0 { result = 124; } if shift == 0 { result = 92; } }  // \ or |
+    if sc == 0x1A { if shift != 0 { result = 123; } if shift == 0 { result = 91; } }  // [ or {
+    if sc == 0x1B { if shift != 0 { result = 125; } if shift == 0 { result = 93; } }  // ] or }
 
-    return -1;
+    return result;
 }

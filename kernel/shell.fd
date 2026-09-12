@@ -604,42 +604,54 @@ fn shell_history_add(len: i64) -> void {
 fn shell_history_recall(direction: i64) -> i64 {
     // direction: -1 = up (older), 1 = down (newer)
     // Returns the new input length, or -1 if no history
+    // NOTE: No `return` inside `if` blocks — PE backend limitation
+    var result: i64 = -1;
     var count: i64 = p_mem_read32(HIST_COUNT);
-    if count == 0 { return -1; }
-    var idx: i64 = p_mem_read32(HIST_INDEX);
-    if direction == -1 {
-        // Up: go to older entry
-        if idx > 0 { idx = idx - 1; }
-        else { return -1; }
-    } else {
-        // Down: go to newer entry
-        if idx < count { idx = idx + 1; }
-        else { return -1; }
+    if count != 0 {
+        var idx: i64 = p_mem_read32(HIST_INDEX);
+        var ok: i64 = 1;
+        if direction == -1 {
+            // Up: go to older entry
+            if idx > 0 { idx = idx - 1; }
+            if idx <= 0 { ok = 0; }
+        }
+        if direction != -1 {
+            // Down: go to newer entry
+            if idx < count { idx = idx + 1; }
+            if idx >= count { ok = 0; }
+        }
+        if ok != 0 {
+            p_mem_write32(HIST_INDEX, idx);
+            // If index is at count (past the last), clear input
+            if idx >= count {
+                input_clear();
+                result = 0;
+            }
+            if idx < count {
+                // Load the entry into the input buffer
+                var entry: i64 = HIST_ENTRIES + (idx % HIST_MAX) * HIST_ENTRY_SIZE;
+                input_clear();
+                var i: i64 = 0;
+                while i < HIST_ENTRY_SIZE {
+                    var c: i64 = p_mem_read8(entry + i);
+                    if c == 0 { break; }
+                    input_write(i, c);
+                    i = i + 1;
+                }
+                result = i;
+            }
+        }
     }
-    p_mem_write32(HIST_INDEX, idx);
-    // If index is at count (past the last), clear input
-    if idx >= count {
-        input_clear();
-        return 0;
-    }
-    // Load the entry into the input buffer
-    var entry: i64 = HIST_ENTRIES + (idx % HIST_MAX) * HIST_ENTRY_SIZE;
-    input_clear();
-    var i: i64 = 0;
-    while i < HIST_ENTRY_SIZE {
-        var c: i64 = p_mem_read8(entry + i);
-        if c == 0 { break; }
-        input_write(i, c);
-        i = i + 1;
-    }
-    return i;
+    return result;
 }
 
 // ─── Shell Tab Completion ────────────────────────────────────────────────
 // Try to complete the current input against known commands.
 // Returns the new input length if completed, 0 if no match.
 fn shell_tab_complete(input_len: i64) -> i64 {
-    if input_len == 0 { return 0; }
+    // NOTE: No `return` inside `if` blocks — PE backend limitation
+    var result: i64 = 0;
+    if input_len != 0 {
     // Check each known command name
     // Commands: help, clear, echo, mem, info, time, date, reboot, poweroff,
     //   malloc, disk, run, elf, ps, ticks, halt, ls, cat, ils, icat, pci,
@@ -733,9 +745,10 @@ fn shell_tab_complete(input_len: i64) -> i64 {
             input_write(i, c);
             i = i + 1;
         }
-        return best_cmd_len;
+        result = best_cmd_len;
     }
-    return 0;
+    }
+    return result;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────
