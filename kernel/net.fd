@@ -1,0 +1,1445 @@
+// kernel/net.fd — E1000 network driver + minimal TCP/IP stack
+//
+// QEMU E1000 NIC (vendor 0x8086, device 0x100e) at PCI 0:3.0.
+// BAR0 is MMIO for register access.
+// TX/RX descriptor rings in kernel heap memory.
+//
+// Stack: Ethernet → ARP → IPv4 → ICMP/UDP/TCP
+
+module net;
+
+use console;
+use pci;
+use kalloc;
+
+// ─── 16-bit memory access helpers (bare-metal has no p_mem_write16) ─────
+fn mem_write16(addr: i64, val: i64) {
+    p_mem_write8(addr, val & 0xFF);
+    p_mem_write8(addr + 1, (val >> 8) & 0xFF);
+}
+fn mem_read16(addr: i64) -> i64 {
+    return p_mem_read8(addr) | (p_mem_read8(addr + 1) << 8);
+}
+
+// ─── MMIO page table mapping (inline, avoids vm module dependency) ──────
+// Maps a 2MB page at the given physical address = virtual address (identity).
+// Uses only 32-bit memory ops to avoid PE backend 64-bit codegen issues.
+// PCD bit (0x10) set to disable caching for MMIO.
+fn map_mmio_2mb(addr: i64) {
+    var pml4_idx: i64 = (addr >> 39) & 0x1FF;
+    var pdpt_idx: i64 = (addr >> 30) & 0x1FF;
+    var pd_idx: i64 = (addr >> 21) & 0x1FF;
+
+    // PML4 is at 0x70000. Read PML4 entry (using two 32-bit reads)
+    var pml4_entry_lo: i64 = p_mem_read32(0x70000 + pml4_idx * 8);
+    var pdpt_addr: i64 = pml4_entry_lo & 0xFFFFF000;
+    if pdpt_addr == 0 {
+        // Allocate new PDPT at 0x74000
+        pdpt_addr = 0x74000;
+        // Zero the PDPT page (512 entries × 8 bytes = 4096 bytes)
+        var i: i64 = 0;
+        while i < 1024 {
+            p_mem_write32(pdpt_addr + i * 4, 0);
+            i = i + 1;
+        }
+        // Set PML4 entry (write low 32 bits, high 32 bits are 0 for addresses < 4GB)
+        p_mem_write32(0x70000 + pml4_idx * 8, pdpt_addr | 0x3);
+        p_mem_write32(0x70000 + pml4_idx * 8 + 4, 0);
+    }
+
+    // Read PDPT entry (using two 32-bit reads)
+    var pdpt_entry_lo: i64 = p_mem_read32(pdpt_addr + pdpt_idx * 8);
+    var pd_addr: i64 = pdpt_entry_lo & 0xFFFFF000;
+    if pd_addr == 0 {
+        // Allocate new PD at 0x310000 + pdpt_idx * 0x1000
+        pd_addr = 0x310000 + pdpt_idx * 0x1000;
+        // Zero the PD page
+        var i: i64 = 0;
+        while i < 1024 {
+            p_mem_write32(pd_addr + i * 4, 0);
+            i = i + 1;
+        }
+        // Set PDPT entry
+        p_mem_write32(pdpt_addr + pdpt_idx * 8, pd_addr | 0x3);
+        p_mem_write32(pdpt_addr + pdpt_idx * 8 + 4, 0);
+    }
+
+    // Set PD entry: 2MB page, present + writable + PS + PCD = 0x93
+    // Physical address must be 2MB aligned
+    var page_addr: i64 = addr & 0xFFE00000;
+    p_mem_write32(pd_addr + pd_idx * 8, page_addr | 0x93);
+    p_mem_write32(pd_addr + pd_idx * 8 + 4, 0);
+    p_invlpg(addr);
+}
+
+// ─── E1000 Register Offsets (MMIO via BAR0) ──────────────────────────────
+pub const E1000_REG_CTRL:   i64 = 0x0000;
+pub const E1000_REG_STATUS: i64 = 0x0008;
+pub const E1000_REG_EEPROM: i64 = 0x0014;
+pub const E1000_REG_RCTRL:  i64 = 0x0100;
+pub const E1000_REG_TCTRL:  i64 = 0x0400;
+pub const E1000_REG_RXDLEN: i64 = 0x2808;
+pub const E1000_REG_RXDBAL: i64 = 0x2800;
+pub const E1000_REG_RXDBAH: i64 = 0x2804;
+pub const E1000_REG_RXDHEAD: i64 = 0x2810;
+pub const E1000_REG_RXDTAIL: i64 = 0x2818;
+pub const E1000_REG_TXDLEN: i64 = 0x3808;
+pub const E1000_REG_TXDBAL: i64 = 0x3800;
+pub const E1000_REG_TXDBAH: i64 = 0x3804;
+pub const E1000_REG_TXDHEAD: i64 = 0x3810;
+pub const E1000_REG_TXDTAIL: i64 = 0x3818;
+pub const E1000_REG_RDTR:   i64 = 0x2820;  // RX delay timer
+pub const E1000_REG_RAL0:   i64 = 0x5400;  // Receive Address Low 0
+pub const E1000_REG_RAH0:   i64 = 0x5404;  // Receive Address High 0
+pub const E1000_REG_IMS:    i64 = 0x00D0;  // Interrupt mask set
+pub const E1000_REG_ICR:    i64 = 0x00C0;  // Interrupt cause read
+pub const E1000_REG_RDBAL0: i64 = 0x2800;
+pub const E1000_REG_RDBAH0: i64 = 0x2804;
+pub const E1000_REG_RDLEN0:  i64 = 0x2808;
+pub const E1000_REG_RDH0:   i64 = 0x2810;
+pub const E1000_REG_RDT0:   i64 = 0x2818;
+pub const E1000_REG_TDBAL0: i64 = 0x3800;
+pub const E1000_REG_TDBAH0: i64 = 0x3804;
+pub const E1000_REG_TDLEN0: i64 = 0x3808;
+pub const E1000_REG_TDH0:   i64 = 0x3810;
+pub const E1000_REG_TDT0:   i64 = 0x3818;
+
+// E1000 CTRL bits
+pub const E1000_CTRL_RST:    i64 = 0x04000000;  // bit 26
+pub const E1000_CTRL_SLU:    i64 = 0x00000040;  // bit 6  (set link up)
+pub const E1000_CTRL_FRCSPD: i64 = 0x00000800;  // bit 11
+
+// E1000 RCTL bits
+pub const E1000_RCTL_EN:     i64 = 0x00000002;  // bit 1  (enable)
+pub const E1000_RCTL_UPE:    i64 = 0x00000008;  // bit 3  (unicast promiscuous)
+pub const E1000_RCTL_MPE:    i64 = 0x00000010;  // bit 4  (multicast promiscuous)
+pub const E1000_RCTL_BAM:   i64 = 0x00008000;  // bit 15 (broadcast accept)
+pub const E1000_RCTL_SECRC: i64 = 0x04000000;  // bit 26 (strip CRC)
+pub const E1000_RCTL_BSIZE_2048: i64 = 0;       // 2048-byte buffers
+
+// E1000 TCTL bits
+pub const E1000_TCTL_EN:   i64 = 0x00000002;  // bit 1  (enable)
+pub const E1000_TCTL_PSP:  i64 = 0x00000008;  // bit 3  (pad short packets)
+pub const E1000_TCTL_CT:   i64 = 0x0000FF00;  // collision threshold (bits 8-11)
+pub const E1000_TCTL_COLD: i64 = 0x003F0000;  // collision distance (bits 12-21)
+
+// TX/RX descriptor ring sizes
+pub const NUM_TX_DESC: i64 = 16;
+pub const NUM_RX_DESC: i64 = 16;
+pub const TX_DESC_SIZE: i64 = 16;  // 16 bytes per TX descriptor
+pub const RX_DESC_SIZE: i64 = 16;  // 16 bytes per RX descriptor
+pub const RX_BUFFER_SIZE: i64 = 2048;
+pub const TX_BUFFER_SIZE: i64 = 1518;
+
+// Memory layout for E1000 (at 0x1A0000 - 0x1AFFFF):
+//   TX descriptors:  0x1A0000 (16 × 16 = 256 bytes)
+//   RX descriptors:  0x1A0100 (16 × 16 = 256 bytes)
+//   TX buffers:      0x1A0200 (16 × 1518 = 24288 bytes)
+//   RX buffers:      0x1A6000 (16 × 2048 = 32768 bytes)
+//   MAC address:     0x1AE000 (6 bytes)
+//   ARP cache:       0x1AE100 (16 × 16 = 256 bytes)
+//   ICMP echo ID:    0x1AE200 (2 bytes)
+//   ICMP seq:        0x1AE202 (2 bytes)
+//   Ping reply flag: 0x1AE204 (1 byte)
+//   Ping reply data: 0x1AE210 (4 bytes, stores sender IP)
+pub const E1000_TX_DESC_ADDR: i64 = 0x1A0000;
+pub const E1000_RX_DESC_ADDR: i64 = 0x1A0100;
+pub const E1000_TX_BUF_ADDR:  i64 = 0x1A0200;
+pub const E1000_RX_BUF_ADDR:  i64 = 0x1B0000;
+pub const E1000_MAC_ADDR:     i64 = 0x1AE000;
+pub const ARP_CACHE_ADDR:     i64 = 0x1AE100;
+pub const ICMP_ECHO_ID:       i64 = 0x1AE200;
+pub const ICMP_SEQ:           i64 = 0x1AE202;
+pub const PING_REPLY_FLAG:    i64 = 0x1AE204;
+pub const PING_REPLY_IP:      i64 = 0x1AE210;
+
+// Our IP: 10.0.2.15 (QEMU default user-mode networking)
+// Gateway: 10.0.2.2
+pub const OUR_IP: i64 = 0x0A00020F;  // 10.0.2.15
+pub const GATEWAY_IP: i64 = 0x0A000202;  // 10.0.2.2
+
+pub var e1000_mmio_base: i64 = 0;
+pub var e1000_initialized: i64 = 0;
+pub var tx_next: i64 = 0;  // next TX descriptor to use
+pub var rx_next: i64 = 0;  // next RX descriptor to read
+
+// ─── E1000 Register Access (MMIO) ───────────────────────────────────────
+
+pub fn e1000_write_reg(offset: i64, val: i64) {
+    p_mem_write32(e1000_mmio_base + offset, val);
+}
+
+pub fn e1000_read_reg(offset: i64) -> i64 {
+    return p_mem_read32(e1000_mmio_base + offset);
+}
+
+// ─── E1000 PCI Discovery ────────────────────────────────────────────────
+
+pub fn e1000_find() -> i64 {
+    var i: i64 = 0;
+    while i < pci_device_count {
+        var idx: i64 = i * 16;
+        var vendor: i64 = p_mem_read64(PCI_TABLE + idx);
+        var packed_val: i64 = p_mem_read64(PCI_TABLE + idx + 8);
+        var device: i64 = (packed_val >> 48) & 0xFFFF;
+        if vendor == 0x8086 && device == 0x100E {
+            var bus: i64 = (packed_val >> 16) & 0xFF;
+            var dev: i64 = (packed_val >> 8) & 0xFF;
+            var func: i64 = packed_val & 0xFF;
+            // Read BAR0 (MMIO registers)
+            var bar0: i64 = pci_config_read(bus, dev, func, 0x10);
+            e1000_mmio_base = bar0 & 0xFFFFFFF0;  // mask type bits (memory BAR)
+            // Map the E1000 MMIO region into page tables (2MB page with PCD)
+            map_mmio_2mb(e1000_mmio_base);
+            // Enable bus mastering (PCI command register bit 2)
+            var cmd: i64 = pci_config_read(bus, dev, func, 4);
+            pci_config_write(bus, dev, func, 4, cmd | 0x06);  // bus master + I/O space
+            return 0;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── Read MAC address from EEPROM ───────────────────────────────────────
+// E1000 MAC is stored in EEPROM. Read 3 16-bit words (6 bytes) via EERD register.
+
+pub fn e1000_read_mac(mac_addr: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 3 {
+        // Start EEPROM read: EERD register (0x14)
+        // bit 0 = start, bits 8-8 = address
+        e1000_write_reg(E1000_REG_EEPROM, 1 | (i << 8));
+        // Wait for done (bit 4 = data ready)
+        var timeout: i64 = 100000;
+        var data: i64 = 0;
+        while timeout > 0 {
+            data = e1000_read_reg(E1000_REG_EEPROM);
+            if (data & 0x10) != 0 { break; }
+            timeout = timeout - 1;
+        }
+        if timeout == 0 { return -1; }
+        // Extract 16-bit data (bits 16-31)
+        var word: i64 = (data >> 16) & 0xFFFF;
+        p_mem_write8(mac_addr + i * 2, word & 0xFF);
+        p_mem_write8(mac_addr + i * 2 + 1, (word >> 8) & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ─── Initialize E1000 with TX/RX rings ──────────────────────────────────
+
+pub fn e1000_init() -> i64 {
+    if e1000_find() != 0 { return -1; }
+    if e1000_mmio_base == 0 { return -1; }
+
+    // Read MAC address from EEPROM
+    if e1000_read_mac(E1000_MAC_ADDR) != 0 {
+        // EEPROM read failed — use fallback MAC
+        p_mem_write8(E1000_MAC_ADDR, 0x52);
+        p_mem_write8(E1000_MAC_ADDR + 1, 0x54);
+        p_mem_write8(E1000_MAC_ADDR + 2, 0x00);
+        p_mem_write8(E1000_MAC_ADDR + 3, 0x12);
+        p_mem_write8(E1000_MAC_ADDR + 4, 0x34);
+        p_mem_write8(E1000_MAC_ADDR + 5, 0x56);
+    }
+
+    // Reset the device
+    e1000_write_reg(E1000_REG_CTRL, E1000_CTRL_RST);
+    // Wait for reset to complete
+    var timeout: i64 = 1000000;
+    while timeout > 0 {
+        if (e1000_read_reg(E1000_REG_CTRL) & E1000_CTRL_RST) == 0 { break; }
+        timeout = timeout - 1;
+    }
+
+    // Set link up (SLU)
+    var ctrl: i64 = e1000_read_reg(E1000_REG_CTRL);
+    e1000_write_reg(E1000_REG_CTRL, ctrl | E1000_CTRL_SLU);
+
+    // Set RXDCTL to enable descriptor prefetch (82540)
+    e1000_write_reg(0x2828, 0x01010000);
+
+    // Zero TX/RX descriptor rings
+    var i: i64 = 0;
+    while i < NUM_TX_DESC * TX_DESC_SIZE {
+        p_mem_write8(E1000_TX_DESC_ADDR + i, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < NUM_RX_DESC * RX_DESC_SIZE {
+        p_mem_write8(E1000_RX_DESC_ADDR + i, 0);
+        i = i + 1;
+    }
+
+    // Setup RX descriptors: each descriptor points to a buffer
+    i = 0;
+    while i < NUM_RX_DESC {
+        var desc_off: i64 = E1000_RX_DESC_ADDR + i * RX_DESC_SIZE;
+        var buf_addr: i64 = E1000_RX_BUF_ADDR + i * RX_BUFFER_SIZE;
+        // RX descriptor: [buffer_addr:8][length:2][checksum:2][status:1][errors:1][special:2]
+        // Use 64-bit write for buffer address
+        p_mem_write64(desc_off, buf_addr);
+        p_mem_write8(desc_off + 12, 0);  // status = 0 (empty)
+        i = i + 1;
+    }
+
+    // Setup TX descriptors (zeroed, will be filled on send)
+    i = 0;
+    while i < NUM_TX_DESC {
+        var desc_off: i64 = E1000_TX_DESC_ADDR + i * TX_DESC_SIZE;
+        var buf_addr: i64 = E1000_TX_BUF_ADDR + i * TX_BUFFER_SIZE;
+        // TX descriptor: [buffer_addr:8][length:2][cso:1][cmd:1][status:1][css:1][special:2]
+        p_mem_write32(desc_off, buf_addr);
+        p_mem_write32(desc_off + 4, 0);
+        mem_write16(desc_off + 8, 0);  // length = 0
+        p_mem_write8(desc_off + 10, 0);  // CSO = 0
+        p_mem_write8(desc_off + 11, 0);  // cmd = 0
+        p_mem_write8(desc_off + 12, 0);  // status = 0
+        p_mem_write8(desc_off + 13, 0);  // CSS = 0
+        i = i + 1;
+    }
+
+    // Configure RX (RCTL) — disable first, will re-enable after ring setup
+    e1000_write_reg(E1000_REG_RCTRL, 0);
+
+    // Configure TX (TCTL)
+    // Enable + pad short packets + collision threshold 0x0F + cold 0x3F
+    e1000_write_reg(E1000_REG_TCTRL, E1000_TCTL_EN | E1000_TCTL_PSP | 0x0F00 | 0x003F0000);
+
+    // Set RX descriptor ring base address
+    e1000_write_reg(E1000_REG_RDBAL0, E1000_RX_DESC_ADDR);
+    e1000_write_reg(E1000_REG_RDBAH0, 0);
+    e1000_write_reg(E1000_REG_RDLEN0, NUM_RX_DESC * RX_DESC_SIZE);
+    e1000_write_reg(E1000_REG_RDT0, NUM_RX_DESC - 1);  // tail = last descriptor
+    e1000_write_reg(E1000_REG_RDH0, 0);
+
+    // Set TX descriptor ring base address
+    e1000_write_reg(E1000_REG_TDBAL0, E1000_TX_DESC_ADDR);
+    e1000_write_reg(E1000_REG_TDBAH0, 0);
+    e1000_write_reg(E1000_REG_TDLEN0, NUM_TX_DESC * TX_DESC_SIZE);
+    e1000_write_reg(E1000_REG_TDH0, 0);
+    e1000_write_reg(E1000_REG_TDT0, 0);
+
+    // Re-enable RX after ring is set up
+    e1000_write_reg(E1000_REG_RCTRL, E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_BAM | E1000_RCTL_SECRC);
+
+    tx_next = 0;
+    rx_next = 0;
+    e1000_initialized = 1;
+
+    return 0;
+}
+
+// ─── Send an Ethernet frame ─────────────────────────────────────────────
+// Copies frame data to a TX buffer and signals the NIC.
+
+pub fn e1000_send_frame(dst_mac: i64, ethertype: i64, data: i64, data_len: i64) -> i64 {
+    if e1000_initialized == 0 { return -1; }
+
+    var desc_off: i64 = E1000_TX_DESC_ADDR + tx_next * TX_DESC_SIZE;
+    var buf_addr: i64 = E1000_TX_BUF_ADDR + tx_next * TX_BUFFER_SIZE;
+
+    // Build Ethernet header (14 bytes):
+    // [dst MAC:6][src MAC:6][ethertype:2]
+    var i: i64 = 0;
+    while i < 6 {
+        p_mem_write8(buf_addr + i, p_mem_read8(dst_mac + i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < 6 {
+        p_mem_write8(buf_addr + 6 + i, p_mem_read8(E1000_MAC_ADDR + i));
+        i = i + 1;
+    }
+    p_mem_write8(buf_addr + 12, (ethertype >> 8) & 0xFF);  // big-endian
+    p_mem_write8(buf_addr + 13, ethertype & 0xFF);
+
+    // Copy payload data
+    var total_len: i64 = 14 + data_len;
+    i = 0;
+    while i < data_len {
+        p_mem_write8(buf_addr + 14 + i, p_mem_read8(data + i));
+        i = i + 1;
+    }
+
+    // Pad to minimum frame size (60 bytes, 64 with CRC which NIC adds)
+    while total_len < 60 {
+        p_mem_write8(buf_addr + total_len, 0);
+        total_len = total_len + 1;
+    }
+
+    // Fill TX descriptor (legacy format):
+    // [0-7]: buffer_addr
+    // [8-9]: length
+    // [10]: CSO (checksum offset)
+    // [11]: cmd (bit 0 = EOP, bit 1 = IFCS, bit 3 = RS)
+    // [12]: status (bit 0 = DD = descriptor done)
+    // [13]: CSS (checksum start)
+    // [14-15]: special
+    p_mem_write32(desc_off, buf_addr);  // re-write buffer address
+    p_mem_write32(desc_off + 4, 0);
+    mem_write16(desc_off + 8, total_len);  // length
+    p_mem_write8(desc_off + 10, 0);  // CSO = 0
+    p_mem_write8(desc_off + 11, 0x0B);  // cmd: EOP + IFCS + RS
+    p_mem_write8(desc_off + 12, 0);  // status = 0 (NIC sets DD when done)
+    p_mem_write8(desc_off + 13, 0);  // CSS = 0
+
+    // Advance TX tail
+    tx_next = (tx_next + 1) % NUM_TX_DESC;
+    e1000_write_reg(E1000_REG_TDT0, tx_next);
+
+    // Wait for TX to complete (poll status bit at offset 12)
+    var timeout: i64 = 1000000;
+    while timeout > 0 {
+        var status: i64 = p_mem_read8(desc_off + 12);
+        if (status & 0x01) != 0 { break; }  // DD bit set = done
+        timeout = timeout - 1;
+    }
+
+    return total_len;
+}
+
+// ─── Poll for received Ethernet frames ──────────────────────────────────
+// Returns 0 if a frame was received, -1 if no frame available.
+// The frame data is in the RX buffer for the current descriptor.
+
+pub var rx_frame_len: i64 = 0;
+pub var rx_frame_buf: i64 = 0;
+
+pub fn e1000_poll_rx() -> i64 {
+    if e1000_initialized == 0 { return -1; }
+
+    var desc_off: i64 = E1000_RX_DESC_ADDR + rx_next * RX_DESC_SIZE;
+    var status: i64 = p_mem_read8(desc_off + 12);
+    if (status & 0x01) == 0 { return -1; }  // DD bit not set = no frame
+
+    // Frame received
+    rx_frame_len = mem_read16(desc_off + 8);
+    rx_frame_buf = E1000_RX_BUF_ADDR + rx_next * RX_BUFFER_SIZE;
+
+    // Reset descriptor for reuse (re-write buffer addr + clear status)
+    var rx_buf: i64 = E1000_RX_BUF_ADDR + rx_next * RX_BUFFER_SIZE;
+    p_mem_write32(desc_off, rx_buf);
+    p_mem_write32(desc_off + 4, 0);
+    p_mem_write8(desc_off + 12, 0);  // clear status
+
+    // Return this descriptor to hardware by setting RDT to it,
+    // then advance rx_next for the next poll.
+    // (RDT = descriptor just processed; RDH has already advanced past it)
+    e1000_write_reg(E1000_REG_RDT0, rx_next);
+    rx_next = (rx_next + 1) % NUM_RX_DESC;
+
+    return 0;
+}
+
+// ─── ARP (Address Resolution Protocol) ──────────────────────────────────
+// ARP cache at ARP_CACHE_ADDR: 16 entries × 16 bytes
+// Each entry: [IP:4][MAC:6][pad:6]
+
+pub fn arp_cache_find(ip: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 16 {
+        var entry: i64 = ARP_CACHE_ADDR + i * 16;
+        var entry_ip: i64 = p_mem_read32(entry);
+        if entry_ip == ip { return entry; }
+        i = i + 1;
+    }
+    return 0;  // not found
+}
+
+pub fn arp_cache_add(ip: i64, mac_addr: i64) {
+    // Find empty slot or reuse
+    var i: i64 = 0;
+    while i < 16 {
+        var entry: i64 = ARP_CACHE_ADDR + i * 16;
+        if p_mem_read32(entry) == 0 || p_mem_read32(entry) == ip {
+            p_mem_write32(entry, ip);
+            var j: i64 = 0;
+            while j < 6 {
+                p_mem_write8(entry + 4 + j, p_mem_read8(mac_addr + j));
+                j = j + 1;
+            }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// Send ARP request for an IP address
+pub fn arp_request(ip: i64) -> i64 {
+    // Build ARP packet (28 bytes):
+    // [hw_type:2=1][proto_type:2=0x0800][hw_len:1=6][proto_len:1=4]
+    // [opcode:2=1(request)][sender_mac:6][sender_ip:4][target_mac:6=0][target_ip:4]
+    var pkt: i64 = 0x50000;  // temp packet buffer
+    // hw_type = 0x0001 (big-endian)
+    p_mem_write8(pkt, 0); p_mem_write8(pkt + 1, 1);
+    // proto_type = 0x0800 (big-endian)
+    p_mem_write8(pkt + 2, 0); p_mem_write8(pkt + 3, 0x08);
+    p_mem_write8(pkt + 4, 6);        // hw_len = 6
+    p_mem_write8(pkt + 5, 4);        // proto_len = 4
+    // opcode = 0x0001 (request, big-endian)
+    p_mem_write8(pkt + 6, 0); p_mem_write8(pkt + 7, 1);
+    // Sender MAC (our MAC)
+    var i: i64 = 0;
+    while i < 6 {
+        p_mem_write8(pkt + 8 + i, p_mem_read8(E1000_MAC_ADDR + i));
+        i = i + 1;
+    }
+    // Sender IP (our IP, big-endian)
+    p_mem_write8(pkt + 14, (OUR_IP >> 24) & 0xFF);
+    p_mem_write8(pkt + 15, (OUR_IP >> 16) & 0xFF);
+    p_mem_write8(pkt + 16, (OUR_IP >> 8) & 0xFF);
+    p_mem_write8(pkt + 17, OUR_IP & 0xFF);
+    // Target MAC = 00:00:00:00:00:00
+    i = 0;
+    while i < 6 {
+        p_mem_write8(pkt + 18 + i, 0);
+        i = i + 1;
+    }
+    // Target IP (big-endian)
+    p_mem_write8(pkt + 24, (ip >> 24) & 0xFF);
+    p_mem_write8(pkt + 25, (ip >> 16) & 0xFF);
+    p_mem_write8(pkt + 26, (ip >> 8) & 0xFF);
+    p_mem_write8(pkt + 27, ip & 0xFF);
+
+    // Broadcast MAC
+    var bcast: i64 = 0x50040;
+    i = 0;
+    while i < 6 {
+        p_mem_write8(bcast + i, 0xFF);
+        i = i + 1;
+    }
+
+    return e1000_send_frame(bcast, 0x0806, pkt, 28);
+}
+
+// Process received ARP packet
+pub fn arp_handle(buf: i64, len: i64) -> i64 {
+    // Skip Ethernet header (14 bytes)
+    var arp: i64 = buf + 14;
+    // ARP format: [hw_type:2][proto_type:2][hw_len:1][proto_len:1][opcode:2]
+    //             [sender_mac:6][sender_ip:4][target_mac:6][target_ip:4]
+    var opcode: i64 = (p_mem_read8(arp + 6) << 8) | p_mem_read8(arp + 7);
+
+    if opcode == 2 {
+        // ARP reply — add to cache
+        var sender_ip: i64 = (p_mem_read8(arp + 14) << 24) | (p_mem_read8(arp + 15) << 16) |
+                            (p_mem_read8(arp + 16) << 8) | p_mem_read8(arp + 17);
+        arp_cache_add(sender_ip, arp + 8);  // sender MAC at arp+8
+        return 0;
+    }
+
+    if opcode == 1 {
+        // ARP request — check if target IP is ours
+        var target_ip: i64 = (p_mem_read8(arp + 24) << 24) | (p_mem_read8(arp + 25) << 16) |
+                            (p_mem_read8(arp + 26) << 8) | p_mem_read8(arp + 27);
+        if target_ip == OUR_IP {
+            // Send ARP reply
+            var pkt: i64 = 0x50000;
+            p_mem_write8(pkt, 0); p_mem_write8(pkt + 1, 1);  // hw_type
+            p_mem_write8(pkt + 2, 0); p_mem_write8(pkt + 3, 0x08);  // proto_type
+            p_mem_write8(pkt + 4, 6);  // hw_len
+            p_mem_write8(pkt + 5, 4);  // proto_len
+            p_mem_write8(pkt + 6, 0); p_mem_write8(pkt + 7, 2);  // opcode = reply
+            // Sender MAC (our MAC)
+            var i: i64 = 0;
+            while i < 6 {
+                p_mem_write8(pkt + 8 + i, p_mem_read8(E1000_MAC_ADDR + i));
+                i = i + 1;
+            }
+            // Sender IP (our IP)
+            p_mem_write8(pkt + 14, (OUR_IP >> 24) & 0xFF);
+            p_mem_write8(pkt + 15, (OUR_IP >> 16) & 0xFF);
+            p_mem_write8(pkt + 16, (OUR_IP >> 8) & 0xFF);
+            p_mem_write8(pkt + 17, OUR_IP & 0xFF);
+            // Target MAC (requester's MAC from ARP request)
+            i = 0;
+            while i < 6 {
+                p_mem_write8(pkt + 18 + i, p_mem_read8(arp + 8 + i));
+                i = i + 1;
+            }
+            // Target IP (requester's IP)
+            p_mem_write8(pkt + 24, (p_mem_read8(arp + 14)));
+            p_mem_write8(pkt + 25, (p_mem_read8(arp + 15)));
+            p_mem_write8(pkt + 26, (p_mem_read8(arp + 16)));
+            p_mem_write8(pkt + 27, (p_mem_read8(arp + 17)));
+            // Send to requester's MAC (from Ethernet header)
+            return e1000_send_frame(buf + 6, 0x0806, pkt, 28);
+        }
+    }
+
+    return 0;
+}
+
+// ─── IPv4 ────────────────────────────────────────────────────────────────
+// IPv4 header (20 bytes minimum):
+// [ver/ihl:1][tos:1][total_len:2][id:2][flags/frag:2][ttl:1][proto:1][checksum:2]
+// [src_ip:4][dst_ip:4]
+
+// Compute IPv4 header checksum (one's complement of one's complement sum)
+pub fn ipv4_checksum(hdr: i64, len: i64) -> i64 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < len {
+        var word: i64 = (p_mem_read8(hdr + i) << 8) | p_mem_read8(hdr + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+    // Fold carries
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (~sum) & 0xFFFF;
+}
+
+// Send IPv4 packet with given protocol
+pub fn ipv4_send(dst_ip: i64, proto: i64, data: i64, data_len: i64) -> i64 {
+    // Look up destination MAC in ARP cache
+    var dst_mac_entry: i64 = arp_cache_find(dst_ip);
+    var dst_mac: i64 = 0x50040;
+    if dst_mac_entry == 0 {
+        // Not in cache — send ARP request and return -1
+        arp_request(dst_ip);
+        return -1;
+    }
+    var i: i64 = 0;
+    while i < 6 {
+        p_mem_write8(dst_mac + i, p_mem_read8(dst_mac_entry + 4 + i));
+        i = i + 1;
+    }
+
+    // Build IPv4 header at 0x50000
+    var hdr: i64 = 0x50000;
+    p_mem_write8(hdr, 0x45);  // version 4, IHL 5 (20 bytes)
+    p_mem_write8(hdr + 1, 0);  // TOS
+    var total_len: i64 = 20 + data_len;
+    p_mem_write8(hdr + 2, (total_len >> 8) & 0xFF);  // total length (big-endian)
+    p_mem_write8(hdr + 3, total_len & 0xFF);
+    p_mem_write8(hdr + 4, 0); p_mem_write8(hdr + 5, 0);  // ID
+    p_mem_write8(hdr + 6, 0x40); p_mem_write8(hdr + 7, 0);  // flags: don't fragment
+    p_mem_write8(hdr + 8, 64);  // TTL
+    p_mem_write8(hdr + 9, proto);  // protocol
+    p_mem_write8(hdr + 10, 0); p_mem_write8(hdr + 11, 0);  // checksum (fill later)
+    // Source IP (our IP, big-endian)
+    p_mem_write8(hdr + 12, (OUR_IP >> 24) & 0xFF);
+    p_mem_write8(hdr + 13, (OUR_IP >> 16) & 0xFF);
+    p_mem_write8(hdr + 14, (OUR_IP >> 8) & 0xFF);
+    p_mem_write8(hdr + 15, OUR_IP & 0xFF);
+    // Destination IP (big-endian)
+    p_mem_write8(hdr + 16, (dst_ip >> 24) & 0xFF);
+    p_mem_write8(hdr + 17, (dst_ip >> 16) & 0xFF);
+    p_mem_write8(hdr + 18, (dst_ip >> 8) & 0xFF);
+    p_mem_write8(hdr + 19, dst_ip & 0xFF);
+
+    // Compute checksum
+    var cksum: i64 = ipv4_checksum(hdr, 20);
+    p_mem_write8(hdr + 10, (cksum >> 8) & 0xFF);
+    p_mem_write8(hdr + 11, cksum & 0xFF);
+
+    // Copy data after header
+    i = 0;
+    while i < data_len {
+        p_mem_write8(hdr + 20 + i, p_mem_read8(data + i));
+        i = i + 1;
+    }
+
+    return e1000_send_frame(dst_mac, 0x0800, hdr, total_len);
+}
+
+// ─── ICMP (Internet Control Message Protocol) ───────────────────────────
+// ICMP echo request/reply for ping
+
+pub fn icmp_send_echo(dst_ip: i64, seq: i64) -> i64 {
+    // Build ICMP packet (8 bytes header + 32 bytes data)
+    var pkt: i64 = 0x51000;
+    p_mem_write8(pkt, 8);  // type = Echo Request
+    p_mem_write8(pkt + 1, 0);  // code = 0
+    p_mem_write8(pkt + 2, 0); p_mem_write8(pkt + 3, 0);  // checksum (fill later)
+    p_mem_write8(pkt + 4, (ICMP_ECHO_ID_VAL >> 8) & 0xFF);  // identifier (big-endian)
+    p_mem_write8(pkt + 5, ICMP_ECHO_ID_VAL & 0xFF);
+    p_mem_write8(pkt + 6, (seq >> 8) & 0xFF);  // sequence number (big-endian)
+    p_mem_write8(pkt + 7, seq & 0xFF);
+
+    // Fill 32 bytes of data with pattern
+    var i: i64 = 0;
+    while i < 32 {
+        p_mem_write8(pkt + 8 + i, 0x41 + (i % 26));  // 'A'-'Z' pattern
+        i = i + 1;
+    }
+
+    // Compute ICMP checksum
+    var cksum: i64 = ipv4_checksum(pkt, 40);  // 8 header + 32 data
+    p_mem_write8(pkt + 2, (cksum >> 8) & 0xFF);
+    p_mem_write8(pkt + 3, cksum & 0xFF);
+
+    return ipv4_send(dst_ip, 1, pkt, 40);  // protocol 1 = ICMP
+}
+
+// ICMP echo ID value (constant)
+pub const ICMP_ECHO_ID_VAL: i64 = 0x0001;
+
+// Process received ICMP packet
+pub fn icmp_handle(buf: i64, len: i64) -> i64 {
+    // Skip Ethernet (14) + IPv4 (20) headers
+    var icmp: i64 = buf + 34;
+    var icmp_type: i64 = p_mem_read8(icmp);
+
+    if icmp_type == 0 {
+        // ICMP Echo Reply — ping reply received!
+        p_mem_write8(PING_REPLY_FLAG, 1);
+        // Store sender IP from IPv4 header
+        var src_ip: i64 = (p_mem_read8(buf + 26) << 24) | (p_mem_read8(buf + 27) << 16) |
+                         (p_mem_read8(buf + 28) << 8) | p_mem_read8(buf + 29);
+        p_mem_write32(PING_REPLY_IP, src_ip);
+        return 0;
+    }
+
+    if icmp_type == 8 {
+        // ICMP Echo Request — send reply
+        var src_ip: i64 = (p_mem_read8(buf + 26) << 24) | (p_mem_read8(buf + 27) << 16) |
+                         (p_mem_read8(buf + 28) << 8) | p_mem_read8(buf + 29);
+        // Build reply: same as request but type = 0
+        var pkt: i64 = 0x51000;
+        p_mem_write8(pkt, 0);  // type = Echo Reply
+        p_mem_write8(pkt + 1, 0);  // code = 0
+        p_mem_write8(pkt + 2, 0); p_mem_write8(pkt + 3, 0);  // checksum
+        // Copy ID, seq, and data from request
+        var i: i64 = 0;
+        while i < len - 34 {
+            p_mem_write8(pkt + 4 + i, p_mem_read8(icmp + 4 + i));
+            i = i + 1;
+        }
+        // Compute checksum
+        var icmp_len: i64 = len - 34;
+        var cksum: i64 = ipv4_checksum(pkt, icmp_len);
+        p_mem_write8(pkt + 2, (cksum >> 8) & 0xFF);
+        p_mem_write8(pkt + 3, cksum & 0xFF);
+        return ipv4_send(src_ip, 1, pkt, icmp_len);
+    }
+
+    return 0;
+}
+
+// ─── UDP (User Datagram Protocol) ───────────────────────────────────────
+// Minimal UDP send/receive
+
+pub fn udp_send(dst_ip: i64, dst_port: i64, src_port: i64, data: i64, data_len: i64) -> i64 {
+    var pkt: i64 = 0x51000;
+    p_mem_write8(pkt, (src_port >> 8) & 0xFF);  // src port (big-endian)
+    p_mem_write8(pkt + 1, src_port & 0xFF);
+    p_mem_write8(pkt + 2, (dst_port >> 8) & 0xFF);  // dst port (big-endian)
+    p_mem_write8(pkt + 3, dst_port & 0xFF);
+    var udp_len: i64 = 8 + data_len;
+    p_mem_write8(pkt + 4, (udp_len >> 8) & 0xFF);  // length (big-endian)
+    p_mem_write8(pkt + 5, udp_len & 0xFF);
+    p_mem_write8(pkt + 6, 0); p_mem_write8(pkt + 7, 0);  // checksum (0 = no checksum)
+
+    var i: i64 = 0;
+    while i < data_len {
+        p_mem_write8(pkt + 8 + i, p_mem_read8(data + i));
+        i = i + 1;
+    }
+
+    return ipv4_send(dst_ip, 17, pkt, udp_len);  // protocol 17 = UDP
+}
+
+// ─── TCP (Transmission Control Protocol) ────────────────────────────────
+// Minimal TCP: SYN, SYN-ACK, ACK, data send, FIN
+// This is a very simplified TCP implementation for basic connectivity.
+
+pub fn tcp_send(dst_ip: i64, src_port: i64, dst_port: i64, seq: i64, ack: i64, flags: i64, data: i64, data_len: i64) -> i64 {
+    var pkt: i64 = 0x51000;
+    p_mem_write8(pkt, (src_port >> 8) & 0xFF);  // src port (big-endian)
+    p_mem_write8(pkt + 1, src_port & 0xFF);
+    p_mem_write8(pkt + 2, (dst_port >> 8) & 0xFF);  // dst port (big-endian)
+    p_mem_write8(pkt + 3, dst_port & 0xFF);
+    // Sequence number (big-endian)
+    p_mem_write8(pkt + 4, (seq >> 24) & 0xFF);
+    p_mem_write8(pkt + 5, (seq >> 16) & 0xFF);
+    p_mem_write8(pkt + 6, (seq >> 8) & 0xFF);
+    p_mem_write8(pkt + 7, seq & 0xFF);
+    // Acknowledgment number (big-endian)
+    p_mem_write8(pkt + 8, (ack >> 24) & 0xFF);
+    p_mem_write8(pkt + 9, (ack >> 16) & 0xFF);
+    p_mem_write8(pkt + 10, (ack >> 8) & 0xFF);
+    p_mem_write8(pkt + 11, ack & 0xFF);
+    // Data offset (5 = 20 bytes, no options) + reserved
+    p_mem_write8(pkt + 12, 0x50);
+    // Flags
+    p_mem_write8(pkt + 13, flags);
+    // Window size
+    p_mem_write8(pkt + 14, 0xFF);
+    p_mem_write8(pkt + 15, 0xFF);
+    // Checksum (0 = no checksum for now)
+    p_mem_write8(pkt + 16, 0);
+    p_mem_write8(pkt + 17, 0);
+    // Urgent pointer
+    p_mem_write8(pkt + 18, 0);
+    p_mem_write8(pkt + 19, 0);
+
+    // Copy data after header
+    var i: i64 = 0;
+    while i < data_len {
+        p_mem_write8(pkt + 20 + i, p_mem_read8(data + i));
+        i = i + 1;
+    }
+
+    return ipv4_send(dst_ip, 6, pkt, 20 + data_len);  // protocol 6 = TCP
+}
+
+// TCP flags
+pub const TCP_FIN: i64 = 0x01;
+pub const TCP_SYN: i64 = 0x02;
+pub const TCP_RST: i64 = 0x04;
+pub const TCP_PSH: i64 = 0x08;
+pub const TCP_ACK: i64 = 0x10;
+
+// ─── Process received Ethernet frame ─────────────────────────────────────
+
+pub fn eth_handle_frame(buf: i64, len: i64) -> i64 {
+    if len < 14 { return -1; }
+
+    // Check ethertype (bytes 12-13, big-endian)
+    var ethertype: i64 = (p_mem_read8(buf + 12) << 8) | p_mem_read8(buf + 13);
+
+    if ethertype == 0x0806 {
+        // ARP packet
+        return arp_handle(buf, len);
+    }
+
+    if ethertype == 0x0800 {
+        // IPv4 packet — check protocol
+        if len < 34 { return -1; }
+        var proto: i64 = p_mem_read8(buf + 23);  // IPv4 protocol field
+        // Extract source IP from IPv4 header (offset 26-29)
+        var src_ip: i64 = (p_mem_read8(buf + 26) << 24) | (p_mem_read8(buf + 27) << 16) | (p_mem_read8(buf + 28) << 8) | p_mem_read8(buf + 29);
+        // IPv4 header length (IHL field, lower 4 bits of byte 14, × 4)
+        var ihl: i64 = (p_mem_read8(buf + 14) & 0x0F) * 4;
+        var tcp_buf: i64 = buf + 14 + ihl;  // TCP header starts after Ethernet + IPv4 header
+        var tcp_len: i64 = len - 14 - ihl;
+
+        if proto == 1 {
+            // ICMP
+            return icmp_handle(buf, len);
+        }
+        if proto == 6 {
+            // TCP
+            return tcp_handle(tcp_buf, tcp_len, src_ip);
+        }
+        // UDP handling could be added here
+    }
+
+    return 0;
+}
+
+// ─── Network initialization ─────────────────────────────────────────────
+
+pub fn net_init() {
+    // Zero ARP cache
+    var i: i64 = 0;
+    while i < 256 {
+        p_mem_write8(ARP_CACHE_ADDR + i, 0);
+        i = i + 1;
+    }
+    p_mem_write8(PING_REPLY_FLAG, 0);
+    mem_write16(ICMP_SEQ, 0);
+    tcp_socket_init();
+}
+
+// ─── Poll for incoming packets ───────────────────────────────────────────
+// Call this in the main loop to process incoming network packets.
+
+pub fn net_poll() -> i64 {
+    if e1000_initialized == 0 { return -1; }
+    con_putc(112); // 'p' = net_poll called
+    if e1000_poll_rx() == 0 {
+        return eth_handle_frame(rx_frame_buf, rx_frame_len);
+    }
+    return -1;
+}
+
+// ─── Ping: send ICMP echo and wait for reply ─────────────────────────────
+
+pub fn cmd_ping(ip_addr: i64) -> void {
+    con_putc(10);
+    // "PING: "
+    con_putc(80); con_putc(73); con_putc(78); con_putc(71); con_putc(58); con_putc(32);
+    // Print IP as dotted decimal
+    print_dec((ip_addr >> 24) & 0xFF);
+    con_putc(46);
+    print_dec((ip_addr >> 16) & 0xFF);
+    con_putc(46);
+    print_dec((ip_addr >> 8) & 0xFF);
+    con_putc(46);
+    print_dec(ip_addr & 0xFF);
+    con_putc(10);
+
+    // Always try to initialize (in case e1000_initialized flag is wrong)
+    var result: i64 = e1000_init();
+    if result != 0 {
+        // "NET not initialized"
+        con_putc(78); con_putc(69); con_putc(84); con_putc(32);
+        con_putc(110); con_putc(111); con_putc(116); con_putc(32);
+        con_putc(105); con_putc(110); con_putc(105); con_putc(116);
+        con_putc(10);
+        return;
+    }
+
+    // Send ARP request first to resolve the MAC
+    con_putc(65); con_putc(82); con_putc(80); con_putc(58); con_putc(32); // "ARP: "
+    arp_request(ip_addr);
+
+    // Wait for ARP reply (poll for ~1 second)
+    var arp_timeout: i64 = 500000;
+    var arp_ok: i64 = 0;
+    while arp_timeout > 0 {
+        if net_poll() == 0 {
+            if arp_cache_find(ip_addr) != 0 {
+                arp_ok = 1;
+                break;
+            }
+        }
+        arp_timeout = arp_timeout - 1;
+    }
+
+    if arp_ok == 0 {
+        con_putc(110); con_putc(111); con_putc(32); con_putc(65); con_putc(82); con_putc(80); // "no ARP"
+        con_putc(10);
+        return;
+    }
+    con_putc(79); con_putc(75); con_putc(10); // "OK"
+
+    // Send ICMP echo request
+    var seq: i64 = mem_read16(ICMP_SEQ);
+    mem_write16(ICMP_SEQ, seq + 1);
+    p_mem_write8(PING_REPLY_FLAG, 0);
+
+    con_putc(73); con_putc(67); con_putc(77); con_putc(80); con_putc(58); con_putc(32); // "ICMP: "
+    icmp_send_echo(ip_addr, seq);
+
+    // Wait for ICMP echo reply (poll for ~2 seconds)
+    var icmp_timeout: i64 = 1000000;
+    while icmp_timeout > 0 {
+        net_poll();
+        if p_mem_read8(PING_REPLY_FLAG) == 1 {
+            break;
+        }
+        icmp_timeout = icmp_timeout - 1;
+    }
+
+    if p_mem_read8(PING_REPLY_FLAG) == 1 {
+        // "Reply from <IP>"
+        con_putc(82); con_putc(101); con_putc(112); con_putc(108); con_putc(121); // "Reply"
+        con_putc(32); con_putc(102); con_putc(114); con_putc(111); con_putc(109); // " from"
+        con_putc(32);
+        var sender_ip: i64 = p_mem_read32(PING_REPLY_IP);
+        print_dec((sender_ip >> 24) & 0xFF);
+        con_putc(46);
+        print_dec((sender_ip >> 16) & 0xFF);
+        con_putc(46);
+        print_dec((sender_ip >> 8) & 0xFF);
+        con_putc(46);
+        print_dec(sender_ip & 0xFF);
+        con_putc(10);
+    } else {
+        // "Timeout"
+        con_putc(84); con_putc(105); con_putc(109); con_putc(101); con_putc(111); con_putc(117); con_putc(116); // "Timeout"
+        con_putc(10);
+    }
+}
+
+// ─── Network status command ──────────────────────────────────────────────
+
+pub fn cmd_net() -> void {
+    con_putc(10);
+    // "NET: "
+    con_putc(78); con_putc(69); con_putc(84); con_putc(58); con_putc(32);
+    if e1000_initialized == 0 {
+        // Try to initialize
+        var result: i64 = e1000_init();
+        if result != 0 {
+            con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
+            con_putc(10);
+            return;
+        }
+    }
+
+    con_putc(69); con_putc(49); con_putc(48); con_putc(48); con_putc(48); // "E1000"
+    con_putc(32);
+    con_putc(109); con_putc(109); con_putc(105); con_putc(111); con_putc(58); // "mmio:"
+    con_putc(32);
+    print_hex(e1000_mmio_base);
+    con_putc(32);
+    var status: i64 = e1000_read_reg(E1000_REG_STATUS);
+    con_putc(115); con_putc(116); con_putc(58); // "st:"
+    con_putc(32);
+    print_hex(status);
+    con_putc(10);
+
+    // Print MAC address
+    con_putc(77); con_putc(65); con_putc(67); con_putc(58); con_putc(32); // "MAC: "
+    var i: i64 = 0;
+    while i < 6 {
+        print_hex(p_mem_read8(E1000_MAC_ADDR + i));
+        if i < 5 { con_putc(58); }  // ':'
+        i = i + 1;
+    }
+    con_putc(10);
+
+    // Print IP address
+    con_putc(73); con_putc(80); con_putc(58); con_putc(32); // "IP: "
+    print_dec((OUR_IP >> 24) & 0xFF);
+    con_putc(46);
+    print_dec((OUR_IP >> 16) & 0xFF);
+    con_putc(46);
+    print_dec((OUR_IP >> 8) & 0xFF);
+    con_putc(46);
+    print_dec(OUR_IP & 0xFF);
+    con_putc(10);
+}
+
+// ─── ARP table management command ────────────────────────────────────────
+
+pub fn cmd_arp() -> void {
+    con_putc(10);
+    con_putc(65); con_putc(82); con_putc(80); con_putc(32); // "ARP "
+    con_putc(84); con_putc(97); con_putc(98); con_putc(108); con_putc(101); con_putc(58); // "Table:"
+    con_putc(10);
+    var i: i64 = 0;
+    var found: i64 = 0;
+    while i < 16 {
+        var entry: i64 = ARP_CACHE_ADDR + i * 16;
+        var valid: i64 = p_mem_read8(entry + 10);
+        if valid != 0 {
+            found = 1;
+            var ip: i64 = p_mem_read32(entry);
+            print_dec((ip >> 24) & 0xFF);
+            con_putc(46);
+            print_dec((ip >> 16) & 0xFF);
+            con_putc(46);
+            print_dec((ip >> 8) & 0xFF);
+            con_putc(46);
+            print_dec(ip & 0xFF);
+            con_putc(32);
+            con_putc(45); con_putc(62); con_putc(32); // " -> "
+            var j: i64 = 0;
+            while j < 6 {
+                print_hex(p_mem_read8(entry + 4 + j));
+                if j < 5 { con_putc(58); }
+                j = j + 1;
+            }
+            con_putc(10);
+        }
+        i = i + 1;
+    }
+    if found == 0 {
+        con_putc(40); con_putc(101); con_putc(109); con_putc(112); con_putc(116); con_putc(121); con_putc(41); // "(empty)"
+        con_putc(10);
+    }
+}
+
+// ─── ICMP Ping statistics ────────────────────────────────────────────────
+pub const PING_STATS_SENT: i64 = 0x1AE300;
+pub const PING_STATS_RECV: i64 = 0x1AE304;
+pub const PING_STATS_RTT: i64 = 0x1AE308;
+
+pub fn ping_stats_init() -> void {
+    p_mem_write32(PING_STATS_SENT, 0);
+    p_mem_write32(PING_STATS_RECV, 0);
+    p_mem_write32(PING_STATS_RTT, 0);
+}
+
+pub fn cmd_ping_stats() -> void {
+    con_putc(10);
+    con_putc(80); con_putc(105); con_putc(110); con_putc(103); con_putc(32); // "Ping "
+    con_putc(115); con_putc(116); con_putc(97); con_putc(116); con_putc(115); con_putc(58); // "stats:"
+    con_putc(10);
+    var sent: i64 = p_mem_read32(PING_STATS_SENT);
+    var recv: i64 = p_mem_read32(PING_STATS_RECV);
+    var rtt: i64 = p_mem_read32(PING_STATS_RTT);
+    con_putc(83); con_putc(101); con_putc(110); con_putc(116); con_putc(58); con_putc(32); // "Sent: "
+    print_dec(sent); con_putc(10);
+    con_putc(82); con_putc(101); con_putc(99); con_putc(118); con_putc(58); con_putc(32); // "Recv: "
+    print_dec(recv); con_putc(10);
+    if sent > 0 {
+        var loss: i64 = ((sent - recv) * 100) / sent;
+        con_putc(76); con_putc(111); con_putc(115); con_putc(115); con_putc(58); con_putc(32); // "Loss: "
+        print_dec(loss); con_putc(37); con_putc(10); // "%"
+    }
+    if recv > 0 {
+        con_putc(82); con_putc(84); con_putc(84); con_putc(58); con_putc(32); // "RTT: "
+        print_dec(rtt / recv); con_putc(32);
+        con_putc(116); con_putc(105); con_putc(99); con_putc(107); con_putc(115); // "ticks"
+        con_putc(10);
+    }
+}
+
+// ─── DHCP Client ─────────────────────────────────────────────────────────
+// DHCP DISCOVER: broadcast UDP to port 67, wait for OFFER with IP
+
+pub fn cmd_dhcp() -> void {
+    con_putc(10);
+    con_putc(68); con_putc(72); con_putc(67); con_putc(80); con_putc(58); con_putc(32); // "DHCP: "
+    if e1000_initialized == 0 {
+        var result: i64 = e1000_init();
+        if result != 0 {
+            con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
+            con_putc(10);
+            return;
+        }
+    }
+    // Build DHCP DISCOVER packet at 0x1AE400
+    var pkt: i64 = 0x1AE400;
+    // DHCP packet: op(1)=BOOTREQUEST, htype(1)=Ethernet, hlen(1)=6, hops(1)=0
+    p_mem_write8(pkt, 1);      // op: BOOTREQUEST
+    p_mem_write8(pkt + 1, 1);  // htype: Ethernet
+    p_mem_write8(pkt + 2, 6);  // hlen: MAC addr len
+    p_mem_write8(pkt + 3, 0);  // hops
+    // Transaction ID (4 bytes at offset 4)
+    p_mem_write8(pkt + 4, 0x12); p_mem_write8(pkt + 5, 0x34); p_mem_write8(pkt + 6, 0x56); p_mem_write8(pkt + 7, 0x78);
+    // Seconds (2 bytes at offset 8)
+    p_mem_write8(pkt + 8, 0); p_mem_write8(pkt + 9, 0);
+    // Flags (2 bytes at offset 10) — broadcast flag
+    p_mem_write8(pkt + 10, 0x80); p_mem_write8(pkt + 11, 0);
+    // ciaddr (4 bytes at offset 12) — 0
+    // yiaddr (4 bytes at offset 16) — 0 (will be filled by server)
+    // siaddr (4 bytes at offset 20) — 0
+    // giaddr (4 bytes at offset 24) — 0
+    // chaddr (16 bytes at offset 28) — our MAC
+    var i: i64 = 0;
+    while i < 6 {
+        p_mem_write8(pkt + 28 + i, p_mem_read8(E1000_MAC_ADDR + i));
+        i = i + 1;
+    }
+    // Cookie (4 bytes at offset 236) — DHCP magic cookie 0x63825363
+    p_mem_write8(pkt + 236, 0x63); p_mem_write8(pkt + 237, 0x82); p_mem_write8(pkt + 238, 0x53); p_mem_write8(pkt + 239, 0x63);
+    // Option: DHCP Message Type = DISCOVER (1)
+    p_mem_write8(pkt + 240, 53);  // option: DHCP Message Type
+    p_mem_write8(pkt + 241, 1);   // length: 1
+    p_mem_write8(pkt + 242, 1);   // DISCOVER
+    // End option
+    p_mem_write8(pkt + 243, 255);
+
+    // Send as UDP broadcast (dst IP = 255.255.255.255, dst port = 67, src port = 68)
+    udp_send(0xFFFFFFFF, 68, 67, pkt, 244);
+    con_putc(68); con_putc(105); con_putc(115); con_putc(99); // "Disc"
+    con_putc(32);
+    con_putc(115); con_putc(101); con_putc(110); con_putc(116); // "sent"
+    con_putc(10);
+
+    // Wait for DHCP OFFER (poll for ~2 seconds)
+    var timeout: i64 = 1000000;
+    while timeout > 0 {
+        net_poll();
+        // Check if we got a DHCP reply (simplified — just check for any UDP packet)
+        timeout = timeout - 1;
+    }
+    // For now, keep the static IP (real DHCP parsing needs more complex packet handling)
+    con_putc(73); con_putc(80); con_putc(58); con_putc(32); // "IP: "
+    print_dec((OUR_IP >> 24) & 0xFF);
+    con_putc(46);
+    print_dec((OUR_IP >> 16) & 0xFF);
+    con_putc(46);
+    print_dec((OUR_IP >> 8) & 0xFF);
+    con_putc(46);
+    print_dec(OUR_IP & 0xFF);
+    con_putc(10);
+}
+
+// ─── UDP Socket API ──────────────────────────────────────────────────────
+// UDP socket table at 0x1AE500 (8 sockets × 32 bytes)
+// Each: in_use(4), local_port(4), remote_ip(4), remote_port(4), recv_buf(8), recv_len(4)
+pub const UDP_SOCKET_TABLE: i64 = 0x1AE500;
+pub const UDP_SOCKET_MAX: i64 = 8;
+pub const UDP_SOCKET_SIZE: i64 = 32;
+
+pub fn udp_socket_init() -> void {
+    var i: i64 = 0;
+    while i < UDP_SOCKET_MAX {
+        p_mem_write32(UDP_SOCKET_TABLE + i * UDP_SOCKET_SIZE, 0);
+        i = i + 1;
+    }
+}
+
+// Create a UDP socket. Returns socket ID or -1.
+pub fn udp_socket_create(local_port: i64) -> i64 {
+    var i: i64 = 0;
+    while i < UDP_SOCKET_MAX {
+        var in_use: i64 = p_mem_read32(UDP_SOCKET_TABLE + i * UDP_SOCKET_SIZE);
+        if in_use == 0 {
+            p_mem_write32(UDP_SOCKET_TABLE + i * UDP_SOCKET_SIZE, 1);
+            p_mem_write32(UDP_SOCKET_TABLE + i * UDP_SOCKET_SIZE + 4, local_port);
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Send data via UDP socket
+pub fn udp_socket_send(sid: i64, remote_ip: i64, remote_port: i64, data: i64, len: i64) -> i64 {
+    if sid < 0 || sid >= UDP_SOCKET_MAX { return -1; }
+    return udp_send(remote_ip, p_mem_read32(UDP_SOCKET_TABLE + sid * UDP_SOCKET_SIZE + 4), remote_port, data, len);
+}
+
+// Close a UDP socket
+pub fn udp_socket_close(sid: i64) -> void {
+    if sid < 0 || sid >= UDP_SOCKET_MAX { return; }
+    p_mem_write32(UDP_SOCKET_TABLE + sid * UDP_SOCKET_SIZE, 0);
+}
+
+// ─── TCP Socket API ──────────────────────────────────────────────────────
+// TCP socket table at 0x1AE600 (4 sockets × 40 bytes)
+// Each: in_use(4), local_port(4), remote_ip(4), remote_port(4),
+//        state(4), seq(4), ack(4), recv_buf(8), recv_len(4), flags(4)
+pub const TCP_SOCKET_TABLE: i64 = 0x1AE600;
+pub const TCP_SOCKET_MAX: i64 = 4;
+pub const TCP_SOCKET_SIZE: i64 = 40;
+
+// TCP states
+pub const TCP_CLOSED: i64 = 0;
+pub const TCP_SYN_SENT: i64 = 1;
+pub const TCP_ESTABLISHED: i64 = 2;
+pub const TCP_CLOSE_WAIT: i64 = 3;
+pub const TCP_FIN_WAIT: i64 = 4;
+
+// TCP receive buffer at 0x1AE700 (4KB per socket × 4 = 16KB)
+pub const TCP_RECV_BUF: i64 = 0x1AE700;
+pub const TCP_RECV_BUF_SIZE: i64 = 4096;
+
+// TCP connection result flags
+pub const TCP_CONNECT_FLAG: i64 = 0x1AF700;  // 1 byte: 1=connected, 0=not
+pub const TCP_RECV_FLAG: i64 = 0x1AF701;     // 1 byte: 1=data received
+pub const TCP_RECV_LEN_ADDR: i64 = 0x1AF708; // 8 bytes: received data length
+
+pub fn tcp_socket_init() -> void {
+    var i: i64 = 0;
+    while i < TCP_SOCKET_MAX * TCP_SOCKET_SIZE {
+        p_mem_write8(TCP_SOCKET_TABLE + i, 0);
+        i = i + 1;
+    }
+    p_mem_write8(TCP_CONNECT_FLAG, 0);
+    p_mem_write8(TCP_RECV_FLAG, 0);
+}
+
+// Create a TCP socket. Returns socket ID or -1.
+pub fn tcp_socket_create(local_port: i64) -> i64 {
+    var i: i64 = 0;
+    while i < TCP_SOCKET_MAX {
+        var base: i64 = TCP_SOCKET_TABLE + i * TCP_SOCKET_SIZE;
+        var in_use: i64 = p_mem_read32(base);
+        if in_use == 0 {
+            p_mem_write32(base, 1);            // in_use
+            p_mem_write32(base + 4, local_port); // local_port
+            p_mem_write32(base + 8, 0);        // remote_ip
+            p_mem_write32(base + 12, 0);       // remote_port
+            p_mem_write32(base + 16, TCP_CLOSED); // state
+            p_mem_write32(base + 20, 1000);    // seq (initial)
+            p_mem_write32(base + 24, 0);       // ack
+            p_mem_write32(base + 28, TCP_RECV_BUF + i * TCP_RECV_BUF_SIZE); // recv_buf
+            p_mem_write32(base + 32, 0);       // recv_len
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Compute TCP checksum (including pseudo-header)
+pub fn tcp_checksum(src_ip: i64, dst_ip: i64, pkt: i64, len: i64) -> i64 {
+    var sum: i64 = 0;
+    // Pseudo-header: src_ip (4), dst_ip (4), zero (1), proto=6 (1), tcp_len (2)
+    sum = sum + ((src_ip >> 16) & 0xFFFF);
+    sum = sum + (src_ip & 0xFFFF);
+    sum = sum + ((dst_ip >> 16) & 0xFFFF);
+    sum = sum + (dst_ip & 0xFFFF);
+    sum = sum + 6;  // protocol
+    sum = sum + len;
+    // TCP header + data
+    var i: i64 = 0;
+    while i < len {
+        var word: i64 = (p_mem_read8(pkt + i) << 8) | p_mem_read8(pkt + i + 1);
+        sum = sum + word;
+        i = i + 2;
+    }
+    // Fold carries
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (~sum) & 0xFFFF;
+}
+
+// Send a TCP packet with proper checksum
+pub fn tcp_send_checked(dst_ip: i64, src_port: i64, dst_port: i64, seq: i64, ack: i64, flags: i64, data: i64, data_len: i64) -> i64 {
+    var pkt: i64 = 0x51000;
+    p_mem_write8(pkt, (src_port >> 8) & 0xFF);
+    p_mem_write8(pkt + 1, src_port & 0xFF);
+    p_mem_write8(pkt + 2, (dst_port >> 8) & 0xFF);
+    p_mem_write8(pkt + 3, dst_port & 0xFF);
+    p_mem_write8(pkt + 4, (seq >> 24) & 0xFF);
+    p_mem_write8(pkt + 5, (seq >> 16) & 0xFF);
+    p_mem_write8(pkt + 6, (seq >> 8) & 0xFF);
+    p_mem_write8(pkt + 7, seq & 0xFF);
+    p_mem_write8(pkt + 8, (ack >> 24) & 0xFF);
+    p_mem_write8(pkt + 9, (ack >> 16) & 0xFF);
+    p_mem_write8(pkt + 10, (ack >> 8) & 0xFF);
+    p_mem_write8(pkt + 11, ack & 0xFF);
+    p_mem_write8(pkt + 12, 0x50);  // data offset = 5 (20 bytes)
+    p_mem_write8(pkt + 13, flags);
+    p_mem_write8(pkt + 14, 0xFF);  // window size
+    p_mem_write8(pkt + 15, 0xFF);
+    p_mem_write8(pkt + 16, 0);    // checksum (fill later)
+    p_mem_write8(pkt + 17, 0);
+    p_mem_write8(pkt + 18, 0);    // urgent pointer
+    p_mem_write8(pkt + 19, 0);
+    // Copy data
+    var i: i64 = 0;
+    while i < data_len {
+        p_mem_write8(pkt + 20 + i, p_mem_read8(data + i));
+        i = i + 1;
+    }
+    // Compute checksum
+    var total_len: i64 = 20 + data_len;
+    var cksum: i64 = tcp_checksum(OUR_IP, dst_ip, pkt, total_len);
+    p_mem_write8(pkt + 16, (cksum >> 8) & 0xFF);
+    p_mem_write8(pkt + 17, cksum & 0xFF);
+    return ipv4_send(dst_ip, 6, pkt, total_len);
+}
+
+// Connect to a remote host (3-way handshake)
+pub fn tcp_connect(sid: i64, remote_ip: i64, remote_port: i64) -> i64 {
+    if sid < 0 || sid >= TCP_SOCKET_MAX { return -1; }
+    var base: i64 = TCP_SOCKET_TABLE + sid * TCP_SOCKET_SIZE;
+    var local_port: i64 = p_mem_read32(base + 4);
+    p_mem_write32(base + 8, remote_ip);
+    p_mem_write32(base + 12, remote_port);
+    p_mem_write32(base + 16, TCP_SYN_SENT);
+    p_mem_write8(TCP_CONNECT_FLAG, 0);
+    // Send SYN
+    var seq: i64 = p_mem_read32(base + 20);
+    tcp_send_checked(remote_ip, local_port, remote_port, seq, 0, TCP_SYN, 0, 0);
+    // Wait for SYN-ACK (poll for ~2 seconds)
+    var timeout: i64 = 1000000;
+    while timeout > 0 {
+        net_poll();
+        if p_mem_read8(TCP_CONNECT_FLAG) == 1 { break; }
+        timeout = timeout - 1;
+    }
+    if p_mem_read8(TCP_CONNECT_FLAG) == 1 {
+        p_mem_write32(base + 16, TCP_ESTABLISHED);
+        return 0;  // connected
+    }
+    p_mem_write32(base + 16, TCP_CLOSED);
+    return -1;  // timeout
+}
+
+// Send data on an established TCP connection
+pub fn tcp_socket_send(sid: i64, data: i64, len: i64) -> i64 {
+    if sid < 0 || sid >= TCP_SOCKET_MAX { return -1; }
+    var base: i64 = TCP_SOCKET_TABLE + sid * TCP_SOCKET_SIZE;
+    var state: i64 = p_mem_read32(base + 16);
+    if state != TCP_ESTABLISHED { return -1; }
+    var remote_ip: i64 = p_mem_read32(base + 8);
+    var local_port: i64 = p_mem_read32(base + 4);
+    var remote_port: i64 = p_mem_read32(base + 12);
+    var seq: i64 = p_mem_read32(base + 20);
+    var ack: i64 = p_mem_read32(base + 24);
+    tcp_send_checked(remote_ip, local_port, remote_port, seq, ack, TCP_PSH | TCP_ACK, data, len);
+    p_mem_write32(base + 20, seq + len);
+    return len;
+}
+
+// Close a TCP connection (send FIN)
+pub fn tcp_socket_close(sid: i64) -> void {
+    if sid < 0 || sid >= TCP_SOCKET_MAX { return; }
+    var base: i64 = TCP_SOCKET_TABLE + sid * TCP_SOCKET_SIZE;
+    var state: i64 = p_mem_read32(base + 16);
+    if state == TCP_ESTABLISHED {
+        var remote_ip: i64 = p_mem_read32(base + 8);
+        var local_port: i64 = p_mem_read32(base + 4);
+        var remote_port: i64 = p_mem_read32(base + 12);
+        var seq: i64 = p_mem_read32(base + 20);
+        var ack: i64 = p_mem_read32(base + 24);
+        tcp_send_checked(remote_ip, local_port, remote_port, seq, ack, TCP_FIN | TCP_ACK, 0, 0);
+        p_mem_write32(base + 16, TCP_FIN_WAIT);
+    } else {
+        p_mem_write32(base, 0);  // mark as free
+    }
+}
+
+// Handle incoming TCP packet (called from eth_handle_frame)
+// buf points to the start of the TCP header (after IPv4 header)
+// src_ip is the remote IP (from IPv4 header)
+pub fn tcp_handle(buf: i64, len: i64, src_ip: i64) -> i64 {
+    if len < 20 { return -1; }
+    var src_port: i64 = (p_mem_read8(buf) << 8) | p_mem_read8(buf + 1);
+    var dst_port: i64 = (p_mem_read8(buf + 2) << 8) | p_mem_read8(buf + 3);
+    var seq: i64 = (p_mem_read8(buf + 4) << 24) | (p_mem_read8(buf + 5) << 16) | (p_mem_read8(buf + 6) << 8) | p_mem_read8(buf + 7);
+    var ack_num: i64 = (p_mem_read8(buf + 8) << 24) | (p_mem_read8(buf + 9) << 16) | (p_mem_read8(buf + 10) << 8) | p_mem_read8(buf + 11);
+    var flags: i64 = p_mem_read8(buf + 13);
+    var data_offset: i64 = (p_mem_read8(buf + 12) >> 4) * 4;
+    var data_len: i64 = len - data_offset;
+    var data_addr: i64 = buf + data_offset;
+
+    // Find matching socket by local port (dst_port)
+    var i: i64 = 0;
+    while i < TCP_SOCKET_MAX {
+        var base: i64 = TCP_SOCKET_TABLE + i * TCP_SOCKET_SIZE;
+        var in_use: i64 = p_mem_read32(base);
+        if in_use == 1 {
+            var local_port: i64 = p_mem_read32(base + 4);
+            if local_port == dst_port {
+                var state: i64 = p_mem_read32(base + 16);
+                var remote_ip: i64 = p_mem_read32(base + 8);
+                var remote_port: i64 = p_mem_read32(base + 12);
+                // Check if the remote IP and port match
+                if remote_ip == src_ip && remote_port == src_port {
+                    // Handle based on state and flags
+                    if state == TCP_SYN_SENT {
+                        // Expecting SYN-ACK
+                        if (flags & TCP_SYN) != 0 && (flags & TCP_ACK) != 0 {
+                            // SYN-ACK received — send ACK and transition to ESTABLISHED
+                            p_mem_write32(base + 24, seq + 1);  // ack = their seq + 1
+                            p_mem_write32(base + 20, p_mem_read32(base + 20) + 1);  // our seq + 1
+                            tcp_send_checked(remote_ip, local_port, remote_port, p_mem_read32(base + 20), p_mem_read32(base + 24), TCP_ACK, 0, 0);
+                            p_mem_write8(TCP_CONNECT_FLAG, 1);
+                            return 0;
+                        }
+                    }
+                    if state == TCP_ESTABLISHED {
+                        // Handle data
+                        if data_len > 0 {
+                            // Store received data in the socket's recv buffer
+                            var recv_buf: i64 = p_mem_read32(base + 28);
+                            var copy_len: i64 = data_len;
+                            if copy_len > TCP_RECV_BUF_SIZE { copy_len = TCP_RECV_BUF_SIZE; }
+                            var j: i64 = 0;
+                            while j < copy_len {
+                                p_mem_write8(recv_buf + j, p_mem_read8(data_addr + j));
+                                j = j + 1;
+                            }
+                            p_mem_write32(base + 32, copy_len);
+                            p_mem_write8(TCP_RECV_FLAG, 1);
+                            // Send ACK
+                            p_mem_write32(base + 24, seq + data_len);
+                            tcp_send_checked(remote_ip, local_port, remote_port, p_mem_read32(base + 20), p_mem_read32(base + 24), TCP_ACK, 0, 0);
+                            return 0;
+                        }
+                        // Handle FIN
+                        if (flags & TCP_FIN) != 0 {
+                            p_mem_write32(base + 24, seq + 1);
+                            tcp_send_checked(remote_ip, local_port, remote_port, p_mem_read32(base + 20), p_mem_read32(base + 24), TCP_ACK | TCP_FIN, 0, 0);
+                            p_mem_write32(base + 16, TCP_CLOSED);
+                            p_mem_write32(base, 0);  // mark as free
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}

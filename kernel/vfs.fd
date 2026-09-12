@@ -1,323 +1,507 @@
-// stdlib/vfs.fd — Virtual File System
-//
-// Provides:
-//   - VFS layer: open/read/write/close/stat
-//   - Ramdisk (load initrd from multiboot module)
-//   - FAT32 read-only driver
-//   - Mount table
-//   - File descriptor table
-//
-// Usage:
-//   use vfs;
-//   vfs_init();
-//   vfs_mount_ramdisk(initrd_addr, initrd_size);
-//   var fd = vfs_open("/hello.txt", VFS_O_RDONLY);
-//   var buf = p_malloc(256);
-//   var n = vfs_read(fd, buf, 256);
-//
-// Only works in --bare or --boot mode.
+// kernel/vfs.fd — FAT32 filesystem reader
+// Simplified FAT32 reader. Assumes disk starts at sector 0, partition 0 is FAT32.
 
 module vfs;
 
-use vec;
-use string;
+use console;
+use ata;
 
-// ─── File Modes ───────────────────────────────────────────────────────────
+pub const FAT32_BUF: i64 = 0x40000;     // sector buffer for FS operations
+pub const FAT_ROOT_CLUSTER: i64 = 2;    // FAT32 root dir starts at cluster 2
 
-const VFS_O_RDONLY: i64 = 0;
-const VFS_O_WRONLY: i64 = 1;
-const VFS_O_RDWR:   i64 = 2;
-const VFS_O_CREAT:  i64 = 4;
-const VFS_O_TRUNC:  i64 = 8;
+// FAT32 state (stored at 0x41000, each field is 4 bytes)
+pub const FAT_STATE_ADDR: i64 = 0x41000;
+pub const FAT_BYTES_PER_SECTOR: i64 = 0x41000;  // offset 0 (4 bytes)
+pub const FAT_SECTORS_PER_CLUSTER: i64 = 0x41004; // offset 4 (4 bytes)
+pub const FAT_RESERVED_SECTORS: i64 = 0x41008;  // offset 8 (4 bytes)
+pub const FAT_NUM_FATS: i64 = 0x4100C;          // offset 12 (4 bytes)
+pub const FAT_SECTORS_PER_FAT: i64 = 0x41010;   // offset 16 (4 bytes)
+pub const FAT_FIRST_DATA_SECTOR: i64 = 0x41014; // offset 20 (4 bytes)
+pub const FAT_INITIALIZED: i64 = 0x41018;       // offset 24 (1 byte)
 
-// ─── File Types ───────────────────────────────────────────────────────────
+// Initialize FAT32 by reading BPB from sector 0
+pub fn fat32_init() -> i64 {
+    var result: i64 = ata_read_sector(0, FAT32_BUF);
+    if result != 0 { return -1; }
 
-const VFS_TYPE_FILE:     i64 = 1;
-const VFS_TYPE_DIR:      i64 = 2;
-const VFS_TYPE_SYMLINK:  i64 = 3;
-const VFS_TYPE_CHARDEV:  i64 = 4;
-const VFS_TYPE_BLKDEV:   i64 = 5;
+    // Read BPB fields (little-endian)
+    var bps: i64 = p_mem_read8(FAT32_BUF + 11) | (p_mem_read8(FAT32_BUF + 12) << 8);
+    var spc: i64 = p_mem_read8(FAT32_BUF + 13);
+    var reserved: i64 = p_mem_read8(FAT32_BUF + 14) | (p_mem_read8(FAT32_BUF + 15) << 8);
+    var num_fats: i64 = p_mem_read8(FAT32_BUF + 16);
+    // sectors_per_fat32 at offset 36 (4 bytes)
+    var spf: i64 = p_mem_read8(FAT32_BUF + 36) | (p_mem_read8(FAT32_BUF + 37) << 8) |
+                    (p_mem_read8(FAT32_BUF + 38) << 16) | (p_mem_read8(FAT32_BUF + 39) << 24);
 
-// ─── VFS Structures ───────────────────────────────────────────────────────
+    p_mem_write32(FAT_BYTES_PER_SECTOR, bps);
+    p_mem_write32(FAT_SECTORS_PER_CLUSTER, spc);
+    p_mem_write32(FAT_RESERVED_SECTORS, reserved);
+    p_mem_write32(FAT_NUM_FATS, num_fats);
+    p_mem_write32(FAT_SECTORS_PER_FAT, spf);
 
-pub struct VfsFile {
-    pub name: str,
-    pub type: i64,
-    pub size: i64,
-    pub data: i64,      // pointer to file data (for ramdisk)
-    pub offset: i64,    // current read/write offset
-}
+    // first_data_sector = reserved + num_fats * sectors_per_fat
+    var first_data: i64 = reserved + num_fats * spf;
+    p_mem_write32(FAT_FIRST_DATA_SECTOR, first_data);
+    p_mem_write8(FAT_INITIALIZED, 1);
 
-pub struct VfsDir {
-    pub name: str,
-    pub entries: Vec<str>,
-}
-
-pub struct VfsStat {
-    pub name: str,
-    pub type: i64,
-    pub size: i64,
-}
-
-// ─── Ramdisk Entry ────────────────────────────────────────────────────────
-
-struct RamdiskEntry {
-    name: str,
-    type: i64,
-    size: i64,
-    data: i64,
-}
-
-var ramdisk_entries: Vec<RamdiskEntry> = Vec::new();
-var ramdisk_base: i64 = 0;
-var ramdisk_size: i64 = 0;
-var ramdisk_loaded: bool = false;
-
-// ─── File Descriptor Table ────────────────────────────────────────────────
-
-const VFS_MAX_FDS: i64 = 256;
-
-struct VfsFd {
-    used: bool,
-    entry_index: i64,
-    offset: i64,
-    mode: i64,
-}
-
-var fd_table: Vec<VfsFd> = Vec::new();
-
-// ─── Initialization ────────────────────────────────────────────────────────
-
-pub fn vfs_init() {
-    ramdisk_entries = Vec::new();
-    ramdisk_base = 0;
-    ramdisk_size = 0;
-    ramdisk_loaded = false;
-
-    fd_table = Vec::new();
-    var i: i64 = 0;
-    while i < VFS_MAX_FDS {
-        fd_table.push(VfsFd { used: false, entry_index: -1, offset: 0, mode: 0 });
-        i = i + 1;
-    }
-}
-
-// ─── Ramdisk Mount ────────────────────────────────────────────────────────
-
-// Mount a ramdisk from a multiboot module.
-// The ramdisk format is simple:
-//   u32 num_entries
-//   For each entry:
-//     u32 name_len, char[name_len] name, u32 type, u64 size, u64 data_offset
-//   File data follows
-pub fn vfs_mount_ramdisk(addr: i64, size: i64) -> bool {
-    ramdisk_base = addr;
-    ramdisk_size = size;
-    ramdisk_loaded = true;
-
-    // Read number of entries
-    var num_entries: i64 = read_u32_at(addr, 0);
-    var pos: i64 = 4;
-
-    var i: i64 = 0;
-    while i < num_entries {
-        var name_len: i64 = read_u32_at(addr, pos);
-        pos = pos + 4;
-
-        var name: str = "";
-        var j: i64 = 0;
-        while j < name_len {
-            name = name + char_to_str(p_phys_read8(addr + pos + j));
-            j = j + 1;
-        }
-        pos = pos + name_len;
-
-        var type: i64 = read_u32_at(addr, pos);
-        pos = pos + 4;
-
-        var file_size: i64 = read_u64_at(addr, pos);
-        pos = pos + 8;
-
-        var data_offset: i64 = read_u64_at(addr, pos);
-        pos = pos + 8;
-
-        ramdisk_entries.push(RamdiskEntry {
-            name: name,
-            type: type,
-            size: file_size,
-            data: addr + data_offset,
-        });
-
-        i = i + 1;
-    }
-
-    return true;
-}
-
-pub fn vfs_ramdisk_loaded() -> bool {
-    return ramdisk_loaded;
-}
-
-pub fn vfs_ramdisk_entry_count() -> i64 {
-    return ramdisk_entries.len();
-}
-
-pub fn vfs_ramdisk_get_name(index: i64) -> str {
-    if index < 0 || index >= ramdisk_entries.len() { return ""; }
-    return ramdisk_entries.get(index).name;
-}
-
-// ─── File Operations ──────────────────────────────────────────────────────
-
-pub fn vfs_open(path: str, mode: i64) -> i64 {
-    // Find file in ramdisk
-    var entry_index: i64 = -1;
-    var i: i64 = 0;
-    while i < ramdisk_entries.len() {
-        if str_equal(ramdisk_entries.get(i).name, path) {
-            entry_index = i;
-            i = ramdisk_entries.len();
-        }
-        i = i + 1;
-    }
-
-    if entry_index < 0 { return -1; }
-
-    // Allocate file descriptor
-    var fd: i64 = vfs_alloc_fd();
-    if fd < 0 { return -1; }
-
-    var entry: VfsFd = fd_table.get(fd);
-    entry.used = true;
-    entry.entry_index = entry_index;
-    entry.offset = 0;
-    entry.mode = mode;
-    fd_table.set(fd, entry);
-
-    return fd;
-}
-
-pub fn vfs_close(fd: i64) -> i64 {
-    if fd < 0 || fd >= VFS_MAX_FDS { return -1; }
-    var entry: VfsFd = fd_table.get(fd);
-    if !entry.used { return -1; }
-    entry.used = false;
-    entry.entry_index = -1;
-    fd_table.set(fd, entry);
     return 0;
 }
 
-pub fn vfs_read(fd: i64, buf: i64, count: i64) -> i64 {
-    if fd < 0 || fd >= VFS_MAX_FDS { return -1; }
-    var fd_entry: VfsFd = fd_table.get(fd);
-    if !fd_entry.used { return -1; }
+// Convert cluster number to starting sector
+pub fn fat32_cluster_to_sector(cluster: i64) -> i64 {
+    var first_data: i64 = p_mem_read32(FAT_FIRST_DATA_SECTOR);
+    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
+    return (cluster - 2) * spc + first_data;
+}
 
-    var ram_entry: RamdiskEntry = ramdisk_entries.get(fd_entry.entry_index);
-    var remaining: i64 = ram_entry.size - fd_entry.offset;
-    if remaining <= 0 { return 0; }
+// Read FAT entry for a cluster (returns next cluster or 0xFFFFFFFF for end)
+pub fn fat32_read_fat(cluster: i64) -> i64 {
+    var bps: i64 = p_mem_read32(FAT_BYTES_PER_SECTOR);
+    var reserved: i64 = p_mem_read32(FAT_RESERVED_SECTORS);
+    // FAT entry offset = cluster * 4 bytes
+    var fat_offset: i64 = cluster * 4;
+    var fat_sector: i64 = reserved + (fat_offset / bps);
+    var entry_offset: i64 = fat_offset % bps;
 
-    var to_read: i64 = count;
-    if to_read > remaining { to_read = remaining; }
+    var result: i64 = ata_read_sector(fat_sector, FAT32_BUF);
+    if result != 0 { return 0xFFFFFFFF; }
 
-    // Copy data from ramdisk to buffer
+    var entry: i64 = p_mem_read8(FAT32_BUF + entry_offset) |
+                     (p_mem_read8(FAT32_BUF + entry_offset + 1) << 8) |
+                     (p_mem_read8(FAT32_BUF + entry_offset + 2) << 16) |
+                     (p_mem_read8(FAT32_BUF + entry_offset + 3) << 24);
+    return entry & 0x0FFFFFFF;
+}
+
+// Read a cluster into a buffer
+pub fn fat32_read_cluster(cluster: i64, buf: i64) -> i64 {
+    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
+    var sector: i64 = fat32_cluster_to_sector(cluster);
     var i: i64 = 0;
-    while i < to_read {
-        var byte: i64 = p_phys_read8(ram_entry.data + fd_entry.offset + i);
-        p_phys_write8(buf + i, byte);
+    while i < spc {
+        var result: i64 = ata_read_sector(sector + i, buf + i * 512);
+        if result != 0 { return -1; }
         i = i + 1;
     }
-
-    fd_entry.offset = fd_entry.offset + to_read;
-    fd_table.set(fd, fd_entry);
-
-    return to_read;
+    return 0;
 }
 
-pub fn vfs_write(fd: i64, buf: i64, count: i64) -> i64 {
-    // Ramdisk is read-only for now
-    return -1;
-}
+// Directory entry structure (32 bytes):
+// [0-10] name (8.3, space-padded)
+// [11]   attributes
+// [12]   reserved
+// [20-21] cluster high
+// [26-27] cluster low
+// [28-31] file size
 
-pub fn vfs_lseek(fd: i64, offset: i64, whence: i64) -> i64 {
-    if fd < 0 || fd >= VFS_MAX_FDS { return -1; }
-    var fd_entry: VfsFd = fd_table.get(fd);
-    if !fd_entry.used { return -1; }
-
-    var ram_entry: RamdiskEntry = ramdisk_entries.get(fd_entry.entry_index);
-
-    if whence == 0 { // SEEK_SET
-        fd_entry.offset = offset;
-    } else if whence == 1 { // SEEK_CUR
-        fd_entry.offset = fd_entry.offset + offset;
-    } else if whence == 2 { // SEEK_END
-        fd_entry.offset = ram_entry.size + offset;
+// List files in root directory
+pub fn cmd_ls() -> void {
+    con_putc(10);
+    if p_mem_read8(FAT_INITIALIZED) != 1 {
+        con_putc(70); con_putc(83); con_putc(32); con_putc(110); con_putc(111); con_putc(116); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116); // "FS not init"
+        con_putc(10);
+        return;
     }
 
-    if fd_entry.offset < 0 { fd_entry.offset = 0; }
-    if fd_entry.offset > ram_entry.size { fd_entry.offset = ram_entry.size; }
+    var cluster: i64 = FAT_ROOT_CLUSTER;
+    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
+    var cluster_size: i64 = spc * 512;
 
-    fd_table.set(fd, fd_entry);
-    return fd_entry.offset;
-}
-
-pub fn vfs_stat(path: str) -> VfsStat {
-    var i: i64 = 0;
-    while i < ramdisk_entries.len() {
-        var entry: RamdiskEntry = ramdisk_entries.get(i);
-        if str_equal(entry.name, path) {
-            return VfsStat { name: entry.name, type: entry.type, size: entry.size };
+    while cluster < 0x0FFFFFF8 {
+        var result: i64 = fat32_read_cluster(cluster, FAT32_BUF);
+        if result != 0 {
+            con_putc(82); con_putc(101); con_putc(97); con_putc(100); con_putc(32); con_putc(101); con_putc(114); con_putc(114); // "Read err"
+            con_putc(10);
+            return;
         }
-        i = i + 1;
-    }
-    return VfsStat { name: "", type: 0, size: -1 };
-}
 
-pub fn vfs_exists(path: str) -> bool {
-    var i: i64 = 0;
-    while i < ramdisk_entries.len() {
-        if str_equal(ramdisk_entries.get(i).name, path) { return true; }
-        i = i + 1;
-    }
-    return false;
-}
-
-pub fn vfs_list_dir(path: str) -> Vec<str> {
-    var result: Vec<str> = Vec::new();
-    var i: i64 = 0;
-    while i < ramdisk_entries.len() {
-        var entry: RamdiskEntry = ramdisk_entries.get(i);
-        // Check if entry name starts with path
-        if str_starts_with(entry.name, path) {
-            result.push(entry.name);
+        var offset: i64 = 0;
+        while offset < cluster_size {
+            var first_byte: i64 = p_mem_read8(FAT32_BUF + offset);
+            if first_byte == 0 { break; }  // end of directory
+            if first_byte != 0xE5 {  // not deleted
+                var attr: i64 = p_mem_read8(FAT32_BUF + offset + 11);
+                if (attr & 0x0F) != 0x0F {  // not LFN entry
+                    // Print name (8.3)
+                    var i: i64 = 0;
+                    while i < 11 {
+                        var c: i64 = p_mem_read8(FAT32_BUF + offset + i);
+                        if c != 32 { con_putc(c); }
+                        if i == 7 && p_mem_read8(FAT32_BUF + offset + 8) != 32 {
+                            con_putc(46);  // '.'
+                        }
+                        i = i + 1;
+                    }
+                    con_putc(32);
+                    // Print size (simple, no division)
+                    var size: i64 = p_mem_read8(FAT32_BUF + offset + 28) +
+                                    (p_mem_read8(FAT32_BUF + offset + 29) * 256);
+                    if size >= 100 {
+                        con_putc(48 + size / 100);
+                        con_putc(48 + (size / 10) % 10);
+                        con_putc(48 + size % 10);
+                    } else if size >= 10 {
+                        con_putc(48 + size / 10);
+                        con_putc(48 + size % 10);
+                    } else {
+                        con_putc(48 + size);
+                    }
+                    con_putc(32); con_putc(66);  // " B"
+                    if (attr & 0x10) != 0 {
+                        con_putc(32); con_putc(60); con_putc(68); con_putc(73); con_putc(82); con_putc(62);  // " <DIR>"
+                    }
+                    con_putc(10);
+                }
+            }
+            offset = offset + 32;
         }
+
+        cluster = fat32_read_fat(cluster);
+    }
+}
+
+// Find a file in root directory by 8.3 name.
+// Returns cluster number if found, 0 if not found.
+// Sets file_size_out to the file size.
+pub fn fat32_find_file(name_addr: i64, name_len: i64, file_size_out: i64) -> i64 {
+    if p_mem_read8(FAT_INITIALIZED) != 1 { return 0; }
+
+    var cluster: i64 = FAT_ROOT_CLUSTER;
+    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
+    var cluster_size: i64 = spc * 512;
+
+    while cluster < 0x0FFFFFF8 {
+        var result: i64 = fat32_read_cluster(cluster, FAT32_BUF);
+        if result != 0 { return 0; }
+
+        var offset: i64 = 0;
+        while offset < cluster_size {
+            var first_byte: i64 = p_mem_read8(FAT32_BUF + offset);
+            if first_byte == 0 { return 0; }  // end of directory
+            if first_byte != 0xE5 {
+                var attr: i64 = p_mem_read8(FAT32_BUF + offset + 11);
+                if (attr & 0x0F) != 0x0F {
+                    // Convert input filename to 8.3 format at 0x41040
+                    // First, fill with spaces
+                    var k: i64 = 0;
+                    while k < 11 {
+                        p_mem_write8(0x41040 + k, 32);
+                        k = k + 1;
+                    }
+                    // Copy name part (before '.') to positions 0-7
+                    var in_idx: i64 = 0;
+                    var out_idx: i64 = 0;
+                    var saw_dot: i64 = 0;
+                    while in_idx < name_len {
+                        var c: i64 = p_mem_read8(name_addr + in_idx);
+                        // Uppercase
+                        if c >= 97 && c <= 122 { c = c - 32; }
+                        if c == 46 {  // '.'
+                            saw_dot = 1;
+                            out_idx = 8;  // extension starts at position 8
+                        } else {
+                            if saw_dot == 0 && out_idx < 8 {
+                                p_mem_write8(0x41040 + out_idx, c);
+                                out_idx = out_idx + 1;
+                            } else if saw_dot == 1 && out_idx < 11 {
+                                p_mem_write8(0x41040 + out_idx, c);
+                                out_idx = out_idx + 1;
+                            }
+                        }
+                        in_idx = in_idx + 1;
+                    }
+                    // Compare 11 bytes
+                    var is_match: i64 = 1;
+                    var i: i64 = 0;
+                    while i < 11 {
+                        var disk_c: i64 = p_mem_read8(FAT32_BUF + offset + i);
+                        var input_c: i64 = p_mem_read8(0x41040 + i);
+                        if disk_c != input_c {
+                            is_match = 0;
+                            i = 11;
+                        }
+                        i = i + 1;
+                    }
+                    if is_match == 1 {
+                        var clus: i64 = p_mem_read8(FAT32_BUF + offset + 26) +
+                                       (p_mem_read8(FAT32_BUF + offset + 27) * 256);
+                        var sz: i64 = p_mem_read8(FAT32_BUF + offset + 28) +
+                                     (p_mem_read8(FAT32_BUF + offset + 29) * 256);
+                        p_mem_write8(file_size_out, sz);
+                        return clus;
+                    }
+                }
+            }
+            offset = offset + 32;
+        }
+        cluster = fat32_read_fat(cluster);
+    }
+    return 0;
+}
+
+// Read file contents by cluster chain into a buffer
+pub fn fat32_read_file(cluster: i64, buf: i64, max_size: i64) -> i64 {
+    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
+    var cluster_size: i64 = spc * 512;
+    var total: i64 = 0;
+
+    while cluster < 0x0FFFFFF8 && total < max_size {
+        var result: i64 = fat32_read_cluster(cluster, buf + total);
+        if result != 0 { return total; }
+        total = total + cluster_size;
+        if total > max_size { total = max_size; }
+        cluster = fat32_read_fat(cluster);
+    }
+    return total;
+}
+
+// Cat a file from FAT32 filesystem
+pub fn cmd_cat(name_addr: i64, name_len: i64) -> void {
+    con_putc(10);
+    if p_mem_read8(FAT_INITIALIZED) != 1 {
+        con_putc(70); con_putc(83); con_putc(32); con_putc(110); con_putc(111); con_putc(116); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116);
+        con_putc(10);
+        return;
+    }
+
+    var file_size: i64 = 0;
+    var size_addr: i64 = 0x41020;  // temp storage for file size
+    var cluster: i64 = fat32_find_file(name_addr, name_len, size_addr);
+    if cluster == 0 {
+        con_putc(78); con_putc(111); con_putc(116); con_putc(32); con_putc(102); con_putc(111); con_putc(117); con_putc(110); con_putc(100); // "Not found"
+        con_putc(10);
+        return;
+    }
+
+    file_size = p_mem_read8(size_addr);
+    // Direct read: bypass fat32_read_file, read sector directly
+    var sector: i64 = fat32_cluster_to_sector(cluster);
+    var result: i64 = ata_read_sector(sector, FAT32_BUF);
+    if result != 0 {
+        con_putc(82); con_putc(101); con_putc(97); con_putc(100); con_putc(32); con_putc(101); con_putc(114); con_putc(114);
+        con_putc(10);
+        return;
+    }
+
+    // Print file contents
+    var i: i64 = 0;
+    while i < file_size {
+        con_putc(p_mem_read8(FAT32_BUF + i));
         i = i + 1;
     }
+    con_putc(10);
+}
+
+// ─── FAT32 Write Support ─────────────────────────────────────────────────
+
+// Write a FAT entry (32-bit value at FAT offset)
+pub fn fat32_write_fat(cluster: i64, value: i64) -> i64 {
+    var reserved: i64 = p_mem_read32(FAT_RESERVED_SECTORS);
+    var bps: i64 = p_mem_read32(FAT_BYTES_PER_SECTOR);
+    var fat_offset: i64 = cluster * 4;
+    var fat_sector: i64 = reserved + (fat_offset / bps);
+    var sector_offset: i64 = fat_offset % bps;
+    // Read the FAT sector
+    var result: i64 = ata_read_sector(fat_sector, FAT32_BUF);
+    if result != 0 { return -1; }
+    // Write the 32-bit FAT entry (lower 28 bits used)
+    p_mem_write32(FAT32_BUF + sector_offset, value & 0x0FFFFFFF);
+    // Write back the FAT sector
+    result = ata_write_sector(fat_sector, FAT32_BUF);
+    if result != 0 { return -1; }
+    // Also update the second FAT copy
+    var spf: i64 = p_mem_read32(FAT_SECTORS_PER_FAT);
+    result = ata_read_sector(fat_sector + spf, FAT32_BUF);
+    if result != 0 { return -1; }
+    p_mem_write32(FAT32_BUF + sector_offset, value & 0x0FFFFFFF);
+    result = ata_write_sector(fat_sector + spf, FAT32_BUF);
     return result;
 }
 
-// ─── File Descriptor Helpers ──────────────────────────────────────────────
+// Find a free cluster in the FAT
+pub fn fat32_find_free_cluster() -> i64 {
+    var reserved: i64 = p_mem_read32(FAT_RESERVED_SECTORS);
+    var bps: i64 = p_mem_read32(FAT_BYTES_PER_SECTOR);
+    var spf: i64 = p_mem_read32(FAT_SECTORS_PER_FAT);
+    var total_fat_sectors: i64 = reserved + spf;
+    var sector: i64 = reserved;
+    while sector < total_fat_sectors {
+        var result: i64 = ata_read_sector(sector, FAT32_BUF);
+        if result != 0 { return -1; }
+        var i: i64 = 0;
+        while i < bps {
+            var entry: i64 = p_mem_read32(FAT32_BUF + i);
+            if entry == 0 {
+                // Found free cluster
+                var cluster: i64 = ((sector - reserved) * bps + i) / 4;
+                return cluster;
+            }
+            i = i + 4;
+        }
+        sector = sector + 1;
+    }
+    return -1;  // no free clusters
+}
 
-fn vfs_alloc_fd() -> i64 {
-    var i: i64 = 3;  // Skip stdin/stdout/stderr
-    while i < VFS_MAX_FDS {
-        var fd: VfsFd = fd_table.get(i);
-        if !fd.used { return i; }
+// Write a cluster to disk
+pub fn fat32_write_cluster(cluster: i64, buf: i64) -> i64 {
+    var sector: i64 = fat32_cluster_to_sector(cluster);
+    return ata_write_sector(sector, buf);
+}
+
+// Create a file in the root directory with initial data
+// Returns 0 on success, -1 on failure
+pub fn fat32_create_file(name_addr: i64, name_len: i64, data_addr: i64, data_len: i64) -> i64 {
+    if p_mem_read8(FAT_INITIALIZED) != 1 { return -1; }
+
+    // Find a free cluster for the file data
+    var data_cluster: i64 = fat32_find_free_cluster();
+    if data_cluster < 2 { return -1; }
+
+    // Mark the cluster as end-of-chain in the FAT
+    fat32_write_fat(data_cluster, 0x0FFFFFFF);
+
+    // Write data to the cluster
+    // First, zero the cluster buffer
+    var i: i64 = 0;
+    while i < 512 {
+        p_mem_write8(FAT32_BUF, 0);
         i = i + 1;
     }
-    return -1;
+    // Copy data to buffer
+    i = 0;
+    while i < data_len && i < 512 {
+        p_mem_write8(FAT32_BUF + i, p_mem_read8(data_addr + i));
+        i = i + 1;
+    }
+    // Write the cluster
+    fat32_write_cluster(data_cluster, FAT32_BUF);
+
+    // Find the root directory (cluster 2 for FAT32)
+    var root_sector: i64 = fat32_cluster_to_sector(2);
+    var result: i64 = ata_read_sector(root_sector, FAT32_BUF);
+    if result != 0 { return -1; }
+
+    // Find a free directory entry (first byte = 0x00 or 0xE5)
+    var entry_offset: i64 = -1;
+    i = 0;
+    while i < 512 {
+        var first_byte: i64 = p_mem_read8(FAT32_BUF + i);
+        if first_byte == 0 || first_byte == 0xE5 {
+            entry_offset = i;
+            break;
+        }
+        i = i + 32;
+    }
+
+    if entry_offset < 0 {
+        // No free entry in this sector — try next root directory sector
+        root_sector = root_sector + 1;
+        result = ata_read_sector(root_sector, FAT32_BUF);
+        if result != 0 { return -1; }
+        entry_offset = 0;
+    }
+
+    // Create the directory entry (8.3 format)
+    // Fill name with spaces (0x20)
+    i = 0;
+    while i < 11 {
+        p_mem_write8(FAT32_BUF + entry_offset + i, 0x20);
+        i = i + 1;
+    }
+    // Copy filename (up to 8 chars, pad with spaces)
+    i = 0;
+    while i < name_len && i < 8 {
+        var c: i64 = p_mem_read8(name_addr + i);
+        // Convert to uppercase for FAT32
+        if c >= 97 && c <= 122 { c = c - 32; }
+        p_mem_write8(FAT32_BUF + entry_offset + i, c);
+        i = i + 1;
+    }
+    // Set attributes (0x20 = archive)
+    p_mem_write8(FAT32_BUF + entry_offset + 11, 0x20);
+    // Set first cluster (lower 16 bits at offset 26, upper 16 bits at offset 20)
+    p_mem_write8(FAT32_BUF + entry_offset + 26, data_cluster & 0xFF);
+    p_mem_write8(FAT32_BUF + entry_offset + 27, (data_cluster >> 8) & 0xFF);
+    p_mem_write8(FAT32_BUF + entry_offset + 20, (data_cluster >> 16) & 0xFF);
+    p_mem_write8(FAT32_BUF + entry_offset + 21, (data_cluster >> 24) & 0xFF);
+    // Set file size (32-bit at offset 28)
+    p_mem_write8(FAT32_BUF + entry_offset + 28, data_len & 0xFF);
+    p_mem_write8(FAT32_BUF + entry_offset + 29, (data_len >> 8) & 0xFF);
+    p_mem_write8(FAT32_BUF + entry_offset + 30, (data_len >> 16) & 0xFF);
+    p_mem_write8(FAT32_BUF + entry_offset + 31, (data_len >> 24) & 0xFF);
+
+    // Write the directory sector back
+    ata_write_sector(root_sector, FAT32_BUF);
+
+    return 0;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────
-
-fn read_u32_at(addr: i64, offset: i64) -> i64 {
-    return p_phys_read8(addr + offset) |
-           (p_phys_read8(addr + offset + 1) << 8) |
-           (p_phys_read8(addr + offset + 2) << 16) |
-           (p_phys_read8(addr + offset + 3) << 24);
+// Delete a file (mark directory entry as deleted)
+pub fn fat32_delete_file(name_addr: i64, name_len: i64) -> i64 {
+    if p_mem_read8(FAT_INITIALIZED) != 1 { return -1; }
+    var root_sector: i64 = fat32_cluster_to_sector(2);
+    var result: i64 = ata_read_sector(root_sector, FAT32_BUF);
+    if result != 0 { return -1; }
+    var i: i64 = 0;
+    while i < 512 {
+        var first_byte: i64 = p_mem_read8(FAT32_BUF + i);
+        if first_byte == 0 { break; }  // end of directory
+        if first_byte != 0xE5 {
+            // Compare name (first 8 chars, uppercase)
+            var is_match: i64 = 1;
+            var j: i64 = 0;
+            while j < name_len && j < 8 {
+                var c: i64 = p_mem_read8(name_addr + j);
+                if c >= 97 && c <= 122 { c = c - 32; }
+                if p_mem_read8(FAT32_BUF + i + j) != c {
+                    is_match = 0;
+                    break;
+                }
+                j = j + 1;
+            }
+            if is_match == 1 && name_len <= 8 {
+                // Mark entry as deleted
+                p_mem_write8(FAT32_BUF + i, 0xE5);
+                ata_write_sector(root_sector, FAT32_BUF);
+                return 0;
+            }
+        }
+        i = i + 32;
+    }
+    return -1;  // not found
 }
 
-fn read_u64_at(addr: i64, offset: i64) -> i64 {
-    var lo: i64 = read_u32_at(addr, offset);
-    var hi: i64 = read_u32_at(addr, offset + 4);
-    return lo | (hi << 32);
+// Touch command — create an empty file
+pub fn cmd_touch(name_addr: i64, name_len: i64) -> void {
+    con_putc(10);
+    if p_mem_read8(FAT_INITIALIZED) != 1 {
+        con_putc(70); con_putc(83); con_putc(32); con_putc(110); con_putc(111); con_putc(116); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116);
+        con_putc(10);
+        return;
+    }
+    var result: i64 = fat32_create_file(name_addr, name_len, 0, 0);
+    if result == 0 {
+        con_putc(79); con_putc(75); con_putc(10); // "OK"
+    } else {
+        con_putc(70); con_putc(97); con_putc(105); con_putc(108); // "Fail"
+        con_putc(10);
+    }
+}
+
+// Delete command — delete a file
+pub fn cmd_rm(name_addr: i64, name_len: i64) -> void {
+    con_putc(10);
+    if p_mem_read8(FAT_INITIALIZED) != 1 {
+        con_putc(70); con_putc(83); con_putc(32); con_putc(110); con_putc(111); con_putc(116); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116);
+        con_putc(10);
+        return;
+    }
+    var result: i64 = fat32_delete_file(name_addr, name_len);
+    if result == 0 {
+        con_putc(79); con_putc(75); con_putc(10); // "OK"
+    } else {
+        con_putc(78); con_putc(111); con_putc(116); con_putc(32); con_putc(102); con_putc(111); con_putc(117); con_putc(110); con_putc(100); // "Not found"
+        con_putc(10);
+    }
 }

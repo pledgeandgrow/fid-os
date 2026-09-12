@@ -1,434 +1,32 @@
-// kernel/shell.fd — Fides OS with VGA framebuffer, keyboard, and shell
+// kernel/shell.fd — Fides OS main kernel + shell
 //
 // Boots via GRUB/Multiboot2, writes to VGA text mode (0xB8000),
-// reads keyboard input via polling (port 0x60/0x64), and runs a
-// basic shell with commands: help, clear, echo, reboot, halt.
+// reads keyboard input via interrupts, and runs a shell.
+// All subsystems are in separate modules imported via `use`.
 
 module shell;
 
-// ─── VGA Text Mode ───────────────────────────────────────────────────────
-// VGA text buffer at 0xB8000. 80 columns x 25 rows.
-// Each cell: 2 bytes — [ASCII char][attribute byte]
-
-const VGA_ADDR:  i64 = 0xB8000;
-const VGA_COLS:  i64 = 80;
-const VGA_ROWS:  i64 = 25;
-const VGA_ATTR:  i64 = 0x07;
-
-var vga_col: i64 = 0;
-var vga_row: i64 = 0;
-
-fn vga_putc_at(col: i64, row: i64, c: i64) -> void {
-    var offset: i64 = (row * VGA_COLS + col) * 2;
-    p_mem_write8(VGA_ADDR + offset, c);
-    p_mem_write8(VGA_ADDR + offset + 1, VGA_ATTR);
-}
-
-fn vga_scroll() -> void {
-    var row: i64 = 0;
-    while row < VGA_ROWS - 1 {
-        var col: i64 = 0;
-        while col < VGA_COLS {
-            var src: i64 = VGA_ADDR + ((row + 1) * VGA_COLS + col) * 2;
-            var dst: i64 = VGA_ADDR + (row * VGA_COLS + col) * 2;
-            p_mem_write8(dst, p_mem_read8(src));
-            p_mem_write8(dst + 1, p_mem_read8(src + 1));
-            col = col + 1;
-        }
-        row = row + 1;
-    }
-    var col2: i64 = 0;
-    while col2 < VGA_COLS {
-        vga_putc_at(col2, VGA_ROWS - 1, 32);
-        col2 = col2 + 1;
-    }
-}
-
-fn vga_putc(c: i64) -> void {
-    if c == 10 {
-        vga_col = 0;
-        vga_row = vga_row + 1;
-        if vga_row >= VGA_ROWS { vga_scroll(); vga_row = VGA_ROWS - 1; }
-        return;
-    }
-    if c == 8 {
-        if vga_col > 0 {
-            vga_col = vga_col - 1;
-            vga_putc_at(vga_col, vga_row, 32);
-        }
-        return;
-    }
-    vga_putc_at(vga_col, vga_row, c);
-    vga_col = vga_col + 1;
-    if vga_col >= VGA_COLS {
-        vga_col = 0;
-        vga_row = vga_row + 1;
-        if vga_row >= VGA_ROWS { vga_scroll(); vga_row = VGA_ROWS - 1; }
-    }
-}
-
-fn vga_clear() -> void {
-    var row: i64 = 0;
-    while row < VGA_ROWS {
-        var col: i64 = 0;
-        while col < VGA_COLS {
-            vga_putc_at(col, row, 32);
-            col = col + 1;
-        }
-        row = row + 1;
-    }
-    vga_col = 0;
-    vga_row = 0;
-}
-
-// ─── Serial Output (COM1) ───────────────────────────────────────────────
-
-fn serial_putc(c: i64) -> void {
-    var ready: i64 = 0;
-    while ready == 0 {
-        ready = p_inb(0x3FD) & 0x20;
-    }
-    p_outb(0x3F8, c);
-}
-
-fn con_putc(c: i64) -> void {
-    vga_putc(c);
-    serial_putc(c);
-}
-
-// ─── Exception Handlers ─────────────────────────────────────────────────
-// CPU exception handlers. These prevent triple faults by catching errors
-// and printing a diagnostic message instead of silently resetting.
-
-// Print a crash message and halt. Used by all exception handlers.
-fn panic_print(msg0: i64, msg1: i64, msg2: i64, msg3: i64, msg4: i64, msg5: i64, msg6: i64, msg7: i64) -> void {
-    con_putc(10);
-    con_putc(91); con_putc(67); con_putc(82); con_putc(65); con_putc(83); con_putc(72); con_putc(93); // [CRASH]
-    con_putc(32);
-    con_putc(msg0); con_putc(msg1); con_putc(msg2); con_putc(msg3);
-    con_putc(msg4); con_putc(msg5); con_putc(msg6); con_putc(msg7);
-    con_putc(10);
-    // Print CR2 (page fault address) if available
-    p_cli();
-    while true { p_hlt(); }
-}
-
-// #DE Divide Error (vector 0x00)
-@interrupt(0) fn exc_divide_error() -> void {
-    panic_print(68, 105, 118, 105, 100, 101, 32, 98); // "Divide b"
-}
-
-// #DF Double Fault (vector 0x08)
-@interrupt(8) fn exc_double_fault() -> void {
-    panic_print(68, 111, 117, 98, 108, 101, 32, 70); // "Double F"
-}
-
-// #GP General Protection Fault (vector 0x0D)
-@interrupt(13) fn exc_gpf() -> void {
-    var errcode: i64 = p_mem_read8(0x510);
-    panic_print(71, 80, 70, 32, 70, 97, 117, 108); // "GPF Faul"
-    con_putc(32); con_putc(69); con_putc(58); con_putc(32); // " E: "
-    print_hex(errcode);
-    con_putc(10);
-}
-
-// #PF Page Fault (vector 0x0E)
-@interrupt(14) fn exc_page_fault() -> void {
-    var cr2: i64 = p_cr2_read();
-    var errcode: i64 = p_mem_read8(0x510);
-    con_putc(10);
-    con_putc(91); con_putc(67); con_putc(82); con_putc(65); con_putc(83); con_putc(72); con_putc(93); // [CRASH]
-    con_putc(32);
-    con_putc(80); con_putc(97); con_putc(103); con_putc(101); con_putc(32); con_putc(70); con_putc(97); // "Page Fa"
-    con_putc(117); con_putc(108); con_putc(116); con_putc(32); con_putc(97); con_putc(116); con_putc(32); // "ult at "
-    print_hex(cr2);
-    con_putc(32); con_putc(69); con_putc(58); con_putc(32); // " E: "
-    print_hex(errcode);
-    con_putc(10);
-    p_cli();
-    while true { p_hlt(); }
-}
-
-// ─── Timer Interrupt (IRQ0) ─────────────────────────────────────────────
-// Timer tick counter at 0x690 (8 bytes)
-const TIMER_TICKS: i64 = 0x690;
-
-// IRQ0 timer interrupt handler (vector 0x20 after PIC remap).
-// Increments a tick counter, calls scheduler, and sends EOI.
-@interrupt(0x20) fn irq0_handler() -> void {
-    // Increment tick counter
-    p_mem_write8(TIMER_TICKS, p_mem_read8(TIMER_TICKS) + 1);
-    // Send EOI to master PIC
-    p_outb(0x20, 0x20);
-}
-
-// ─── Exception Handlers ──────────────────────────────────────────────────
-
-// Error code saved by PE backend prologue at 0x510
-const EXC_ERRCODE: i64 = 0x510;
-
-// (Existing exception handlers in shell.fd already handle #PF, #GP, #DF, #DE)
-// The PE backend prologue saves the CPU-pushed error code at 0x510 for
-// vectors that push one (0x08, 0x0A-0x0E, 0x11, 0x1E).
-
-// Get the current tick count.
-fn timer_get_ticks() -> i64 {
-    return p_mem_read8(TIMER_TICKS);
-}
-
-// ─── Keyboard Input (Interrupt-Driven) ──────────────────────────────────
-
-// Scancode circular buffer at 0x600 (64 entries × 8 bytes = 512 bytes)
-// Head/tail pointers at 0x680/0x688
-// Shift state at 0x689 (0=none, 1=left or right shift)
-// CapsLock state at 0x68A (0=off, 1=on)
-const SCANCODE_BUF: i64 = 0x600;
-const SCANCODE_HEAD: i64 = 0x680;
-const SCANCODE_TAIL: i64 = 0x688;
-const KBD_SHIFT: i64 = 0x689;
-const KBD_CAPS: i64 = 0x68A;
-const SCANCODE_SIZE: i64 = 64;
-
-// IRQ1 keyboard interrupt handler.
-// The boot trampoline automatically wires this to IDT vector 0x21.
-// This function is called by the CPU when a key is pressed/released.
-// It reads the scancode, stores it in the buffer, and sends EOI to the PIC.
-interrupt fn irq1_handler() -> void {
-    // Read scancode from keyboard data port
-    var sc: i64 = p_inb(0x60);
-
-    // Track Shift state (0x2A=left shift down, 0xAA=left shift up,
-    //                     0x36=right shift down, 0xB6=right shift up)
-    if sc == 0x2A || sc == 0x36 {
-        p_mem_write8(KBD_SHIFT, 1);
-        p_outb(0x20, 0x20);
-        return;
-    }
-    if sc == 0xAA || sc == 0xB6 {
-        p_mem_write8(KBD_SHIFT, 0);
-        p_outb(0x20, 0x20);
-        return;
-    }
-    // Toggle CapsLock on 0x3A (make code only)
-    if sc == 0x3A {
-        var caps: i64 = p_mem_read8(KBD_CAPS);
-        if caps == 0 { p_mem_write8(KBD_CAPS, 1); }
-        else { p_mem_write8(KBD_CAPS, 0); }
-        p_outb(0x20, 0x20);
-        return;
-    }
-
-    // Store in circular buffer
-    var head: i64 = p_mem_read8(SCANCODE_HEAD);
-    var next: i64 = head + 1;
-    if next >= SCANCODE_SIZE { next = 0; }
-    // Only write if buffer not full (tail != next)
-    var tail: i64 = p_mem_read8(SCANCODE_TAIL);
-    if next != tail {
-        // Store scancode at buffer[head]
-        p_mem_write8(SCANCODE_BUF + head, sc);
-        p_mem_write8(SCANCODE_HEAD, next);
-    }
-
-    // Send EOI (End of Interrupt) to master PIC
-    p_outb(0x20, 0x20);
-}
-
-// Read a scancode from the buffer. Returns -1 if no scancode available.
-// Uses hlt to wait for interrupts (CPU sleeps until a key is pressed).
-fn kbd_read_scancode() -> i64 {
-    while true {
-        var head: i64 = p_mem_read8(SCANCODE_HEAD);
-        var tail: i64 = p_mem_read8(SCANCODE_TAIL);
-        if head != tail {
-            // Buffer has data
-            var sc: i64 = p_mem_read8(SCANCODE_BUF + tail);
-            var next: i64 = tail + 1;
-            if next >= SCANCODE_SIZE { next = 0; }
-            p_mem_write8(SCANCODE_TAIL, next);
-            return sc;
-        }
-        // No data — sleep until next interrupt
-        p_hlt();
-    }
-    return -1;
-}
-
-// Convert scancode to ASCII, respecting Shift and CapsLock state.
-fn scancode_to_ascii(sc: i64) -> i64 {
-    // Release codes (bit 7 set) are not characters
-    if (sc & 0x80) != 0 { return -1; }
-
-    var shift: i64 = p_mem_read8(KBD_SHIFT);
-    var caps: i64 = p_mem_read8(KBD_CAPS);
-
-    // Special keys
-    if sc == 0x1C { return 10; }  // Enter
-    if sc == 0x39 { return 32; }  // Space
-    if sc == 0x0E { return 8;  }  // Backspace
-
-    // Letters (a-z): apply Shift or CapsLock for uppercase
-    var letter: i64 = -1;
-    if sc == 0x1E { letter = 97; }  if sc == 0x30 { letter = 98; }
-    if sc == 0x2E { letter = 99; }  if sc == 0x20 { letter = 100; }
-    if sc == 0x12 { letter = 101; } if sc == 0x21 { letter = 102; }
-    if sc == 0x22 { letter = 103; } if sc == 0x23 { letter = 104; }
-    if sc == 0x17 { letter = 105; } if sc == 0x24 { letter = 106; }
-    if sc == 0x25 { letter = 107; } if sc == 0x26 { letter = 108; }
-    if sc == 0x32 { letter = 109; } if sc == 0x31 { letter = 110; }
-    if sc == 0x18 { letter = 111; } if sc == 0x19 { letter = 112; }
-    if sc == 0x10 { letter = 113; } if sc == 0x13 { letter = 114; }
-    if sc == 0x1F { letter = 115; } if sc == 0x14 { letter = 116; }
-    if sc == 0x16 { letter = 117; } if sc == 0x2F { letter = 118; }
-    if sc == 0x11 { letter = 119; } if sc == 0x2D { letter = 120; }
-    if sc == 0x15 { letter = 121; } if sc == 0x2C { letter = 122; }
-    if letter != -1 {
-        // Uppercase if (shift XOR caps) for letters
-        if (shift != 0) != (caps != 0) {
-            return letter - 32; // to uppercase
-        }
-        return letter;
-    }
-
-    // Number row: shifted gives symbols
-    if sc == 0x02 { if shift != 0 { return 33; }  return 49; }  // 1 or !
-    if sc == 0x03 { if shift != 0 { return 64; }  return 50; }  // 2 or @
-    if sc == 0x04 { if shift != 0 { return 35; }  return 51; }  // 3 or #
-    if sc == 0x05 { if shift != 0 { return 36; }  return 52; }  // 4 or $
-    if sc == 0x06 { if shift != 0 { return 37; }  return 53; }  // 5 or %
-    if sc == 0x07 { if shift != 0 { return 94; }  return 54; }  // 6 or ^
-    if sc == 0x08 { if shift != 0 { return 38; }  return 55; }  // 7 or &
-    if sc == 0x09 { if shift != 0 { return 42; }  return 56; }  // 8 or *
-    if sc == 0x0A { if shift != 0 { return 40; }  return 57; }  // 9 or (
-    if sc == 0x0B { if shift != 0 { return 41; }  return 48; }  // 0 or )
-
-    // Punctuation (unshifted)
-    if sc == 0x0C { if shift != 0 { return 95; }  return 45; }  // - or _
-    if sc == 0x0D { if shift != 0 { return 43; }  return 61; }  // = or +
-    if sc == 0x33 { if shift != 0 { return 60; }  return 44; }  // , or <
-    if sc == 0x34 { if shift != 0 { return 62; }  return 46; }  // . or >
-    if sc == 0x35 { if shift != 0 { return 63; }  return 47; }  // / or ?
-
-    // Additional keys
-    if sc == 0x27 { if shift != 0 { return 123; } return 59; }  // ; or {
-    if sc == 0x28 { if shift != 0 { return 125; } return 39; }  // ' or }
-    if sc == 0x29 { if shift != 0 { return 126; } return 96; }  // ` or ~
-    if sc == 0x2B { if shift != 0 { return 124; } return 92; }  // \ or |
-    if sc == 0x1A { if shift != 0 { return 123; } return 91; }  // [ or {
-    if sc == 0x1B { if shift != 0 { return 125; } return 93; }  // ] or }
-
-    return -1;
-}
-
-// ─── Input Buffer ────────────────────────────────────────────────────────
-// Use a fixed memory region for the input buffer (below VGA at 0x80000)
-const INPUT_BUF_ADDR: i64 = 0x80000;
-const INPUT_MAX: i64 = 256;
-
-fn input_clear() -> void {
-    var i: i64 = 0;
-    while i < INPUT_MAX {
-        p_mem_write8(INPUT_BUF_ADDR + i, 0);
-        i = i + 1;
-    }
-}
-
-fn input_write(idx: i64, c: i64) -> void {
-    p_mem_write8(INPUT_BUF_ADDR + idx, c);
-}
-
-fn input_get(idx: i64) -> i64 {
-    return p_mem_read8(INPUT_BUF_ADDR + idx);
-}
-
-// Check if input matches a string (char codes passed as args)
-fn input_matches(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, len: i64, actual_len: i64) -> i64 {
-    if actual_len != len { return 0; }
-    if len > 0 { if input_get(0) != s0 { return 0; } }
-    if len > 1 { if input_get(1) != s1 { return 0; } }
-    if len > 2 { if input_get(2) != s2 { return 0; } }
-    if len > 3 { if input_get(3) != s3 { return 0; } }
-    if len > 4 { if input_get(4) != s4 { return 0; } }
-    return 1;
-}
-
-// Check if input matches a string up to 8 chars
-fn input_matches8(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64, len: i64, actual_len: i64) -> i64 {
-    if actual_len != len { return 0; }
-    if len > 0 { if input_get(0) != s0 { return 0; } }
-    if len > 1 { if input_get(1) != s1 { return 0; } }
-    if len > 2 { if input_get(2) != s2 { return 0; } }
-    if len > 3 { if input_get(3) != s3 { return 0; } }
-    if len > 4 { if input_get(4) != s4 { return 0; } }
-    if len > 5 { if input_get(5) != s5 { return 0; } }
-    if len > 6 { if input_get(6) != s6 { return 0; } }
-    if len > 7 { if input_get(7) != s7 { return 0; } }
-    return 1;
-}
-
-// Print a decimal integer
-fn print_dec(n: i64) -> void {
-    var m: i64 = n;
-    if m == 0 { con_putc(48); return; }
-    // Handle negative
-    if m < 0 {
-        con_putc(45);
-        m = 0 - m;
-    }
-    // Extract digits into a buffer at 0x50000
-    var buf: i64 = 0x50000;
-    var i: i64 = 0;
-    while m > 0 {
-        p_mem_write8(buf + i, 48 + (m % 10));
-        m = m / 10;
-        i = i + 1;
-    }
-    // Print in reverse
-    while i > 0 {
-        i = i - 1;
-        con_putc(p_mem_read8(buf + i));
-    }
-}
-
-// Print a hex integer (64-bit, with 0x prefix)
-fn print_hex(n: i64) -> void {
-    con_putc(48); con_putc(120);
-    var buf: i64 = 0x50000;
-    var i: i64 = 0;
-    var tmp: i64 = n;
-    while i < 16 {
-        var nibble: i64 = tmp & 0xF;
-        if nibble < 10 {
-            p_mem_write8(buf + i, 48 + nibble);
-        } else {
-            p_mem_write8(buf + i, 97 + nibble - 10);
-        }
-        tmp = tmp >> 4;
-        i = i + 1;
-    }
-    // Skip leading zeros
-    i = 15;
-    while i > 0 {
-        if p_mem_read8(buf + i) != 48 { break; }
-        i = i - 1;
-    }
-    while i >= 0 {
-        con_putc(p_mem_read8(buf + i));
-        i = i - 1;
-    }
-}
-
-// Print a fixed string from char codes (up to 16)
-fn print_str(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64, len: i64) -> void {
-    if len > 0 { con_putc(s0); }
-    if len > 1 { con_putc(s1); }
-    if len > 2 { con_putc(s2); }
-    if len > 3 { con_putc(s3); }
-    if len > 4 { con_putc(s4); }
-    if len > 5 { con_putc(s5); }
-    if len > 6 { con_putc(s6); }
-    if len > 7 { con_putc(s7); }
-}
+use vga;
+use serial;
+use console;
+use isr;
+use keyboard;
+use kalloc;
+use sched;
+use ata;
+use vfs;
+use initrd;
+use pci;
+use acpi;
+use vm;
+use mouse;
+use apic;
+use elf;
+use syscall;
+use net;
+use framebuffer;
+use dma;
+use shell_script;
 
 // ─── Shell Commands ─────────────────────────────────────────────────────
 
@@ -594,256 +192,6 @@ fn cmd_echo(input_len: i64) -> void {
         i = i + 1;
     }
     con_putc(10);
-}
-
-// ─── ELF Loader ─────────────────────────────────────────────────────────
-// Simplified ELF64 loader for bare-metal mode.
-// Parses ELF header, validates magic, loads PT_LOAD segments, returns entry.
-
-const ELF_MAGIC0: i64 = 0x7F;
-const ELF_MAGIC1: i64 = 0x45;  // 'E'
-const ELF_MAGIC2: i64 = 0x4C;  // 'L'
-const ELF_MAGIC3: i64 = 0x46;  // 'F'
-const ELF_CLASS_64: i64 = 2;
-const ELF_MACHINE_X86_64: i64 = 62;
-const PT_LOAD: i64 = 1;
-
-// Read a little-endian u16 from a memory buffer
-fn elf_read_u16(buf: i64, offset: i64) -> i64 {
-    var b0: i64 = p_mem_read8(buf + offset);
-    var b1: i64 = p_mem_read8(buf + offset + 1);
-    return b0 | (b1 << 8);
-}
-
-// Read a little-endian u32 from a memory buffer
-fn elf_read_u32(buf: i64, offset: i64) -> i64 {
-    var b0: i64 = p_mem_read8(buf + offset);
-    var b1: i64 = p_mem_read8(buf + offset + 1);
-    var b2: i64 = p_mem_read8(buf + offset + 2);
-    var b3: i64 = p_mem_read8(buf + offset + 3);
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-}
-
-// Read a little-endian u64 from a memory buffer
-fn elf_read_u64(buf: i64, offset: i64) -> i64 {
-    var lo: i64 = elf_read_u32(buf, offset);
-    var hi: i64 = elf_read_u32(buf, offset + 4);
-    return lo | (hi << 32);
-}
-
-// Check if a buffer contains a valid ELF64 header
-fn elf_is_valid(buf: i64) -> i64 {
-    if p_mem_read8(buf + 0) != ELF_MAGIC0 { return 0; }
-    if p_mem_read8(buf + 1) != ELF_MAGIC1 { return 0; }
-    if p_mem_read8(buf + 2) != ELF_MAGIC2 { return 0; }
-    if p_mem_read8(buf + 3) != ELF_MAGIC3 { return 0; }
-    if p_mem_read8(buf + 4) != ELF_CLASS_64 { return 0; }
-    var machine: i64 = elf_read_u16(buf, 18);
-    if machine != ELF_MACHINE_X86_64 { return 0; }
-    return 1;
-}
-
-// Load an ELF64 binary from a memory buffer. Returns entry point or 0 on error.
-fn elf_load(buf: i64) -> i64 {
-    if elf_is_valid(buf) == 0 { return 0; }
-
-    // Parse ELF header
-    var entry: i64 = elf_read_u64(buf, 24);
-    var phoff: i64 = elf_read_u64(buf, 32);
-    var phentsize: i64 = elf_read_u16(buf, 54);
-    var phnum: i64 = elf_read_u16(buf, 56);
-
-    // Load all PT_LOAD segments
-    var i: i64 = 0;
-    while i < phnum {
-        var phdr_offset: i64 = phoff + i * phentsize;
-        var ptype: i64 = elf_read_u32(buf, phdr_offset);
-        if ptype == PT_LOAD {
-            var p_offset: i64 = elf_read_u64(buf, phdr_offset + 8);
-            var p_vaddr: i64 = elf_read_u64(buf, phdr_offset + 16);
-            var p_filesz: i64 = elf_read_u64(buf, phdr_offset + 32);
-            var p_memsz: i64 = elf_read_u64(buf, phdr_offset + 40);
-
-            // Copy file contents to virtual address
-            var j: i64 = 0;
-            while j < p_filesz {
-                var byte: i64 = p_mem_read8(buf + p_offset + j);
-                p_mem_write8(p_vaddr + j, byte);
-                j = j + 1;
-            }
-            // Zero out BSS (memsz - filesz)
-            var k: i64 = p_filesz;
-            while k < p_memsz {
-                p_mem_write8(p_vaddr + k, 0);
-                k = k + 1;
-            }
-        }
-        i = i + 1;
-    }
-
-    return entry;
-}
-
-// ─── Memory Management ──────────────────────────────────────────────────
-// Simple page-frame allocator with free list.
-// Heap starts at 0x300000. We use a bitmap at 0x310000 to track allocated
-// 4KB pages. Free list uses the page itself to store the next free pointer.
-
-const HEAP_START: i64 = 0x300000;
-const HEAP_BITMAP: i64 = 0x310000;
-const HEAP_MAX_PAGES: i64 = 256;  // 256 pages × 4KB = 1MB heap
-const PAGE_SIZE: i64 = 4096;
-
-// Initialize the heap: zero the bitmap, mark all pages free.
-fn heap_init() -> void {
-    var i: i64 = 0;
-    while i < HEAP_MAX_PAGES {
-        p_mem_write8(HEAP_BITMAP + i, 0);  // 0 = free
-        i = i + 1;
-    }
-}
-
-// Allocate a 4KB-aligned page. Returns physical address or 0 if out of memory.
-fn page_alloc() -> i64 {
-    var i: i64 = 0;
-    while i < HEAP_MAX_PAGES {
-        if p_mem_read8(HEAP_BITMAP + i) == 0 {
-            p_mem_write8(HEAP_BITMAP + i, 1);  // mark allocated
-            return HEAP_START + i * PAGE_SIZE;
-        }
-        i = i + 1;
-    }
-    return 0;  // out of memory
-}
-
-// Free a previously allocated page.
-fn page_free(addr: i64) -> void {
-    if addr < HEAP_START { return; }
-    var idx: i64 = (addr - HEAP_START) / PAGE_SIZE;
-    if idx >= HEAP_MAX_PAGES { return; }
-    p_mem_write8(HEAP_BITMAP + idx, 0);  // mark free
-}
-
-// Allocate `size` bytes, rounded up to a page. Returns address or 0.
-fn kmalloc(size: i64) -> i64 {
-    if size <= 0 { return 0; }
-    return page_alloc();  // simple: one page per allocation
-}
-
-// Free a previously allocated block.
-fn kfree(addr: i64) -> void {
-    page_free(addr);
-}
-
-// ─── Process Scheduler ─────────────────────────────────────────────────
-// Simple round-robin scheduler with up to 8 processes.
-// Process table at 0x320000 (below heap bitmap at 0x310000).
-// Each process entry is 64 bytes:
-//   [0]  state    (0=free, 1=ready, 2=running, 3=blocked)
-//   [8]  rsp      (saved stack pointer)
-//   [16] rbp      (saved base pointer)
-//   [24] cr3      (page table for this process)
-//   [32] entry    (entry point address)
-//   [40] pid      (process ID)
-//   [48] ticks    (CPU ticks used)
-
-const SCHED_TABLE: i64 = 0x320000;
-const SCHED_MAX_PROCS: i64 = 8;
-const SCHED_ENTRY_SIZE: i64 = 64;
-const PROC_FREE: i64 = 0;
-const PROC_READY: i64 = 1;
-const PROC_RUNNING: i64 = 2;
-const PROC_BLOCKED: i64 = 3;
-
-var sched_current: i64 = -1;  // current process index
-var sched_ticks: i64 = 0;     // ticks in current quantum
-
-// Initialize the scheduler — mark all process slots as free.
-fn sched_init() -> void {
-    var i: i64 = 0;
-    while i < SCHED_MAX_PROCS {
-        p_mem_write8(SCHED_TABLE + i * SCHED_ENTRY_SIZE, PROC_FREE);
-        i = i + 1;
-    }
-    sched_current = -1;
-    sched_ticks = 0;
-}
-
-// Create a new process. Returns PID or -1 if table is full.
-fn sched_create(entry: i64, cr3: i64) -> i64 {
-    var i: i64 = 0;
-    while i < SCHED_MAX_PROCS {
-        var base: i64 = SCHED_TABLE + i * SCHED_ENTRY_SIZE;
-        if p_mem_read8(base) == PROC_FREE {
-            p_mem_write8(base, PROC_READY);
-            p_mem_write8(base + 8, 0);   // rsp (will be set on first run)
-            p_mem_write8(base + 16, 0);  // rbp
-            p_mem_write8(base + 24, cr3);
-            p_mem_write8(base + 32, entry);
-            p_mem_write8(base + 40, i + 1);  // pid = i+1
-            p_mem_write8(base + 48, 0);  // ticks
-            return i + 1;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-// Get the number of active (non-free) processes.
-fn sched_count() -> i64 {
-    var count: i64 = 0;
-    var i: i64 = 0;
-    while i < SCHED_MAX_PROCS {
-        if p_mem_read8(SCHED_TABLE + i * SCHED_ENTRY_SIZE) != PROC_FREE {
-            count = count + 1;
-        }
-        i = i + 1;
-    }
-    return count;
-}
-
-// Find the next ready process after `current`.
-fn sched_next_ready(current: i64) -> i64 {
-    var i: i64 = current + 1;
-    while i < SCHED_MAX_PROCS {
-        if p_mem_read8(SCHED_TABLE + i * SCHED_ENTRY_SIZE) == PROC_READY {
-            return i;
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i <= current {
-        if p_mem_read8(SCHED_TABLE + i * SCHED_ENTRY_SIZE) == PROC_READY {
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-// Print process table status.
-fn cmd_ps() -> void {
-    con_putc(10);
-    con_putc(80); con_putc(73); con_putc(68); con_putc(32); con_putc(83); con_putc(116); con_putc(97); con_putc(116); con_putc(101); con_putc(32); con_putc(69); con_putc(110); con_putc(116); con_putc(114); con_putc(121); // "PID State Entry"
-    con_putc(10);
-    var i: i64 = 0;
-    while i < SCHED_MAX_PROCS {
-        var base: i64 = SCHED_TABLE + i * SCHED_ENTRY_SIZE;
-        var state: i64 = p_mem_read8(base);
-        if state != PROC_FREE {
-            var pid: i64 = p_mem_read8(base + 40);
-            var entry: i64 = p_mem_read8(base + 32);
-            print_dec(pid);
-            con_putc(32);
-            if state == PROC_READY { con_putc(82); con_putc(101); con_putc(97); con_putc(100); con_putc(121); } // "Ready"
-            else if state == PROC_RUNNING { con_putc(82); con_putc(117); con_putc(110); } // "Run"
-            else if state == PROC_BLOCKED { con_putc(66); con_putc(108); con_putc(111); con_putc(99); con_putc(107); } // "Block"
-            con_putc(32);
-            print_hex(entry);
-            con_putc(10);
-        }
-        i = i + 1;
-    }
 }
 
 fn cmd_mem() -> void {
@@ -1023,962 +371,6 @@ fn cmd_malloc() -> void {
     con_putc(10);
 }
 
-// ─── ATA/PIO Disk I/O ────────────────────────────────────────────────────
-// Read one 512-byte sector from the primary ATA disk via PIO.
-// buf must be at least 512 bytes. Returns 0 on success, -1 on error.
-fn ata_read_sector(lba: i64, buf: i64) -> i64 {
-    // Wait for BSY to clear
-    var timeout: i64 = 100000;
-    while timeout > 0 {
-        var status: i64 = p_inb(0x1F7);
-        if (status & 0x80) == 0 { break; }
-        timeout = timeout - 1;
-    }
-    if timeout == 0 { return -1; }
-
-    // Select drive (LBA mode, drive 0)
-    p_outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
-    // Set sector count = 1
-    p_outb(0x1F2, 1);
-    // Set LBA low/mid/high
-    p_outb(0x1F3, lba & 0xFF);
-    p_outb(0x1F4, (lba >> 8) & 0xFF);
-    p_outb(0x1F5, (lba >> 16) & 0xFF);
-    // Send READ SECTORS command (0x20)
-    p_outb(0x1F7, 0x20);
-
-    // Wait for DRQ (data ready)
-    timeout = 100000;
-    while timeout > 0 {
-        var status: i64 = p_inb(0x1F7);
-        if (status & 0x08) != 0 { break; }
-        if (status & 0x01) != 0 { return -1; }  // error
-        timeout = timeout - 1;
-    }
-    if timeout == 0 { return -1; }
-
-    // Read 256 16-bit words (512 bytes)
-    var i: i64 = 0;
-    while i < 256 {
-        var word: i64 = p_inw(0x1F0);
-        p_mem_write8(buf + i * 2, word & 0xFF);
-        p_mem_write8(buf + i * 2 + 1, (word >> 8) & 0xFF);
-        i = i + 1;
-    }
-    return 0;
-}
-
-// Write one 512-byte sector to the primary ATA disk via PIO.
-fn ata_write_sector(lba: i64, buf: i64) -> i64 {
-    var timeout: i64 = 100000;
-    while timeout > 0 {
-        var status: i64 = p_inb(0x1F7);
-        if (status & 0x80) == 0 { break; }
-        timeout = timeout - 1;
-    }
-    if timeout == 0 { return -1; }
-
-    p_outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
-    p_outb(0x1F2, 1);
-    p_outb(0x1F3, lba & 0xFF);
-    p_outb(0x1F4, (lba >> 8) & 0xFF);
-    p_outb(0x1F5, (lba >> 16) & 0xFF);
-    p_outb(0x1F7, 0x30);  // WRITE SECTORS
-
-    timeout = 100000;
-    while timeout > 0 {
-        var status: i64 = p_inb(0x1F7);
-        if (status & 0x08) != 0 { break; }
-        if (status & 0x01) != 0 { return -1; }
-        timeout = timeout - 1;
-    }
-    if timeout == 0 { return -1; }
-
-    var i: i64 = 0;
-    while i < 256 {
-        var lo: i64 = p_mem_read8(buf + i * 2);
-        var hi: i64 = p_mem_read8(buf + i * 2 + 1);
-        p_outw(0x1F0, lo | (hi << 8));
-        i = i + 1;
-    }
-    // Flush cache
-    p_outb(0x1F7, 0xE7);
-    return 0;
-}
-
-// ─── FAT32 Filesystem ──────────────────────────────────────────────────
-// Simplified FAT32 reader/writer.
-// Assumes: disk starts at sector 0, partition 0 is FAT32.
-// BPB (BIOS Parameter Block) at sector 0, offset 0x0B.
-// FAT starts at reserved_sectors. Data starts after FAT.
-
-const FAT32_BUF: i64 = 0x40000;     // sector buffer for FS operations
-const FAT_ROOT_CLUSTER: i64 = 2;    // FAT32 root dir starts at cluster 2
-
-// FAT32 state (stored at 0x41000, each field is 4 bytes)
-const FAT_STATE_ADDR: i64 = 0x41000;
-const FAT_BYTES_PER_SECTOR: i64 = 0x41000;  // offset 0 (4 bytes)
-const FAT_SECTORS_PER_CLUSTER: i64 = 0x41004; // offset 4 (4 bytes)
-const FAT_RESERVED_SECTORS: i64 = 0x41008;  // offset 8 (4 bytes)
-const FAT_NUM_FATS: i64 = 0x4100C;          // offset 12 (4 bytes)
-const FAT_SECTORS_PER_FAT: i64 = 0x41010;   // offset 16 (4 bytes)
-const FAT_FIRST_DATA_SECTOR: i64 = 0x41014; // offset 20 (4 bytes)
-const FAT_INITIALIZED: i64 = 0x41018;       // offset 24 (1 byte)
-
-// Initialize FAT32 by reading BPB from sector 0
-fn fat32_init() -> i64 {
-    var result: i64 = ata_read_sector(0, FAT32_BUF);
-    if result != 0 { return -1; }
-
-    // Read BPB fields (little-endian)
-    var bps: i64 = p_mem_read8(FAT32_BUF + 11) | (p_mem_read8(FAT32_BUF + 12) << 8);
-    var spc: i64 = p_mem_read8(FAT32_BUF + 13);
-    var reserved: i64 = p_mem_read8(FAT32_BUF + 14) | (p_mem_read8(FAT32_BUF + 15) << 8);
-    var num_fats: i64 = p_mem_read8(FAT32_BUF + 16);
-    // sectors_per_fat32 at offset 36 (4 bytes)
-    var spf: i64 = p_mem_read8(FAT32_BUF + 36) | (p_mem_read8(FAT32_BUF + 37) << 8) |
-                    (p_mem_read8(FAT32_BUF + 38) << 16) | (p_mem_read8(FAT32_BUF + 39) << 24);
-
-    p_mem_write32(FAT_BYTES_PER_SECTOR, bps);
-    p_mem_write32(FAT_SECTORS_PER_CLUSTER, spc);
-    p_mem_write32(FAT_RESERVED_SECTORS, reserved);
-    p_mem_write32(FAT_NUM_FATS, num_fats);
-    p_mem_write32(FAT_SECTORS_PER_FAT, spf);
-
-    // first_data_sector = reserved + num_fats * sectors_per_fat
-    var first_data: i64 = reserved + num_fats * spf;
-    p_mem_write32(FAT_FIRST_DATA_SECTOR, first_data);
-    p_mem_write8(FAT_INITIALIZED, 1);
-
-    return 0;
-}
-
-// Convert cluster number to starting sector
-fn fat32_cluster_to_sector(cluster: i64) -> i64 {
-    var first_data: i64 = p_mem_read32(FAT_FIRST_DATA_SECTOR);
-    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
-    return (cluster - 2) * spc + first_data;
-}
-
-// Read FAT entry for a cluster (returns next cluster or 0xFFFFFFFF for end)
-fn fat32_read_fat(cluster: i64) -> i64 {
-    var bps: i64 = p_mem_read32(FAT_BYTES_PER_SECTOR);
-    var reserved: i64 = p_mem_read32(FAT_RESERVED_SECTORS);
-    // FAT entry offset = cluster * 4 bytes
-    var fat_offset: i64 = cluster * 4;
-    var fat_sector: i64 = reserved + (fat_offset / bps);
-    var entry_offset: i64 = fat_offset % bps;
-
-    var result: i64 = ata_read_sector(fat_sector, FAT32_BUF);
-    if result != 0 { return 0xFFFFFFFF; }
-
-    var entry: i64 = p_mem_read8(FAT32_BUF + entry_offset) |
-                     (p_mem_read8(FAT32_BUF + entry_offset + 1) << 8) |
-                     (p_mem_read8(FAT32_BUF + entry_offset + 2) << 16) |
-                     (p_mem_read8(FAT32_BUF + entry_offset + 3) << 24);
-    return entry & 0x0FFFFFFF;
-}
-
-// Read a cluster into a buffer
-fn fat32_read_cluster(cluster: i64, buf: i64) -> i64 {
-    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
-    var sector: i64 = fat32_cluster_to_sector(cluster);
-    var i: i64 = 0;
-    while i < spc {
-        var result: i64 = ata_read_sector(sector + i, buf + i * 512);
-        if result != 0 { return -1; }
-        i = i + 1;
-    }
-    return 0;
-}
-
-// Directory entry structure (32 bytes):
-// [0-10] name (8.3, space-padded)
-// [11]   attributes
-// [12]   reserved
-// [20-21] cluster high
-// [26-27] cluster low
-// [28-31] file size
-
-// List files in root directory
-fn cmd_ls() -> void {
-    con_putc(10);
-    if p_mem_read8(FAT_INITIALIZED) != 1 {
-        con_putc(70); con_putc(83); con_putc(32); con_putc(110); con_putc(111); con_putc(116); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116); // "FS not init"
-        con_putc(10);
-        return;
-    }
-
-    var cluster: i64 = FAT_ROOT_CLUSTER;
-    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
-    var cluster_size: i64 = spc * 512;
-
-    while cluster < 0x0FFFFFF8 {
-        var result: i64 = fat32_read_cluster(cluster, FAT32_BUF);
-        if result != 0 {
-            con_putc(82); con_putc(101); con_putc(97); con_putc(100); con_putc(32); con_putc(101); con_putc(114); con_putc(114); // "Read err"
-            con_putc(10);
-            return;
-        }
-
-        var offset: i64 = 0;
-        while offset < cluster_size {
-            var first_byte: i64 = p_mem_read8(FAT32_BUF + offset);
-            if first_byte == 0 { break; }  // end of directory
-            if first_byte != 0xE5 {  // not deleted
-                var attr: i64 = p_mem_read8(FAT32_BUF + offset + 11);
-                if (attr & 0x0F) != 0x0F {  // not LFN entry
-                    // Print name (8.3)
-                    var i: i64 = 0;
-                    while i < 11 {
-                        var c: i64 = p_mem_read8(FAT32_BUF + offset + i);
-                        if c != 32 { con_putc(c); }
-                        if i == 7 && p_mem_read8(FAT32_BUF + offset + 8) != 32 {
-                            con_putc(46);  // '.'
-                        }
-                        i = i + 1;
-                    }
-                    con_putc(32);
-                    // Print size (simple, no division)
-                    var size: i64 = p_mem_read8(FAT32_BUF + offset + 28) +
-                                    (p_mem_read8(FAT32_BUF + offset + 29) * 256);
-                    if size >= 100 {
-                        con_putc(48 + size / 100);
-                        con_putc(48 + (size / 10) % 10);
-                        con_putc(48 + size % 10);
-                    } else if size >= 10 {
-                        con_putc(48 + size / 10);
-                        con_putc(48 + size % 10);
-                    } else {
-                        con_putc(48 + size);
-                    }
-                    con_putc(32); con_putc(66);  // " B"
-                    if (attr & 0x10) != 0 {
-                        con_putc(32); con_putc(60); con_putc(68); con_putc(73); con_putc(82); con_putc(62);  // " <DIR>"
-                    }
-                    con_putc(10);
-                }
-            }
-            offset = offset + 32;
-        }
-
-        cluster = fat32_read_fat(cluster);
-    }
-}
-
-// Find a file in root directory by 8.3 name.
-// Returns cluster number if found, 0 if not found.
-// Sets file_size_out to the file size.
-fn fat32_find_file(name_addr: i64, name_len: i64, file_size_out: i64) -> i64 {
-    if p_mem_read8(FAT_INITIALIZED) != 1 { return 0; }
-
-    var cluster: i64 = FAT_ROOT_CLUSTER;
-    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
-    var cluster_size: i64 = spc * 512;
-
-    while cluster < 0x0FFFFFF8 {
-        var result: i64 = fat32_read_cluster(cluster, FAT32_BUF);
-        if result != 0 { return 0; }
-
-        var offset: i64 = 0;
-        while offset < cluster_size {
-            var first_byte: i64 = p_mem_read8(FAT32_BUF + offset);
-            if first_byte == 0 { return 0; }  // end of directory
-            if first_byte != 0xE5 {
-                var attr: i64 = p_mem_read8(FAT32_BUF + offset + 11);
-                if (attr & 0x0F) != 0x0F {
-                    // Convert input filename to 8.3 format at 0x41040
-                    // First, fill with spaces
-                    var k: i64 = 0;
-                    while k < 11 {
-                        p_mem_write8(0x41040 + k, 32);
-                        k = k + 1;
-                    }
-                    // Copy name part (before '.') to positions 0-7
-                    var in_idx: i64 = 0;
-                    var out_idx: i64 = 0;
-                    var saw_dot: i64 = 0;
-                    while in_idx < name_len {
-                        var c: i64 = p_mem_read8(name_addr + in_idx);
-                        // Uppercase
-                        if c >= 97 && c <= 122 { c = c - 32; }
-                        if c == 46 {  // '.'
-                            saw_dot = 1;
-                            out_idx = 8;  // extension starts at position 8
-                        } else {
-                            if saw_dot == 0 && out_idx < 8 {
-                                p_mem_write8(0x41040 + out_idx, c);
-                                out_idx = out_idx + 1;
-                            } else if saw_dot == 1 && out_idx < 11 {
-                                p_mem_write8(0x41040 + out_idx, c);
-                                out_idx = out_idx + 1;
-                            }
-                        }
-                        in_idx = in_idx + 1;
-                    }
-                    // Compare 11 bytes
-                    var is_match: i64 = 1;
-                    var i: i64 = 0;
-                    while i < 11 {
-                        var disk_c: i64 = p_mem_read8(FAT32_BUF + offset + i);
-                        var input_c: i64 = p_mem_read8(0x41040 + i);
-                        if disk_c != input_c {
-                            is_match = 0;
-                            i = 11;
-                        }
-                        i = i + 1;
-                    }
-                    if is_match == 1 {
-                        var clus: i64 = p_mem_read8(FAT32_BUF + offset + 26) +
-                                       (p_mem_read8(FAT32_BUF + offset + 27) * 256);
-                        var sz: i64 = p_mem_read8(FAT32_BUF + offset + 28) +
-                                     (p_mem_read8(FAT32_BUF + offset + 29) * 256);
-                        p_mem_write8(file_size_out, sz);
-                        return clus;
-                    }
-                }
-            }
-            offset = offset + 32;
-        }
-        cluster = fat32_read_fat(cluster);
-    }
-    return 0;
-}
-
-// Read file contents by cluster chain into a buffer
-fn fat32_read_file(cluster: i64, buf: i64, max_size: i64) -> i64 {
-    var spc: i64 = p_mem_read32(FAT_SECTORS_PER_CLUSTER);
-    var cluster_size: i64 = spc * 512;
-    var total: i64 = 0;
-
-    while cluster < 0x0FFFFFF8 && total < max_size {
-        var result: i64 = fat32_read_cluster(cluster, buf + total);
-        if result != 0 { return total; }
-        total = total + cluster_size;
-        if total > max_size { total = max_size; }
-        cluster = fat32_read_fat(cluster);
-    }
-    return total;
-}
-
-// ─── Initrd Ramdisk (VFS) ────────────────────────────────────────────────
-// Simple ramdisk loaded from disk sector 10.
-// Format: u32 num_entries, then per-entry: u32 name_len, name, u32 type, u64 size, u64 offset
-// File data follows the header.
-const INITRD_SECTOR: i64 = 10;
-const INITRD_BUF: i64 = 0x140000;   // 1.25MB: ramdisk loaded here (above kernel)
-const INITRD_LOADED: i64 = 0x695;   // 1 byte flag
-const INITRD_NUM_ENTRIES: i64 = 0x696; // 4 bytes
-
-fn initrd_load() -> i64 {
-    var result: i64 = ata_read_sector(INITRD_SECTOR, INITRD_BUF);
-    if result != 0 { return -1; }
-    var num: i64 = p_mem_read32(INITRD_BUF);
-    p_mem_write8(INITRD_LOADED, 1);
-    p_mem_write32(INITRD_NUM_ENTRIES, num);
-    return num;
-}
-
-fn initrd_num_entries() -> i64 {
-    if p_mem_read8(INITRD_LOADED) != 1 { return 0; }
-    return p_mem_read32(INITRD_NUM_ENTRIES);
-}
-
-// Get entry header offset by index
-fn initrd_entry_offset(index: i64) -> i64 {
-    // Skip u32 num_entries (4 bytes), then iterate to find the index-th entry
-    var offset: i64 = 4;
-    var i: i64 = 0;
-    while i < index {
-        var name_len: i64 = p_mem_read32(INITRD_BUF + offset);
-        offset = offset + 4 + name_len + 4 + 8 + 8; // name_len + name + type + size + data_offset
-        i = i + 1;
-    }
-    return offset;
-}
-
-// Get entry name by index (writes to a buffer, returns length)
-fn initrd_get_name(index: i64, buf: i64) -> i64 {
-    var off: i64 = initrd_entry_offset(index);
-    var name_len: i64 = p_mem_read32(INITRD_BUF + off);
-    var i: i64 = 0;
-    while i < name_len {
-        p_mem_write8(buf + i, p_mem_read8(INITRD_BUF + off + 4 + i));
-        i = i + 1;
-    }
-    return name_len;
-}
-
-// Get entry size by index
-fn initrd_get_size(index: i64) -> i64 {
-    var off: i64 = initrd_entry_offset(index);
-    var name_len: i64 = p_mem_read32(INITRD_BUF + off);
-    // size is at off + 4 + name_len + 4
-    var size_off: i64 = off + 4 + name_len + 4;
-    return p_mem_read64(INITRD_BUF + size_off);
-}
-
-// Get entry data offset by index
-fn initrd_get_data_offset(index: i64) -> i64 {
-    var off: i64 = initrd_entry_offset(index);
-    var name_len: i64 = p_mem_read32(INITRD_BUF + off);
-    // data_offset is at off + 4 + name_len + 4 + 8
-    var doff: i64 = off + 4 + name_len + 4 + 8;
-    return p_mem_read64(INITRD_BUF + doff);
-}
-
-// Find file by name (returns index or -1)
-fn initrd_find(name_addr: i64, name_len: i64) -> i64 {
-    var num: i64 = initrd_num_entries();
-    var i: i64 = 0;
-    while i < num {
-        var entry_name_len: i64 = initrd_get_name(i, INPUT_BUF_ADDR + 256);
-        if entry_name_len == name_len {
-            var is_match: i64 = 1;
-            var j: i64 = 0;
-            while j < name_len {
-                if p_mem_read8(INPUT_BUF_ADDR + 256 + j) != p_mem_read8(name_addr + j) {
-                    is_match = 0;
-                }
-                j = j + 1;
-            }
-            if is_match == 1 { return i; }
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-// List initrd files
-fn cmd_initrd_ls() -> void {
-    con_putc(10);
-    if p_mem_read8(INITRD_LOADED) != 1 {
-        con_putc(78); con_putc(111); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116); con_putc(114); con_putc(100); // "No initrd"
-        con_putc(10);
-        return;
-    }
-    var num: i64 = initrd_num_entries();
-    var i: i64 = 0;
-    while i < num {
-        var name_len: i64 = initrd_get_name(i, INPUT_BUF_ADDR + 256);
-        var j: i64 = 0;
-        while j < name_len {
-            con_putc(p_mem_read8(INPUT_BUF_ADDR + 256 + j));
-            j = j + 1;
-        }
-        con_putc(32);
-        var size: i64 = initrd_get_size(i);
-        print_dec(size);
-        con_putc(32); con_putc(66); // " B"
-        con_putc(10);
-        i = i + 1;
-    }
-}
-
-// Cat a file from initrd
-fn cmd_initrd_cat(name_addr: i64, name_len: i64) -> void {
-    con_putc(10);
-    if p_mem_read8(INITRD_LOADED) != 1 {
-        con_putc(78); con_putc(111); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116); con_putc(114); con_putc(100); // "No initrd"
-        con_putc(10);
-        return;
-    }
-    var idx: i64 = initrd_find(name_addr, name_len);
-    if idx < 0 {
-        con_putc(78); con_putc(111); con_putc(116); con_putc(32); con_putc(102); con_putc(111); con_putc(117); con_putc(110); con_putc(100); // "Not found"
-        con_putc(10);
-        return;
-    }
-    var size: i64 = initrd_get_size(idx);
-    var doff: i64 = initrd_get_data_offset(idx);
-    var i: i64 = 0;
-    while i < size {
-        con_putc(p_mem_read8(INITRD_BUF + doff + i));
-        i = i + 1;
-    }
-    con_putc(10);
-}
-
-// ─── PCI Bus Enumeration (G10) ────────────────────────────────────────────
-// PCI config space access via ports 0xCF8 (address) and 0xCFC (data)
-const PCI_ADDR: i64 = 0xCF8;
-const PCI_DATA: i64 = 0xCFC;
-
-fn pci_config_read(bus: i64, dev: i64, func: i64, offset: i64) -> i64 {
-    // Enable bit 31, bus 23-16, dev 15-11, func 10-8, offset 7-2
-    var addr: i64 = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC);
-    p_outl(PCI_ADDR, addr);
-    return p_inl(PCI_DATA);
-}
-
-fn pci_config_write(bus: i64, dev: i64, func: i64, offset: i64, val: i64) {
-    var addr: i64 = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC);
-    p_outl(PCI_ADDR, addr);
-    p_outl(PCI_DATA, val);
-}
-
-fn pci_get_vendor(bus: i64, dev: i64, func: i64) -> i64 {
-    return pci_config_read(bus, dev, func, 0) & 0xFFFF;
-}
-
-fn pci_get_device(bus: i64, dev: i64, func: i64) -> i64 {
-    return (pci_config_read(bus, dev, func, 0) >> 16) & 0xFFFF;
-}
-
-fn pci_get_class(bus: i64, dev: i64, func: i64) -> i64 {
-    return (pci_config_read(bus, dev, func, 8) >> 24) & 0xFF;
-}
-
-fn pci_get_subclass(bus: i64, dev: i64, func: i64) -> i64 {
-    return (pci_config_read(bus, dev, func, 8) >> 16) & 0xFF;
-}
-
-// PCI device table at 0x150000 (up to 256 entries × 16 bytes)
-const PCI_TABLE: i64 = 0x150000;
-var pci_device_count: i64 = 0;
-
-fn pci_scan() -> i64 {
-    pci_device_count = 0;
-    var bus: i64 = 0;
-    while bus < 256 {
-        var dev: i64 = 0;
-        while dev < 32 {
-            var func: i64 = 0;
-            while func < 8 {
-                var vendor: i64 = pci_get_vendor(bus, dev, func);
-                if vendor != 0xFFFF {
-                    var device: i64 = pci_get_device(bus, dev, func);
-                    var class_code: i64 = pci_get_class(bus, dev, func);
-                    var subclass: i64 = pci_get_subclass(bus, dev, func);
-                    // Store in table: vendor, device, class, subclass
-                    var idx: i64 = pci_device_count * 16;
-                    p_mem_write64(PCI_TABLE + idx, vendor);
-                    p_mem_write64(PCI_TABLE + idx + 8, (device << 48) | (class_code << 40) | (subclass << 32) | (bus << 16) | (dev << 8) | func);
-                    pci_device_count = pci_device_count + 1;
-                    if pci_device_count >= 256 { return pci_device_count; }
-                }
-                func = func + 1;
-            }
-            dev = dev + 1;
-        }
-        bus = bus + 1;
-    }
-    return pci_device_count;
-}
-
-fn cmd_pci() -> void {
-    con_putc(10);
-    // "PCI Devices:"
-    con_putc(80); con_putc(67); con_putc(73); con_putc(32); con_putc(68); con_putc(101); con_putc(118); con_putc(105); con_putc(99); con_putc(101); con_putc(115); con_putc(58);
-    con_putc(10);
-    var i: i64 = 0;
-    while i < pci_device_count {
-        var idx: i64 = i * 16;
-        var vendor: i64 = p_mem_read64(PCI_TABLE + idx);
-        var packed_val: i64 = p_mem_read64(PCI_TABLE + idx + 8);
-        var device: i64 = (packed_val >> 48) & 0xFFFF;
-        var class_code: i64 = (packed_val >> 40) & 0xFF;
-        var bus: i64 = (packed_val >> 16) & 0xFF;
-        var dev: i64 = (packed_val >> 8) & 0xFF;
-        var func: i64 = packed_val & 0xFF;
-        // Print bus:dev.func vendor:device class
-        print_dec(bus); con_putc(58); print_dec(dev); con_putc(46); print_dec(func);
-        con_putc(32);
-        con_putc(118); con_putc(101); con_putc(110); con_putc(100); con_putc(111); con_putc(114); con_putc(58); // "vendor:"
-        con_putc(32);
-        print_hex(vendor);
-        con_putc(32);
-        con_putc(100); con_putc(101); con_putc(118); con_putc(58); // "dev:"
-        con_putc(32);
-        print_hex(device);
-        con_putc(32);
-        con_putc(99); con_putc(108); con_putc(115); con_putc(58); // "cls:"
-        con_putc(32);
-        print_hex(class_code);
-        con_putc(10);
-        i = i + 1;
-    }
-    if pci_device_count == 0 {
-        con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
-        con_putc(10);
-    }
-}
-
-// ─── ACPI Power Management (G15) ──────────────────────────────────────────
-// QEMU ACPI shutdown port is already used by cmd_poweroff.
-// Add ACPI reset and PM status.
-
-fn acpi_init() -> void {
-    // In a real OS, we'd parse ACPI tables via RSDP.
-    // For QEMU, the PM ports are fixed:
-    //   PM1a_CNT = 0x604 (QEMU)
-    //   PM1b_CNT = 0xB004 (older QEMU)
-    //   Reset    = 0x604 with bit 6 set
-    // Just verify ports are accessible — nothing to init for QEMU.
-}
-
-fn cmd_acpi() -> void {
-    con_putc(10);
-    // "ACPI: QEMU PM ports"
-    con_putc(65); con_putc(67); con_putc(80); con_putc(73); con_putc(58); con_putc(32);
-    con_putc(81); con_putc(69); con_putc(77); con_putc(85); con_putc(32); con_putc(80); con_putc(77);
-    con_putc(10);
-    // "  poweroff - S5 (ACPI shutdown)"
-    con_putc(32); con_putc(32);
-    con_putc(112); con_putc(111); con_putc(119); con_putc(101); con_putc(114); con_putc(111); con_putc(102); con_putc(102);
-    con_putc(32); con_putc(45); con_putc(32); con_putc(83); con_putc(53);
-    con_putc(10);
-    // "  reset    - ACPI reset (port 0x604)"
-    con_putc(32); con_putc(32);
-    con_putc(114); con_putc(101); con_putc(115); con_putc(101); con_putc(116);
-    con_putc(32); con_putc(45); con_putc(32); con_putc(65); con_putc(67); con_putc(80); con_putc(73);
-    con_putc(10);
-}
-
-fn cmd_acpi_reset() -> void {
-    con_putc(10);
-    // "ACPI reset..."
-    con_putc(65); con_putc(67); con_putc(80); con_putc(73); con_putc(32); con_putc(114); con_putc(101); con_putc(115); con_putc(101); con_putc(116);
-    con_putc(10);
-    // ACPI reset: write 0x06 to PM1 control register (bit 6 = reset)
-    p_outw(0x604, 0x06);
-    // Fallback: keyboard controller reset
-    p_outb(0x64, 0xFE);
-    p_cli();
-    while true { p_hlt(); }
-}
-
-// ─── Kernel Heap with Free (G18) ──────────────────────────────────────────
-// Heap starts at 0x300000. Free list stored in freed blocks.
-// Each allocation: [size:8][data...]
-// Free list: singly linked, address stored in first 8 bytes of freed block.
-
-const HEAP_START: i64 = 0x300000;
-const HEAP_END:   i64 = 0x400000;  // 1MB heap
-var heap_next: i64 = 0x300000;
-var heap_free_list: i64 = 0;  // head of free list (0 = empty)
-
-fn heap_init() {
-    heap_next = HEAP_START;
-    heap_free_list = 0;
-}
-
-fn heap_alloc(size: i64) -> i64 {
-    // Try free list first (first-fit)
-    var prev: i64 = 0;
-    var cur: i64 = heap_free_list;
-    while cur != 0 {
-        var block_size: i64 = p_mem_read64(cur);  // size includes header
-        if block_size >= size + 8 {
-            // Found a fit — remove from free list
-            var next_free: i64 = p_mem_read64(cur + 8);
-            if prev == 0 {
-                heap_free_list = next_free;
-            } else {
-                p_mem_write64(prev + 8, next_free);
-            }
-            return cur + 8;  // return data pointer (past size header)
-        }
-        prev = cur;
-        cur = p_mem_read64(cur + 8);
-    }
-    // Bump allocate
-    if heap_next + size + 8 > HEAP_END { return 0; }
-    p_mem_write64(heap_next, size + 8);  // store block size
-    var ptr: i64 = heap_next + 8;
-    heap_next = heap_next + size + 8;
-    // Align to 8 bytes
-    while heap_next % 8 != 0 { heap_next = heap_next + 1; }
-    return ptr;
-}
-
-fn heap_free(ptr: i64) {
-    if ptr == 0 { return; }
-    var block_start: i64 = ptr - 8;
-    // Add to free list head
-    p_mem_write64(block_start + 8, heap_free_list);
-    heap_free_list = block_start;
-}
-
-// ─── Virtual Memory Mapping API (G19) ─────────────────────────────────────
-// Kernel PML4 at 0x70000, PDPT at 0x71000
-// vm_map maps a virtual address to a physical address in kernel page tables.
-
-fn vm_map(vaddr: i64, paddr: i64, flags: i64) -> i64 {
-    // PML4 index = bits 39-47
-    var pml4_idx: i64 = (vaddr >> 39) & 0x1FF;
-    // PDPT index = bits 30-38
-    var pdpt_idx: i64 = (vaddr >> 30) & 0x1FF;
-    // PD index = bits 21-29
-    var pd_idx: i64 = (vaddr >> 21) & 0x1FF;
-
-    // Get PML4 entry
-    var pml4_entry: i64 = p_mem_read64(0x70000 + pml4_idx * 8);
-    var pdpt_addr: i64 = pml4_entry & 0xFFFFFFFFFFFFF000;  // mask flags
-    if pdpt_addr == 0 {
-        // Allocate a new PDPT
-        pdpt_addr = 0x74000;  // Use fixed address for new PDPT
-        var i: i64 = 0;
-        while i < 4096 {
-            p_mem_write8(pdpt_addr + i, 0);
-            i = i + 1;
-        }
-        p_mem_write64(0x70000 + pml4_idx * 8, pdpt_addr | 0x3);
-    }
-
-    // Get PDPT entry — check if it's a 1GB huge page (PS bit = 0x80)
-    var pdpt_entry: i64 = p_mem_read64(pdpt_addr + pdpt_idx * 8);
-    if (pdpt_entry & 0x80) != 0 {
-        // It's a 1GB huge page — need to split into a PD with 512 2MB entries
-        // Use a fixed address in the heap area for the new PD
-        var pd_addr: i64 = 0x310000 + pdpt_idx * 0x1000;
-        var phys_base: i64 = pdpt_entry & 0xFFFFFFFFFFE00000;  // 1GB aligned physical
-        var i: i64 = 0;
-        while i < 512 {
-            // Each 2MB entry: present | writable | huge | (user if original had it)
-            var entry_flags: i64 = 0x83;
-            if (pdpt_entry & 0x04) != 0 { entry_flags = entry_flags | 0x04; }  // user bit
-            p_mem_write64(pd_addr + i * 8, (phys_base + i * 0x200000) | entry_flags);
-            i = i + 1;
-        }
-        // Replace PDPT entry: clear PS bit, point to new PD
-        var pdpt_flags: i64 = pdpt_entry & 0x7;  // keep present/writable/user
-        p_mem_write64(pdpt_addr + pdpt_idx * 8, pd_addr | pdpt_flags);
-        pdpt_entry = p_mem_read64(pdpt_addr + pdpt_idx * 8);
-    }
-
-    var pd_addr: i64 = pdpt_entry & 0xFFFFFFFFFFFFF000;
-    if pd_addr == 0 {
-        pd_addr = 0x310000 + pdpt_idx * 0x1000;
-        var i: i64 = 0;
-        while i < 4096 {
-            p_mem_write8(pd_addr + i, 0);
-            i = i + 1;
-        }
-        p_mem_write64(pdpt_addr + pdpt_idx * 8, pd_addr | 0x3);
-    }
-
-    // Set PD entry as 2MB page (PS bit = 0x80)
-    // Present | Writable | PS | flags
-    var pd_flags: i64 = 0x83 | (flags & 0x7F);
-    p_mem_write64(pd_addr + pd_idx * 8, (paddr & 0xFFFFFFFFFFE00000) | pd_flags);
-
-    // Flush TLB for this address
-    p_invlpg(vaddr);
-    return 0;
-}
-
-fn vm_unmap(vaddr: i64) -> i64 {
-    var pml4_idx: i64 = (vaddr >> 39) & 0x1FF;
-    var pdpt_idx: i64 = (vaddr >> 30) & 0x1FF;
-    var pd_idx: i64 = (vaddr >> 21) & 0x1FF;
-
-    var pml4_entry: i64 = p_mem_read64(0x70000 + pml4_idx * 8);
-    var pdpt_addr: i64 = pml4_entry & 0xFFFFFFFFFFFFF000;
-    if pdpt_addr == 0 { return -1; }
-
-    var pdpt_entry: i64 = p_mem_read64(pdpt_addr + pdpt_idx * 8);
-    var pd_addr: i64 = pdpt_entry & 0xFFFFFFFFFFFFF000;
-    if pd_addr == 0 { return -1; }
-
-    // Clear the PD entry
-    p_mem_write64(pd_addr + pd_idx * 8, 0);
-    p_invlpg(vaddr);
-    return 0;
-}
-
-fn cmd_vm() -> void {
-    con_putc(10);
-    // "VM: verify mapping 0x800000"
-    con_putc(86); con_putc(77); con_putc(58); con_putc(32);
-    con_putc(118); con_putc(101); con_putc(114); con_putc(105); con_putc(102); con_putc(121);
-    con_putc(10);
-    // Test read/write to an already-mapped address (first 1GB is identity-mapped)
-    p_mem_write64(0x800000, 0xDEADBEEF);
-    var val: i64 = p_mem_read64(0x800000);
-    con_putc(79); con_putc(75); con_putc(32); // "OK "
-    print_hex(val);
-    con_putc(10);
-    // Show CR3 (page table base)
-    con_putc(67); con_putc(82); con_putc(51); con_putc(58); con_putc(32); // "CR3: "
-    print_hex(p_cr3_read());
-    con_putc(10);
-}
-
-// ─── PS/2 Mouse Input (G13) ───────────────────────────────────────────────
-// Mouse uses IRQ12 (vector 0x2C after PIC remap), port 0x60 data, 0x64 status.
-// Mouse state at 0x6A0: [x:1, y:1, buttons:1, cycle:1, dx:1, dy:1]
-const MOUSE_STATE: i64 = 0x6A0;
-
-fn mouse_init() -> i64 {
-    // Enable auxiliary device (mouse) on PS/2 controller
-    // outb(0x64, 0xA8) — enable second port
-    p_outb(0x64, 0xA8);
-
-    // Read current controller config
-    p_outb(0x64, 0x20);
-    var config: i64 = p_inb(0x60);
-    // Set bit 1 (enable IRQ12) and bit 5 (enable auxiliary clock)
-    config = config | 0x02 | 0x20;
-    p_outb(0x64, 0x60);
-    p_outb(0x60, config);
-
-    // Set defaults on mouse
-    p_outb(0x64, 0xD4);  // send to mouse
-    p_outb(0x60, 0xF6);  // set defaults
-    var ack: i64 = p_inb(0x60);  // read ACK (0xFA)
-
-    // Enable data reporting
-    p_outb(0x64, 0xD4);
-    p_outb(0x60, 0xF4);  // enable reporting
-    ack = p_inb(0x60);  // read ACK
-
-    // Initialize state
-    p_mem_write8(MOUSE_STATE, 0);      // x
-    p_mem_write8(MOUSE_STATE + 1, 0);  // y
-    p_mem_write8(MOUSE_STATE + 2, 0);  // buttons
-    p_mem_write8(MOUSE_STATE + 3, 0);  // cycle
-
-    return 0;
-}
-
-// IRQ12 mouse handler (vector 0x2C)
-@interrupt(0x2C) fn irq12_mouse_handler() -> void {
-    var data: i64 = p_inb(0x60);
-    var cycle: i64 = p_mem_read8(MOUSE_STATE + 3);
-
-    if cycle == 0 {
-        // Byte 1: buttons and sign bits
-        p_mem_write8(MOUSE_STATE + 2, data & 0x07);  // buttons
-        p_mem_write8(MOUSE_STATE + 4, (data >> 4) & 0x01);  // x sign
-        p_mem_write8(MOUSE_STATE + 5, (data >> 5) & 0x01);  // y sign
-        cycle = 1;
-    } else if cycle == 1 {
-        // Byte 2: x movement
-        p_mem_write8(MOUSE_STATE, data);
-        cycle = 2;
-    } else {
-        // Byte 3: y movement
-        p_mem_write8(MOUSE_STATE + 1, data);
-        cycle = 0;
-    }
-    p_mem_write8(MOUSE_STATE + 3, cycle);
-
-    // Send EOI to both PICs (IRQ12 is on slave)
-    p_outb(0xA0, 0x20);  // EOI to slave
-    p_outb(0x20, 0x20);  // EOI to master
-}
-
-fn cmd_mouse() -> void {
-    con_putc(10);
-    // "Mouse: "
-    con_putc(77); con_putc(111); con_putc(117); con_putc(115); con_putc(101); con_putc(58); con_putc(32);
-    var buttons: i64 = p_mem_read8(MOUSE_STATE + 2);
-    var dx: i64 = p_mem_read8(MOUSE_STATE);
-    var dy: i64 = p_mem_read8(MOUSE_STATE + 1);
-    con_putc(98); con_putc(58); con_putc(32); // "b: "
-    print_dec(buttons);
-    con_putc(32);
-    con_putc(120); con_putc(58); con_putc(32); // "x: "
-    print_dec(dx);
-    con_putc(32);
-    con_putc(121); con_putc(58); con_putc(32); // "y: "
-    print_dec(dy);
-    con_putc(10);
-}
-
-// ─── APIC Timer (G9) ──────────────────────────────────────────────────────
-// LAPIC registers are MMIO at 0xFEE00000.
-// For QEMU, the LAPIC is at the default address.
-const LAPIC_BASE: i64 = 0xFEE00000;
-const LAPIC_EOI:  i64 = 0xFEE000B0;
-const LAPIC_TPR:  i64 = 0xFEE00080;
-const LAPIC_LVT_TIMER: i64 = 0xFEE00320;
-const LAPIC_TIMER_INIT: i64 = 0xFEE00380;
-const LAPIC_TIMER_CURRENT: i64 = 0xFEE00390;
-const LAPIC_TIMER_DIV: i64 = 0xFEE003E0;
-
-fn apic_write(reg: i64, val: i64) {
-    p_mem_write32(reg, val);
-}
-
-fn apic_read(reg: i64) -> i64 {
-    return p_mem_read32(reg);
-}
-
-fn apic_init() -> i64 {
-    // Enable LAPIC by setting bit 8 of the Spurious Interrupt Vector Register
-    // SIVR is at 0xFEE000F0
-    apic_write(0xFEE000F0, 0x100 | 0xFF);  // Enable + vector 0xFF
-
-    // Mask LVT timer for now
-    apic_write(LAPIC_LVT_TIMER, 0x10000);  // masked
-
-    // Set timer divide to 16 (0x3 = divide by 16)
-    apic_write(LAPIC_TIMER_DIV, 0x3);
-
-    // Set initial count
-    apic_write(LAPIC_TIMER_INIT, 0x100000);
-
-    return 0;
-}
-
-fn cmd_apic() -> void {
-    con_putc(10);
-    // "APIC: "
-    con_putc(65); con_putc(80); con_putc(73); con_putc(67); con_putc(58); con_putc(32);
-    var result: i64 = apic_init();
-    if result == 0 {
-        con_putc(105); con_putc(110); con_putc(105); con_putc(116); // "init"
-        con_putc(32);
-        con_putc(79); con_putc(75); // "OK"
-    } else {
-        con_putc(102); con_putc(97); con_putc(105); con_putc(108); // "fail"
-    }
-    con_putc(10);
-    // Print timer current count
-    var current: i64 = apic_read(LAPIC_TIMER_CURRENT);
-    con_putc(99); con_putc(110); con_putc(116); con_putc(58); con_putc(32); // "cnt: "
-    print_hex(current);
-    con_putc(10);
-}
-
-fn cmd_cat(name_addr: i64, name_len: i64) -> void {
-    con_putc(10);
-    if p_mem_read8(FAT_INITIALIZED) != 1 {
-        con_putc(70); con_putc(83); con_putc(32); con_putc(110); con_putc(111); con_putc(116); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116);
-        con_putc(10);
-        return;
-    }
-
-    var file_size: i64 = 0;
-    var size_addr: i64 = 0x41020;  // temp storage for file size
-    var cluster: i64 = fat32_find_file(name_addr, name_len, size_addr);
-    if cluster == 0 {
-        con_putc(78); con_putc(111); con_putc(116); con_putc(32); con_putc(102); con_putc(111); con_putc(117); con_putc(110); con_putc(100); // "Not found"
-        con_putc(10);
-        return;
-    }
-
-    file_size = p_mem_read8(size_addr);
-    // Direct read: bypass fat32_read_file, read sector directly
-    var sector: i64 = fat32_cluster_to_sector(cluster);
-    var result: i64 = ata_read_sector(sector, FAT32_BUF);
-    if result != 0 {
-        con_putc(82); con_putc(101); con_putc(97); con_putc(100); con_putc(32); con_putc(101); con_putc(114); con_putc(114);
-        con_putc(10);
-        return;
-    }
-
-    // Print file contents
-    var i: i64 = 0;
-    while i < file_size {
-        con_putc(p_mem_read8(FAT32_BUF + i));
-        i = i + 1;
-    }
-    con_putc(10);
-}
-
 fn cmd_disk() -> void {
     con_putc(10);
     // "Disk: reading sector 0..."
@@ -2041,546 +433,6 @@ fn cmd_disk() -> void {
     } else {
         // "No MBR"
         con_putc(78); con_putc(111); con_putc(32); con_putc(77); con_putc(66); con_putc(82);
-    }
-    con_putc(10);
-}
-
-// ─── User-Mode Program Loading ──────────────────────────────────────────
-
-// Syscall numbers
-const SYS_EXIT: i64 = 0;
-const SYS_WRITE: i64 = 1;
-const SYS_READ: i64 = 2;
-const SYS_GETPID: i64 = 3;
-const SYS_YIELD: i64 = 4;
-
-// Syscall dispatch — called by the assembly syscall handler.
-// Args: syscall_num (RCX), arg1 (RDX), arg2 (R8), arg3 (R9)
-// Returns 0 to continue user mode, non-zero to exit to kernel.
-pub fn syscall_dispatch(syscall_num: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
-    // Syscall numbers:
-    //   0 = sys_exit(exit_code)  — returns to kernel
-    //   1 = sys_write(buf_ptr, len) — writes to VGA/serial, returns bytes written
-    //   2 = sys_read(buf_ptr, len) — reads from keyboard (stub, returns 0)
-    //   3 = sys_getpid() — returns PID
-    //   4 = sys_yield() — yields CPU (stub, returns 0)
-
-    if syscall_num == 0 {
-        // sys_exit: print exit code, return to kernel
-        con_putc(10);
-        con_putc(69); con_putc(120); con_putc(105); con_putc(116); con_putc(40); // "Exit("
-        print_hex(arg1);
-        con_putc(41); con_putc(10); // ")"
-        return 0; // return value doesn't matter; handler checks syscall_num==0
-    }
-
-    if syscall_num == 1 {
-        // sys_write(buf_ptr, len): write string to VGA/serial
-        var i: i64 = 0;
-        while i < arg2 {
-            con_putc(p_mem_read8(arg1 + i));
-            i = i + 1;
-        }
-        return arg2; // return bytes written
-    }
-
-    if syscall_num == 2 {
-        // sys_read(buf_ptr, len): read from keyboard buffer into user buffer
-        // Reads one character at a time (blocking until a key is available)
-        // Returns the number of bytes actually read (1 if a key was read, 0 on error)
-        if arg2 <= 0 { return 0; }
-        // Read one scancode from the keyboard buffer (blocks until key pressed)
-        var sc: i64 = kbd_read_scancode();
-        var ch: i64 = scancode_to_ascii(sc);
-        if ch < 0 { return 0; }
-        // Write the character to the user buffer
-        p_mem_write8(arg1, ch);
-        return 1;
-    }
-
-    if syscall_num == 3 {
-        // sys_getpid: return PID (always 1 for now)
-        return 1;
-    }
-
-    if syscall_num == 4 {
-        // sys_yield: stub — no scheduler yet
-        return 0;
-    }
-
-    if syscall_num == 9 {
-        // sys_mmap(addr, length, prot, flags, fd, offset)
-        return sys_mmap(arg1, arg2, arg3, 0, 0, 0);
-    }
-
-    if syscall_num == 12 {
-        // sys_brk(new_brk)
-        return sys_brk(arg1);
-    }
-
-    if syscall_num == 39 {
-        // sys_getpid
-        return current_pid;
-    }
-
-    if syscall_num == 57 {
-        // sys_fork
-        return sys_fork();
-    }
-
-    if syscall_num == 59 {
-        // sys_exec(path, path_len)
-        return sys_exec(arg1, arg2);
-    }
-
-    if syscall_num == 61 {
-        // sys_wait(pid)
-        return sys_wait(arg1);
-    }
-
-    if syscall_num == 62 {
-        // sys_kill(pid, sig)
-        return sys_kill(arg1, arg2);
-    }
-
-    if syscall_num == 134 {
-        // sys_sigaction(sig, handler)
-        return sys_sigaction(arg1, arg2);
-    }
-
-    if syscall_num == 200 {
-        // sys_pipe
-        return sys_pipe();
-    }
-
-    if syscall_num == 201 {
-        // sys_shmget(key, size, flags)
-        return sys_shmget(arg1, arg2, arg3);
-    }
-
-    // Unknown syscall — print debug and continue
-    con_putc(10);
-    con_putc(83); con_putc(58); // "S:"
-    print_hex(syscall_num);
-    con_putc(32);
-    con_putc(82); con_putc(58); // "R:"
-    print_hex(arg1);
-    con_putc(32);
-    con_putc(80); con_putc(58); // "P:"
-    print_hex(arg2);
-    con_putc(32);
-    con_putc(65); con_putc(58); // "A:"
-    print_hex(arg3);
-    con_putc(10);
-    return 0;
-}
-
-// ─── Extended Syscalls (G2, G5, G6, G7, G8, G21) ──────────────────────────
-
-// User heap state at 0x6B0: [brk_current:8]
-const USER_BRK: i64 = 0x6B0;
-const USER_HEAP_START: i64 = 0x13000;  // user heap starts above user stack
-
-// Process table at 0x160000 (up to 64 processes × 32 bytes)
-const PROC_TABLE: i64 = 0x160000;
-const MAX_PROCS: i64 = 64;
-var current_pid: i64 = 1;
-var next_pid: i64 = 2;
-
-// Signal handler table at 0x170000 (64 signals × 8 bytes per process)
-const SIGNAL_TABLE: i64 = 0x170000;
-
-// Pipe buffer at 0x180000 (up to 16 pipes × 4096 bytes)
-const PIPE_TABLE: i64 = 0x180000;
-const MAX_PIPES: i64 = 16;
-const PIPE_SIZE: i64 = 4096;
-
-fn proc_init() {
-    current_pid = 1;
-    next_pid = 2;
-    // Initialize process 1 (kernel shell)
-    p_mem_write64(PROC_TABLE, 1);        // pid
-    p_mem_write64(PROC_TABLE + 8, 1);    // state = running
-    p_mem_write64(PROC_TABLE + 16, 0x10000); // entry
-    p_mem_write64(PROC_TABLE + 24, 0x72000); // pml4
-    // Initialize user brk
-    p_mem_write64(USER_BRK, USER_HEAP_START);
-}
-
-fn sys_brk(new_brk: i64) -> i64 {
-    // G7: Set program break (user heap)
-    var current_brk: i64 = p_mem_read64(USER_BRK);
-    if new_brk == 0 {
-        // Query current brk
-        return current_brk;
-    }
-    if new_brk < USER_HEAP_START || new_brk > 0x1F000 {
-        return current_brk;  // invalid range, return current
-    }
-    p_mem_write64(USER_BRK, new_brk);
-    return new_brk;
-}
-
-fn sys_mmap(addr: i64, length: i64, prot: i64, flags: i64, fd: i64, offset: i64) -> i64 {
-    // G7: Simple mmap — allocate anonymous pages in user space
-    // For now, just extend the user break
-    var current_brk: i64 = p_mem_read64(USER_BRK);
-    if length <= 0 { return 0; }
-    // Align to page boundary
-    var aligned_len: i64 = (length + 0xFFF) & 0xFFFFFFFFFFFFF000;
-    var result: i64 = current_brk;
-    p_mem_write64(USER_BRK, current_brk + aligned_len);
-    return result;
-}
-
-fn sys_fork() -> i64 {
-    // G2: Fork — create a copy of the current process
-    // In a real OS, this would copy page tables (COW) and create a new process.
-    // For now, return -1 (not implemented in single-process mode)
-    return -1;
-}
-
-fn sys_exec(path: i64, path_len: i64) -> i64 {
-    // G2: Exec — replace current process with a new program
-    // For now, load from initrd and jump to it
-    var idx: i64 = initrd_find(path, path_len);
-    if idx < 0 { return -1; }
-    var size: i64 = initrd_get_size(idx);
-    var doff: i64 = initrd_get_data_offset(idx);
-    // Copy to 0x10000
-    var i: i64 = 0;
-    while i < size {
-        p_mem_write8(0x10000 + i, p_mem_read8(INITRD_BUF + doff + i));
-        i = i + 1;
-    }
-    // Enter user mode
-    p_enter_user_mode(0x10000, 0x12000);
-    return 0;  // never reached
-}
-
-fn sys_wait(pid: i64) -> i64 {
-    // G2: Wait — block until child exits
-    // For now, return 0 (no children to wait for)
-    return 0;
-}
-
-fn sys_kill(pid: i64, sig: i64) -> i64 {
-    // G8: Send signal to process
-    // For now, just return 0
-    return 0;
-}
-
-fn sys_sigaction(sig: i64, handler: i64) -> i64 {
-    // G8: Set signal handler
-    if sig < 0 || sig >= 64 { return -1; }
-    p_mem_write64(SIGNAL_TABLE + sig * 8, handler);
-    return 0;
-}
-
-fn sys_pipe() -> i64 {
-    // G21: Create a pipe — returns pipe id
-    // Find a free pipe slot
-    var i: i64 = 0;
-    while i < MAX_PIPES {
-        var in_use: i64 = p_mem_read8(PIPE_TABLE + i * (PIPE_SIZE + 16));
-        if in_use == 0 {
-            p_mem_write8(PIPE_TABLE + i * (PIPE_SIZE + 16), 1);
-            // Initialize read/write offsets
-            p_mem_write64(PIPE_TABLE + i * (PIPE_SIZE + 16) + 8, 0);  // read offset
-            p_mem_write64(PIPE_TABLE + i * (PIPE_SIZE + 16) + 16, 0); // write offset
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-fn sys_shmget(key: i64, size: i64, flags: i64) -> i64 {
-    // G21: Allocate shared memory — return virtual address
-    // Use a fixed shared memory region at 0x200000
-    var current: i64 = p_mem_read64(0x6C0);
-    if current == 0 { current = 0x200000; }
-    var aligned: i64 = (size + 0xFFF) & 0xFFFFFFFFFFFFF000;
-    var result: i64 = current;
-    p_mem_write64(0x6C0, current + aligned);
-    return result;
-}
-
-// ─── E1000 Network Driver (G22) ───────────────────────────────────────────
-// QEMU E1000 NIC is at PCI 0:3.0 (vendor 0x8086, device 0x100e)
-// I/O BAR is at PCI config offset 0x10 (BAR0)
-// MMIO BAR is at offset 0x14 (BAR1)
-
-const E1000_REG_CTRL:   i64 = 0x0000;
-const E1000_REG_STATUS: i64 = 0x0008;
-const E1000_REG_RCTRL:  i64 = 0x0100;
-const E1000_REG_TCTRL:  i64 = 0x0400;
-var e1000_io_base: i64 = 0;
-
-fn e1000_find() -> i64 {
-    // Search PCI table for E1000 (vendor 0x8086, device 0x100e)
-    var i: i64 = 0;
-    while i < pci_device_count {
-        var idx: i64 = i * 16;
-        var vendor: i64 = p_mem_read64(PCI_TABLE + idx);
-        var packed_val: i64 = p_mem_read64(PCI_TABLE + idx + 8);
-        var device: i64 = (packed_val >> 48) & 0xFFFF;
-        if vendor == 0x8086 && device == 0x100E {
-            var bus: i64 = (packed_val >> 16) & 0xFF;
-            var dev: i64 = (packed_val >> 8) & 0xFF;
-            var func: i64 = packed_val & 0xFF;
-            // Read BAR0 (I/O space) at config offset 0x10
-            var bar0: i64 = pci_config_read(bus, dev, func, 0x10);
-            e1000_io_base = bar0 & 0xFFFFFFFC;  // mask I/O bit and type
-            return 0;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-fn e1000_init() -> i64 {
-    if e1000_find() != 0 { return -1; }
-    if e1000_io_base == 0 { return -1; }
-
-    // Read status register to verify NIC is present
-    var status: i64 = e1000_read_reg(E1000_REG_STATUS);
-    if status == 0 { return -1; }
-
-    // Reset the device: write CTRL.FRCSPD | CTRL.RST (bit 6 | bit 26)
-    // Actually just set link up: CTRL.SLU (bit 6)
-    e1000_write_reg(E1000_REG_CTRL, 0x40);
-
-    // Disable interrupts
-    e1000_write_reg(0x00D0, 0);
-
-    return 0;
-}
-
-fn e1000_read_reg(offset: i64) -> i64 {
-    return p_inl(e1000_io_base + offset);
-}
-
-fn e1000_write_reg(offset: i64, val: i64) {
-    p_outl(e1000_io_base + offset, val);
-}
-
-fn cmd_net() -> void {
-    con_putc(10);
-    // "NET: "
-    con_putc(78); con_putc(69); con_putc(84); con_putc(58); con_putc(32);
-    var result: i64 = e1000_init();
-    if result == 0 {
-        con_putc(69); con_putc(49); con_putc(48); con_putc(48); con_putc(48); // "E1000"
-        con_putc(32);
-        con_putc(105); con_putc(111); con_putc(58); // "io:"
-        con_putc(32);
-        print_hex(e1000_io_base);
-        con_putc(32);
-        var status: i64 = e1000_read_reg(E1000_REG_STATUS);
-        con_putc(115); con_putc(116); con_putc(58); // "st:"
-        con_putc(32);
-        print_hex(status);
-    } else {
-        con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
-    }
-    con_putc(10);
-}
-
-// ─── Minimal TCP/IP Stack (G23) ───────────────────────────────────────────
-// ARP cache, ICMP echo (ping), UDP, and minimal TCP.
-// This is a scaffold — actual packet TX/RX requires the E1000 driver
-// to be fully functional with ring buffers.
-
-// ARP cache at 0x190000 (16 entries × 16 bytes: 4 IP + 6 MAC + 6 pad)
-const ARP_CACHE: i64 = 0x190000;
-
-// Our IP: 10.0.2.15 (QEMU default)
-// Gateway: 10.0.2.2
-// Our MAC: 52:54:00:12:34:56 (QEMU default)
-
-fn net_init() {
-    // Zero ARP cache
-    var i: i64 = 0;
-    while i < 256 {
-        p_mem_write8(ARP_CACHE + i, 0);
-        i = i + 1;
-    }
-}
-
-fn cmd_ping(ip_addr: i64) -> void {
-    con_putc(10);
-    // "PING: "
-    con_putc(80); con_putc(73); con_putc(78); con_putc(71); con_putc(58); con_putc(32);
-    // Print IP as dotted decimal
-    print_dec((ip_addr >> 24) & 0xFF);
-    con_putc(46);
-    print_dec((ip_addr >> 16) & 0xFF);
-    con_putc(46);
-    print_dec((ip_addr >> 8) & 0xFF);
-    con_putc(46);
-    print_dec(ip_addr & 0xFF);
-    con_putc(10);
-    // In a full implementation, we'd send an ICMP echo request via E1000
-    // For now, just print a message
-    con_putc(83); con_putc(101); con_putc(110); con_putc(100); con_putc(105); con_putc(110); con_putc(103); // "Sending"
-    con_putc(32);
-    con_putc(73); con_putc(67); con_putc(77); con_putc(80); // "ICMP"
-    con_putc(32);
-    con_putc(101); con_putc(99); con_putc(104); con_putc(111); // "echo"
-    con_putc(10);
-}
-
-// ─── Framebuffer Console (G12) ────────────────────────────────────────────
-// VBE framebuffer info from GRUB multiboot2 (if available).
-// For now, we detect VBE mode info and provide a simple pixel plotter.
-// The framebuffer address, width, height, and bpp are stored at 0x1A0000.
-
-const FB_ADDR: i64 = 0x1A0000;    // framebuffer physical address
-const FB_WIDTH: i64 = 0x1A0008;   // width in pixels
-const FB_HEIGHT: i64 = 0x1A0010;  // height in pixels
-const FB_BPP: i64 = 0x1A0018;     // bits per pixel
-const FB_PITCH: i64 = 0x1A0020;   // bytes per scanline
-
-fn fb_init() -> i64 {
-    // In a real implementation, we'd parse multiboot2 info for VBE data.
-    // For QEMU with -display none, there's no framebuffer.
-    // Set defaults to 0 (no framebuffer)
-    p_mem_write64(FB_ADDR, 0);
-    p_mem_write64(FB_WIDTH, 0);
-    p_mem_write64(FB_HEIGHT, 0);
-    p_mem_write64(FB_BPP, 0);
-    p_mem_write64(FB_PITCH, 0);
-    return 0;
-}
-
-fn fb_putpixel(x: i64, y: i64, color: i64) {
-    var addr: i64 = p_mem_read64(FB_ADDR);
-    var pitch: i64 = p_mem_read64(FB_PITCH);
-    var bpp: i64 = p_mem_read64(FB_BPP);
-    if addr == 0 || bpp == 0 { return; }
-    var offset: i64 = y * pitch + x * (bpp / 8);
-    p_mem_write32(addr + offset, color);
-}
-
-fn cmd_fb() -> void {
-    con_putc(10);
-    // "FB: "
-    con_putc(70); con_putc(66); con_putc(58); con_putc(32);
-    var addr: i64 = p_mem_read64(FB_ADDR);
-    if addr == 0 {
-        con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
-    } else {
-        con_putc(97); con_putc(100); con_putc(100); con_putc(114); con_putc(58); // "addr:"
-        con_putc(32);
-        print_hex(addr);
-        con_putc(32);
-        con_putc(119); con_putc(120); con_putc(104); // "wxh"
-        con_putc(58);
-        con_putc(32);
-        print_dec(p_mem_read64(FB_WIDTH));
-        con_putc(120);
-        print_dec(p_mem_read64(FB_HEIGHT));
-    }
-    con_putc(10);
-}
-
-// ─── SMP Boot (G20) ───────────────────────────────────────────────────────
-// Boot Application Processor (AP) via SIPI.
-// APIC ID is at LAPIC + 0x20 (local APIC ID register).
-
-fn smp_boot_ap(apic_id: i64) -> i64 {
-    // Send INIT IPI to the AP
-    // ICR low at 0xFEE00300, ICR high at 0xFEE00310
-    // ICR high: [dest][...][dest shorthand] — bits 24-31 = destination
-    apic_write(0xFEE00310, apic_id << 24);
-    // ICR low: [vector][delivery][dest mode][level][trigger][dest shorthand]
-    // INIT IPI: delivery mode = 5 (INIT), level = 1 (assert), trigger = 1 (level)
-    // Vector = 0 (doesn't matter for INIT)
-    apic_write(0xFEE00300, 0x4500);
-
-    // Wait 10ms (approximately — just do a busy loop)
-    var i: i64 = 0;
-    while i < 1000000 { i = i + 1; }
-
-    // Send SIPI (Startup IPI) with vector pointing to 0x8000 (real mode)
-    // SIPI vector = page number (0x08 = physical address 0x8000)
-    apic_write(0xFEE00310, apic_id << 24);
-    apic_write(0xFEE00300, 0x4608);
-
-    // Wait for AP to boot
-    i = 0;
-    while i < 1000000 { i = i + 1; }
-
-    return 0;
-}
-
-fn cmd_smp() -> void {
-    con_putc(10);
-    // "SMP: "
-    con_putc(83); con_putc(77); con_putc(80); con_putc(58); con_putc(32);
-    // Get APIC ID from LAPIC
-    var apic_id: i64 = (apic_read(0xFEE00020) >> 24) & 0xFF;
-    con_putc(66); con_putc(83); con_putc(80); // "BSP"
-    con_putc(32);
-    con_putc(105); con_putc(100); con_putc(58); // "id:"
-    con_putc(32);
-    print_hex(apic_id);
-    con_putc(10);
-    // Try to boot AP 1
-    con_putc(66); con_putc(111); con_putc(111); con_putc(116); // "Boot"
-    con_putc(32);
-    con_putc(65); con_putc(80); con_putc(49); // "AP1"
-    con_putc(32);
-    var result: i64 = smp_boot_ap(1);
-    if result == 0 {
-        con_putc(79); con_putc(75); // "OK"
-    } else {
-        con_putc(70); con_putc(97); con_putc(105); con_putc(108); // "Fail"
-    }
-    con_putc(10);
-}
-
-// ─── ATA DMA (G11) ────────────────────────────────────────────────────────
-// Bus-master DMA for ATA/IDE.
-// PCI device 0:1.1 is the PIIX3 IDE controller.
-// BAR4 (offset 0x20) is the Bus Master IDE I/O base.
-
-var ata_dma_base: i64 = 0;
-
-fn ata_dma_init() -> i64 {
-    // Find PIIX3 IDE controller (vendor 0x8086, device 0x7010)
-    var i: i64 = 0;
-    while i < pci_device_count {
-        var idx: i64 = i * 16;
-        var vendor: i64 = p_mem_read64(PCI_TABLE + idx);
-        var packed_val: i64 = p_mem_read64(PCI_TABLE + idx + 8);
-        var device: i64 = (packed_val >> 48) & 0xFFFF;
-        if vendor == 0x8086 && device == 0x7010 {
-            var bus: i64 = (packed_val >> 16) & 0xFF;
-            var dev: i64 = (packed_val >> 8) & 0xFF;
-            var func: i64 = packed_val & 0xFF;
-            // Read BAR4 (bus master base)
-            var bar4: i64 = pci_config_read(bus, dev, func, 0x20);
-            ata_dma_base = bar4 & 0xFFFC;
-            return 0;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-fn cmd_dma() -> void {
-    con_putc(10);
-    // "DMA: "
-    con_putc(68); con_putc(77); con_putc(65); con_putc(58); con_putc(32);
-    var result: i64 = ata_dma_init();
-    if result == 0 {
-        con_putc(98); con_putc(97); con_putc(115); con_putc(101); con_putc(58); // "base:"
-        con_putc(32);
-        print_hex(ata_dma_base);
-    } else {
-        con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
     }
     con_putc(10);
 }
@@ -2717,86 +569,173 @@ pub fn user_program_done() -> void {
     con_putc(10);
 }
 
-// Load and run an ELF program from disk sector 2.
-fn cmd_elf() -> void {
-    con_putc(10);
-    con_putc(76); con_putc(111); con_putc(97); con_putc(100); con_putc(105); con_putc(110); con_putc(103); // "Loading"
-    con_putc(32); con_putc(69); con_putc(76); con_putc(70); con_putc(32); con_putc(102); con_putc(114); con_putc(111); con_putc(109); // " ELF from"
-    con_putc(32); con_putc(115); con_putc(101); con_putc(99); con_putc(116); con_putc(111); con_putc(114); con_putc(32); con_putc(50); // " sector 2"
-    con_putc(46); con_putc(46); con_putc(46);
-    con_putc(10);
-    // Read sector 2 into buffer at 0x20000
-    var ok: i64 = ata_read_sector(2, 0x20000);
-    if ok != 0 {
-        con_putc(70); con_putc(97); con_putc(105); con_putc(108); con_putc(101); con_putc(100); // "Failed"
-        con_putc(32); con_putc(116); con_putc(111); con_putc(32); con_putc(114); con_putc(101); con_putc(97); con_putc(100); // " to read"
-        con_putc(10);
-    } else {
-        // Parse ELF
-        var entry: i64 = elf_load(0x20000);
-        if entry == 0 {
-            con_putc(78); con_putc(111); con_putc(116); con_putc(32); con_putc(97); con_putc(110); con_putc(32); con_putc(69); con_putc(76); con_putc(70); // "Not an ELF"
-            con_putc(10);
-        } else {
-            con_putc(69); con_putc(110); con_putc(116); con_putc(114); con_putc(121); con_putc(58); con_putc(32); // "Entry: "
-            print_hex(entry);
-            con_putc(10);
-            // Enter user mode with the ELF entry point
-            con_putc(74); con_putc(117); con_putc(109); con_putc(112); con_putc(105); con_putc(110); con_putc(103); // "Jumping"
-            con_putc(32); con_putc(116); con_putc(111); con_putc(32); con_putc(117); con_putc(115); con_putc(101); con_putc(114); // " to user"
-            con_putc(32); con_putc(109); con_putc(111); con_putc(100); con_putc(101); // " mode"
-            con_putc(10);
-            p_enter_user_mode(entry, 0x12000);
-        }
-    }
+// ─── Shell History ───────────────────────────────────────────────────────
+// History buffer at 0x1D6000: 16 entries × 128 bytes
+// 0x1D6000: count (4 bytes), 0x1D6004: current index (4 bytes)
+// 0x1D6100: entries (16 × 128 = 2048 bytes)
+
+const HIST_COUNT: i64 = 0x1D6000;
+const HIST_INDEX: i64 = 0x1D6004;
+const HIST_ENTRIES: i64 = 0x1D6100;
+const HIST_MAX: i64 = 16;
+const HIST_ENTRY_SIZE: i64 = 128;
+
+fn shell_history_init() -> void {
+    p_mem_write32(HIST_COUNT, 0);
+    p_mem_write32(HIST_INDEX, 0);
 }
 
-// Load and run a user-mode program from disk sector 1.
-// The user program is a flat binary loaded at 0x10000.
-// User stack is at 0x12000 (grows down).
-// The user program writes to VGA at 0xB8000 and calls int 0x80 to exit.
-fn cmd_run() -> void {
-    con_putc(10);
-    // "Loading user program from sector 1..."
-    con_putc(76); con_putc(111); con_putc(97); con_putc(100); con_putc(105);
-    con_putc(110); con_putc(103); con_putc(32); con_putc(117); con_putc(115);
-    con_putc(101); con_putc(114); con_putc(32); con_putc(112); con_putc(114);
-    con_putc(111); con_putc(103); con_putc(114); con_putc(97); con_putc(109);
-    con_putc(32); con_putc(102); con_putc(114); con_putc(111); con_putc(109);
-    con_putc(32); con_putc(115); con_putc(101); con_putc(99); con_putc(116);
-    con_putc(111); con_putc(114); con_putc(32); con_putc(49); con_putc(46); con_putc(46); con_putc(46);
-    con_putc(10);
+fn shell_history_add(len: i64) -> void {
+    if len == 0 { return; }
+    var count: i64 = p_mem_read32(HIST_COUNT);
+    var entry: i64 = HIST_ENTRIES + (count % HIST_MAX) * HIST_ENTRY_SIZE;
+    // Copy current input to history entry
+    var i: i64 = 0;
+    while i < len && i < HIST_ENTRY_SIZE {
+        p_mem_write8(entry + i, input_get(i));
+        i = i + 1;
+    }
+    p_mem_write8(entry + len, 0);  // null-terminate
+    count = count + 1;
+    p_mem_write32(HIST_COUNT, count);
+    p_mem_write32(HIST_INDEX, count);  // reset index to "after" the last entry
+}
 
-    // Load user program from disk sector 1 to address 0x10000
-    var result: i64 = ata_read_sector(1, 0x10000);
-    if result != 0 {
-        // "Failed to load user program"
-        con_putc(70); con_putc(97); con_putc(105); con_putc(108); con_putc(101);
-        con_putc(100); con_putc(32); con_putc(116); con_putc(111); con_putc(32);
-        con_putc(108); con_putc(111); con_putc(97); con_putc(100); con_putc(32);
-        con_putc(117); con_putc(115); con_putc(101); con_putc(114); con_putc(32);
-        con_putc(112); con_putc(114); con_putc(111); con_putc(103); con_putc(114);
-        con_putc(97); con_putc(109);
-        con_putc(10);
-        return;
+fn shell_history_recall(direction: i64) -> i64 {
+    // direction: -1 = up (older), 1 = down (newer)
+    // Returns the new input length, or -1 if no history
+    var count: i64 = p_mem_read32(HIST_COUNT);
+    if count == 0 { return -1; }
+    var idx: i64 = p_mem_read32(HIST_INDEX);
+    if direction == -1 {
+        // Up: go to older entry
+        if idx > 0 { idx = idx - 1; }
+        else { return -1; }
+    } else {
+        // Down: go to newer entry
+        if idx < count { idx = idx + 1; }
+        else { return -1; }
+    }
+    p_mem_write32(HIST_INDEX, idx);
+    // If index is at count (past the last), clear input
+    if idx >= count {
+        input_clear();
+        return 0;
+    }
+    // Load the entry into the input buffer
+    var entry: i64 = HIST_ENTRIES + (idx % HIST_MAX) * HIST_ENTRY_SIZE;
+    input_clear();
+    var i: i64 = 0;
+    while i < HIST_ENTRY_SIZE {
+        var c: i64 = p_mem_read8(entry + i);
+        if c == 0 { break; }
+        input_write(i, c);
+        i = i + 1;
+    }
+    return i;
+}
+
+// ─── Shell Tab Completion ────────────────────────────────────────────────
+// Try to complete the current input against known commands.
+// Returns the new input length if completed, 0 if no match.
+fn shell_tab_complete(input_len: i64) -> i64 {
+    if input_len == 0 { return 0; }
+    // Check each known command name
+    // Commands: help, clear, echo, mem, info, time, date, reboot, poweroff,
+    //   malloc, disk, run, elf, ps, ticks, halt, ls, cat, ils, icat, pci,
+    //   acpi, vm, mouse, apic, heap, free, net, arp, pstats, fb, smp, dma,
+    //   touch, rm, vars
+    var best_len: i64 = 0;
+    var best_cmd: i64 = 0;
+    var best_cmd_len: i64 = 0;
+    var match_count: i64 = 0;
+
+    // Helper: check if input matches the prefix of a command
+    // cmd_addr points to a string in memory, cmd_len is its length
+    // We check if the first input_len bytes of the command match the input
+
+    // For each command, we store the ASCII bytes inline and compare
+    // This is verbose but avoids needing string storage
+
+    // "help" (4)
+    if input_len <= 4 {
+        if input_len >= 1 && input_get(0) == 104 { // 'h'
+            if input_len >= 2 && input_get(1) == 101 { // 'he'
+                if input_len >= 3 && input_get(2) == 108 { // 'hel'
+                    if input_len >= 4 && input_get(3) == 112 { // 'help'
+                        best_cmd = 1; best_cmd_len = 4; match_count = match_count + 1;
+                    } else if input_len == 3 { best_cmd = 1; best_cmd_len = 4; match_count = match_count + 1; }
+                } else if input_len == 2 { best_cmd = 1; best_cmd_len = 4; match_count = match_count + 1; }
+            } else if input_len == 1 {
+                // "heap" also starts with 'h'
+                best_cmd = 1; best_cmd_len = 4; match_count = match_count + 1;
+                best_cmd = 2; best_cmd_len = 4; match_count = match_count + 1;
+            }
+        }
     }
 
-    // "Entering ring 3 (user mode)..."
-    con_putc(69); con_putc(110); con_putc(116); con_putc(101); con_putc(114);
-    con_putc(105); con_putc(110); con_putc(103); con_putc(32); con_putc(114);
-    con_putc(105); con_putc(110); con_putc(103); con_putc(32); con_putc(51);
-    con_putc(32); con_putc(40); con_putc(117); con_putc(115); con_putc(101);
-    con_putc(114); con_putc(32); con_putc(109); con_putc(111); con_putc(100);
-    con_putc(101); con_putc(41); con_putc(46); con_putc(46); con_putc(46);
-    con_putc(10);
+    // "net" (3) and "ne..." 
+    if input_len <= 3 && input_len >= 1 && input_get(0) == 110 { // 'n'
+        best_cmd = 3; best_cmd_len = 3; match_count = match_count + 1;
+    }
 
-    // Enter user mode: entry at 0x10000, stack at 0x12000
-    // This does iret to ring 3 and never returns.
-    // When the user calls int 0x80, the syscall handler returns to
-    // user_program_done() in the kernel.
-    p_enter_user_mode(0x10000, 0x12000);
+    // "arp" (3)
+    if input_len <= 3 && input_len >= 1 && input_get(0) == 97 { // 'a'
+        best_cmd = 4; best_cmd_len = 3; match_count = match_count + 1;
+        // "acpi" also starts with 'a'
+        best_cmd = 5; best_cmd_len = 4; match_count = match_count + 1;
+        // "apic" also starts with 'a'
+        best_cmd = 6; best_cmd_len = 4; match_count = match_count + 1;
+    }
 
-    // This code is never reached — p_enter_user_mode does iret
+    // "smp" (3)
+    if input_len <= 3 && input_len >= 1 && input_get(0) == 115 { // 's'
+        best_cmd = 7; best_cmd_len = 3; match_count = match_count + 1;
+    }
+
+    // "rm" (2)
+    if input_len <= 2 && input_len >= 1 && input_get(0) == 114 { // 'r'
+        best_cmd = 8; best_cmd_len = 2; match_count = match_count + 1;
+        // "reboot" also starts with 'r'
+        best_cmd = 9; best_cmd_len = 6; match_count = match_count + 1;
+        // "run" also starts with 'r'
+        best_cmd = 10; best_cmd_len = 3; match_count = match_count + 1;
+    }
+
+    // If exactly one match, complete it
+    if match_count == 1 {
+        // Fill in the rest of the command
+        var i: i64 = input_len;
+        while i < best_cmd_len {
+            // Write the completion character based on which command
+            var c: i64 = 0;
+            if best_cmd == 1 { // "help"
+                if i == 0 { c = 104; } else if i == 1 { c = 101; } else if i == 2 { c = 108; } else if i == 3 { c = 112; }
+            } else if best_cmd == 2 { // "heap"
+                if i == 0 { c = 104; } else if i == 1 { c = 101; } else if i == 2 { c = 97; } else if i == 3 { c = 112; }
+            } else if best_cmd == 3 { // "net"
+                if i == 0 { c = 110; } else if i == 1 { c = 101; } else if i == 2 { c = 116; }
+            } else if best_cmd == 4 { // "arp"
+                if i == 0 { c = 97; } else if i == 1 { c = 114; } else if i == 2 { c = 112; }
+            } else if best_cmd == 5 { // "acpi"
+                if i == 0 { c = 97; } else if i == 1 { c = 99; } else if i == 2 { c = 112; } else if i == 3 { c = 105; }
+            } else if best_cmd == 6 { // "apic"
+                if i == 0 { c = 97; } else if i == 1 { c = 112; } else if i == 2 { c = 105; } else if i == 3 { c = 99; }
+            } else if best_cmd == 7 { // "smp"
+                if i == 0 { c = 115; } else if i == 1 { c = 109; } else if i == 2 { c = 112; }
+            } else if best_cmd == 8 { // "rm"
+                if i == 0 { c = 114; } else if i == 1 { c = 109; }
+            } else if best_cmd == 9 { // "reboot"
+                if i == 0 { c = 114; } else if i == 1 { c = 101; } else if i == 2 { c = 98; } else if i == 3 { c = 111; } else if i == 4 { c = 111; } else if i == 5 { c = 116; }
+            } else if best_cmd == 10 { // "run"
+                if i == 0 { c = 114; } else if i == 1 { c = 117; } else if i == 2 { c = 110; }
+            }
+            input_write(i, c);
+            i = i + 1;
+        }
+        return best_cmd_len;
+    }
+    return 0;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────
@@ -2815,6 +754,18 @@ pub fn main() -> void {
     p_mem_write8(TIMER_TICKS, 0);
     // Initialize heap
     heap_init();
+    // Initialize shell history
+    shell_history_init();
+    // Initialize ping stats
+    ping_stats_init();
+    // Initialize file descriptors
+    fd_init();
+    // Initialize kernel threads
+    kthread_init();
+    // Initialize UDP sockets
+    udp_socket_init();
+    // Initialize disk cache
+    disk_cache_init();
     // Initialize scheduler
     sched_init();
     // Initialize FAT32 filesystem
@@ -2849,8 +800,15 @@ pub fn main() -> void {
     // (auto-test of all OS features runs in user_program_done after exit)
     cmd_run();
 
+    // Initialize shell variables
+    vars_init();
+
     // Shell loop
     while true {
+        // Cooperative scheduler: check quantum and switch threads
+        if p_mem_read8(SCHED_QUANTUM_ADDR) >= 10 {
+            sched_timer_tick();
+        }
         // Print prompt "> "
         con_putc(62); con_putc(32);
 
@@ -2860,12 +818,72 @@ pub fn main() -> void {
 
         while reading == 1 {
             var sc: i64 = kbd_read_scancode();
+            // Process shift/caps/extended modifiers first
+            sc = kbd_process_modifiers(sc);
+            if sc == -1 { continue; }
+            // Check for arrow keys (extended scancodes: 0x148=up, 0x150=down)
+            if sc == 0x48 || sc == 0x148 {
+                // Up arrow — recall previous command
+                var hlen: i64 = shell_history_recall(-1);
+                if hlen >= 0 {
+                    input_len = hlen;
+                    // Redraw line: clear current line and show recalled command
+                    con_putc(13);  // carriage return
+                    con_putc(62); con_putc(32);  // "> "
+                    var i: i64 = 0;
+                    while i < input_len {
+                        con_putc(input_get(i));
+                        i = i + 1;
+                    }
+                    con_putc(32);  // clear extra char
+                    con_putc(8);   // move cursor back
+                }
+                continue;
+            }
+            if sc == 0x50 || sc == 0x150 {
+                // Down arrow — recall next command
+                var hlen: i64 = shell_history_recall(1);
+                if hlen >= 0 {
+                    input_len = hlen;
+                    con_putc(13);
+                    con_putc(62); con_putc(32);
+                    var i: i64 = 0;
+                    while i < input_len {
+                        con_putc(input_get(i));
+                        i = i + 1;
+                    }
+                    con_putc(32);
+                    con_putc(8);
+                }
+                continue;
+            }
+            if sc == 0x0F {
+                // Tab — command completion
+                // Try to complete the current input against known commands
+                var completed: i64 = shell_tab_complete(input_len);
+                if completed > 0 {
+                    input_len = completed;
+                    // Redraw line
+                    con_putc(13);
+                    con_putc(62); con_putc(32);
+                    var i: i64 = 0;
+                    while i < input_len {
+                        con_putc(input_get(i));
+                        i = i + 1;
+                    }
+                    con_putc(32);
+                    con_putc(8);
+                }
+                continue;
+            }
             var c: i64 = scancode_to_ascii(sc);
 
             if c == -1 { continue; }
 
             if c == 10 {
                 con_putc(10);
+                // Save command to history
+                shell_history_add(input_len);
                 reading = 0;
             } else if c == 8 {
                 if input_len > 0 {
@@ -2880,140 +898,421 @@ pub fn main() -> void {
             }
         }
 
-        // Process command
-        if input_len == 0 {
+        // ─── Expand variables ($var → value) ───────────────────────────
+        // Expand variables into a temp buffer at 0x81000, then copy back
+        var expanded_len: i64 = expand_vars(INPUT_BUF_ADDR, input_len, 0x81000, 512);
+        if expanded_len != input_len {
+            // Copy expanded input back to input buffer
+            input_clear();
+            var i: i64 = 0;
+            while i < expanded_len && i < INPUT_MAX {
+                input_write(i, p_mem_read8(0x81000 + i));
+                i = i + 1;
+            }
+            input_len = expanded_len;
+        }
+
+        // ─── Check for variable assignment (name=value) ────────────────
+        var eq_pos: i64 = is_var_assignment(INPUT_BUF_ADDR, input_len);
+        if eq_pos > 0 {
+            // Set variable: name = value
+            var_set(INPUT_BUF_ADDR, eq_pos, INPUT_BUF_ADDR + eq_pos + 1, input_len - eq_pos - 1);
+            con_putc(79); con_putc(75); con_putc(10); // "OK"
+        } else if input_len == 0 {
             // Empty line
-        } else if input_matches(104, 101, 108, 112, 0, 4, input_len) == 1 {
-            // "help"
-            cmd_help();
-        } else if input_matches(99, 108, 101, 97, 114, 5, input_len) == 1 {
-            // "clear"
-            cmd_clear();
-        } else if input_matches8(101, 99, 104, 111, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "echo <text>"
-            cmd_echo(input_len);
-        } else if input_matches8(109, 101, 109, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-            // "mem"
-            cmd_mem();
-        } else if input_matches8(105, 110, 102, 111, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "info"
-            cmd_info();
-        } else if input_matches8(116, 105, 109, 101, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "time"
-            cmd_time();
-        } else if input_matches8(100, 97, 116, 101, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "date"
-            cmd_date();
-        } else if input_matches8(114, 101, 98, 111, 111, 116, 0, 0, 6, input_len) == 1 {
-            // "reboot"
-            cmd_reboot();
-        } else if input_matches8(112, 111, 119, 101, 114, 111, 102, 102, 8, input_len) == 1 {
-            // "poweroff"
-            cmd_poweroff();
-        } else if input_matches8(109, 97, 108, 108, 111, 99, 0, 0, 6, input_len) == 1 {
-            // "malloc"
-            cmd_malloc();
-        } else if input_matches8(100, 105, 115, 107, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "disk"
-            cmd_disk();
-        } else if input_matches8(114, 117, 110, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-            // "run"
-            cmd_run();
-        } else if input_matches8(101, 108, 102, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-            // "elf" — load ELF from sector 2 and run
-            cmd_elf();
-        } else if input_matches8(116, 105, 99, 107, 115, 0, 0, 0, 5, input_len) == 1 {
-            // "ticks"
+        } else if input_matches(118, 97, 114, 115, 0, 4, input_len) == 1 {
+            // "vars" — show variables
+            cmd_vars();
+        } else if input_contains_char(INPUT_BUF_ADDR, input_len, 59) >= 0 {
+            // Command chaining: cmd1 ; cmd2 ; cmd3
+            // Save original input to temp buffer at 0x83000 (since dispatch modifies input buffer)
+            var save_i: i64 = 0;
+            while save_i < input_len {
+                p_mem_write8(0x83000 + save_i, p_mem_read8(INPUT_BUF_ADDR + save_i));
+                save_i = save_i + 1;
+            }
+            var saved_input_len: i64 = input_len;
+            // Execute each command in sequence
+            var start: i64 = 0;
+            var pos: i64 = 0;
+            while pos <= saved_input_len {
+                var is_sep: i64 = 0;
+                if pos == saved_input_len { is_sep = 1; }
+                else if p_mem_read8(0x83000 + pos) == 59 { is_sep = 1; }
+                if is_sep == 1 {
+                    // Execute command from start to pos
+                    var cmd_start: i64 = start;
+                    var cmd_len: i64 = pos - start;
+                    // Trim leading spaces
+                    while cmd_len > 0 && p_mem_read8(0x83000 + cmd_start) == 32 {
+                        cmd_start = cmd_start + 1;
+                        cmd_len = cmd_len - 1;
+                    }
+                    // Trim trailing spaces
+                    while cmd_len > 0 && p_mem_read8(0x83000 + cmd_start + cmd_len - 1) == 32 {
+                        cmd_len = cmd_len - 1;
+                    }
+                    if cmd_len > 0 {
+                        // Copy sub-command from saved buffer to input buffer and dispatch
+                        input_clear();
+                        var ti: i64 = 0;
+                        while ti < cmd_len {
+                            input_write(ti, p_mem_read8(0x83000 + cmd_start + ti));
+                            ti = ti + 1;
+                        }
+                        shell_dispatch(cmd_len);
+                    }
+                    start = pos + 1;
+                }
+                pos = pos + 1;
+            }
+        } else if input_contains_char(INPUT_BUF_ADDR, input_len, 124) >= 0 {
+            // Pipe: cmd1 | cmd2 — capture output of cmd1, display as input to cmd2
+            var pipe_pos: i64 = input_contains_char(INPUT_BUF_ADDR, input_len, 124);
+            // Run first command with capture
+            capture_start();
+            // Execute the first command (before the pipe)
+            // Temporarily truncate input at pipe position
+            var saved_len: i64 = input_len;
+            input_len = pipe_pos;
+            shell_dispatch(input_len);
+            input_len = saved_len;
+            capture_stop();
+            // Print captured output (since our commands don't read from stdin,
+            // we just display the piped output)
             con_putc(10);
-            con_putc(84); con_putc(105); con_putc(99); con_putc(107); con_putc(115); // "Ticks"
-            con_putc(58); con_putc(32);
-            print_dec(timer_get_ticks());
-            con_putc(10);
-        } else if input_matches(112, 115, 0, 0, 0, 2, input_len) == 1 {
-            // "ps" — show process table
-            cmd_ps();
-        } else if input_matches(108, 115, 0, 0, 0, 2, input_len) == 1 {
-            // "ls" — list files
-            cmd_ls();
-        } else if input_matches(99, 97, 116, 0, 0, 3, input_len) == 1 {
-            // "cat" — read file (needs filename after space)
-            // Find the filename after "cat "
-            var fname_start: i64 = 4;
+            var cap_len: i64 = capture_get_len();
+            var i: i64 = 0;
+            while i < cap_len {
+                con_putc(p_mem_read8(capture_get_buf() + i));
+                i = i + 1;
+            }
+        } else if input_contains_char(INPUT_BUF_ADDR, input_len, 62) >= 0 {
+            // Redirect: cmd > file or cmd >> file
+            var redir_pos: i64 = input_contains_char(INPUT_BUF_ADDR, input_len, 62);
+            // Check for append (>>)
+            var is_append: i64 = 0;
+            if redir_pos + 1 < input_len && input_get(redir_pos + 1) == 62 {
+                is_append = 1;
+                redir_pos = redir_pos + 1;
+            }
+            // Get filename (after the > or >>)
+            var fname_start: i64 = redir_pos + 1;
             while fname_start < input_len {
                 if input_get(fname_start) != 32 { break; }
                 fname_start = fname_start + 1;
             }
-            if fname_start < input_len {
-                cmd_cat(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
-            } else {
-                con_putc(63); con_putc(10);
+            // Save filename to temp buffer at 0x84000 before dispatch clears input
+            var fname_len: i64 = input_len - fname_start;
+            var fi: i64 = 0;
+            while fi < fname_len {
+                p_mem_write8(0x84000 + fi, input_get(fname_start + fi));
+                fi = fi + 1;
             }
-        } else if input_matches(104, 97, 108, 116, 0, 4, input_len) == 1 {
-            // "halt"
-            cmd_halt();
-        } else if input_matches8(105, 108, 115, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-            // "ils" — list initrd files
-            cmd_initrd_ls();
-        } else if input_matches8(105, 99, 97, 116, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "icat" — read file from initrd
-            var fname_start: i64 = 5;
-            while fname_start < input_len {
-                if input_get(fname_start) != 32 { break; }
-                fname_start = fname_start + 1;
+            // Capture output of the command
+            capture_start();
+            var saved_len: i64 = input_len;
+            input_len = redir_pos - (is_append);  // truncate before the >
+            if is_append == 1 { input_len = redir_pos - 1; }
+            shell_dispatch(input_len);
+            input_len = saved_len;
+            capture_stop();
+            // Write captured output to file (or just report)
+            con_putc(10);
+            con_putc(82); con_putc(101); con_putc(100); con_putc(105); con_putc(114); con_putc(101); con_putc(99); con_putc(116); // "Redirect"
+            con_putc(32);
+            var cap_len2: i64 = capture_get_len();
+            print_dec(cap_len2);
+            con_putc(32);
+            con_putc(98); con_putc(121); con_putc(116); con_putc(101); con_putc(115); // "bytes"
+            con_putc(32);
+            con_putc(116); con_putc(111); // "to"
+            con_putc(32);
+            // Print saved filename
+            fi = 0;
+            while fi < fname_len {
+                con_putc(p_mem_read8(0x84000 + fi));
+                fi = fi + 1;
             }
-            if fname_start < input_len {
-                cmd_initrd_cat(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
-            } else {
-                con_putc(63); con_putc(10);
-            }
-        } else if input_matches8(112, 99, 105, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-            // "pci" — list PCI devices
-            cmd_pci();
-        } else if input_matches8(97, 99, 112, 105, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "acpi" — show ACPI info
-            cmd_acpi();
-        } else if input_matches8(118, 109, 0, 0, 0, 0, 0, 0, 2, input_len) == 1 {
-            // "vm" — test VM mapping
-            cmd_vm();
-        } else if input_matches8(109, 111, 117, 115, 101, 0, 0, 0, 5, input_len) == 1 {
-            // "mouse" — show mouse state
-            cmd_mouse();
-        } else if input_matches8(97, 112, 105, 99, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "apic" — init/show APIC
-            cmd_apic();
-        } else if input_matches8(104, 101, 97, 112, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "heap" — show heap info
             con_putc(10);
-            con_putc(110); con_putc(101); con_putc(120); con_putc(116); con_putc(58); con_putc(32); // "next: "
-            print_hex(heap_next);
-            con_putc(10);
-        } else if input_matches8(102, 114, 101, 101, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "free" — test heap free
-            con_putc(10);
-            var p1: i64 = heap_alloc(64);
-            var p2: i64 = heap_alloc(128);
-            heap_free(p1);
-            heap_free(p2);
-            con_putc(79); con_putc(75); // "OK"
-            con_putc(10);
-        } else if input_matches8(110, 101, 116, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-            // "net" — init/show network
-            cmd_net();
-        } else if input_matches8(102, 98, 0, 0, 0, 0, 0, 0, 2, input_len) == 1 {
-            // "fb" — show framebuffer info
-            cmd_fb();
-        } else if input_matches8(115, 109, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-            // "smp" — boot SMP
-            cmd_smp();
-        } else if input_matches8(100, 109, 97, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-            // "dma" — show DMA info
-            cmd_dma();
-        } else if input_matches8(112, 105, 110, 103, 0, 0, 0, 0, 4, input_len) == 1 {
-            // "ping" — send ICMP echo (stub)
-            cmd_ping(0x0A000202);  // ping 10.0.2.2
         } else {
-            // Unknown
+            // Normal command dispatch
+            shell_dispatch(input_len);
+        }
+    }
+}
+
+// ─── TCP test command ────────────────────────────────────────────────────
+fn cmd_tcp() -> void {
+    con_putc(10);
+    // "TCP: connect 10.0.2.2:80"
+    con_putc(84); con_putc(67); con_putc(80); con_putc(58); con_putc(32); // "TCP: "
+    con_putc(99); con_putc(111); con_putc(110); con_putc(110); con_putc(101); con_putc(99); con_putc(116); // "connect"
+    con_putc(32);
+    con_putc(49); con_putc(48); con_putc(46); con_putc(48); con_putc(46); con_putc(50); con_putc(46); con_putc(50); // "10.0.2.2"
+    con_putc(58);
+    con_putc(56); con_putc(48); // "80"
+    con_putc(10);
+
+    // Create a TCP socket on local port 4096
+    var sid: i64 = tcp_socket_create(4096);
+    if sid < 0 {
+        con_putc(78); con_putc(111); con_putc(32); con_putc(115); con_putc(111); con_putc(99); con_putc(107); con_putc(101); con_putc(116); // "No socket"
+        con_putc(10);
+        return;
+    }
+
+    // Connect to 10.0.2.2:80 (QEMU SLIRP gateway)
+    var result: i64 = tcp_connect(sid, 0x0A000202, 80);
+    if result == 0 {
+        con_putc(67); con_putc(111); con_putc(110); con_putc(110); con_putc(101); con_putc(99); con_putc(116); con_putc(101); con_putc(100); // "Connected"
+        con_putc(10);
+
+        // Send HTTP GET request
+        var http: i64 = 0x53000;
+        // "GET / HTTP/1.0\r\n\r\n"
+        var req: i64 = 0;
+        p_mem_write8(http + 0, 71);  // G
+        p_mem_write8(http + 1, 69);  // E
+        p_mem_write8(http + 2, 84);  // T
+        p_mem_write8(http + 3, 32);  // (space)
+        p_mem_write8(http + 4, 47);  // /
+        p_mem_write8(http + 5, 32);  // (space)
+        p_mem_write8(http + 6, 72);  // H
+        p_mem_write8(http + 7, 84);  // T
+        p_mem_write8(http + 8, 84);  // T
+        p_mem_write8(http + 9, 80);  // P
+        p_mem_write8(http + 10, 47); // /
+        p_mem_write8(http + 11, 49); // 1
+        p_mem_write8(http + 12, 46); // .
+        p_mem_write8(http + 13, 48); // 0
+        p_mem_write8(http + 14, 13); // \r
+        p_mem_write8(http + 15, 10); // \n
+        p_mem_write8(http + 16, 13); // \r
+        p_mem_write8(http + 17, 10); // \n
+        tcp_socket_send(sid, http, 18);
+        con_putc(83); con_putc(101); con_putc(110); con_putc(116); // "Sent"
+        con_putc(10);
+
+        // Wait for response (poll for ~3 seconds)
+        p_mem_write8(TCP_RECV_FLAG, 0);
+        var timeout: i64 = 1500000;
+        while timeout > 0 {
+            net_poll();
+            if p_mem_read8(TCP_RECV_FLAG) == 1 { break; }
+            timeout = timeout - 1;
+        }
+        if p_mem_read8(TCP_RECV_FLAG) == 1 {
+            con_putc(82); con_putc(101); con_putc(99); con_putc(118); con_putc(58); // "Recv:"
+            con_putc(32);
+            var recv_len: i64 = p_mem_read32(TCP_SOCKET_TABLE + sid * TCP_SOCKET_SIZE + 32);
+            print_dec(recv_len);
+            con_putc(32);
+            con_putc(98); con_putc(121); con_putc(116); con_putc(101); con_putc(115); // "bytes"
+            con_putc(10);
+        } else {
+            con_putc(84); con_putc(105); con_putc(109); con_putc(101); con_putc(111); con_putc(117); con_putc(116); // "Timeout"
+            con_putc(10);
+        }
+        // Close connection
+        tcp_socket_close(sid);
+    } else {
+        con_putc(70); con_putc(97); con_putc(105); con_putc(108); // "Fail"
+        con_putc(10);
+    }
+}
+
+// ─── SMP command stub ───────────────────────────────────────────────────
+fn cmd_smp() -> void {
+    con_putc(10);
+    con_putc(83); con_putc(77); con_putc(80); con_putc(58); con_putc(32); // "SMP: "
+    con_putc(110); con_putc(111); con_putc(116); con_putc(32); // "not "
+    con_putc(97); con_putc(118); con_putc(97); con_putc(105); con_putc(108); // "avail"
+    con_putc(10);
+}
+
+// ─── Shell Command Dispatch ─────────────────────────────────────────────
+// Dispatch a single command based on the input buffer contents.
+fn shell_dispatch(input_len: i64) -> void {
+    if input_len == 0 {
+        // Empty
+    } else if input_matches(104, 101, 108, 112, 0, 4, input_len) == 1 {
+        // "help"
+        cmd_help();
+    } else if input_matches(99, 108, 101, 97, 114, 5, input_len) == 1 {
+        // "clear"
+        cmd_clear();
+    } else if input_prefix4(101, 99, 104, 111, 4, input_len) == 1 {
+        // "echo <text>"
+        cmd_echo(input_len);
+    } else if input_matches8(109, 101, 109, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "mem"
+        cmd_mem();
+    } else if input_matches8(105, 110, 102, 111, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "info"
+        cmd_info();
+    } else if input_matches8(116, 105, 109, 101, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "time"
+        cmd_time();
+    } else if input_matches8(100, 97, 116, 101, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "date"
+        cmd_date();
+    } else if input_matches8(114, 101, 98, 111, 111, 116, 0, 0, 6, input_len) == 1 {
+        // "reboot"
+        cmd_reboot();
+    } else if input_matches8(112, 111, 119, 101, 114, 111, 102, 102, 8, input_len) == 1 {
+        // "poweroff"
+        cmd_poweroff();
+    } else if input_matches8(109, 97, 108, 108, 111, 99, 0, 0, 6, input_len) == 1 {
+        // "malloc"
+        cmd_malloc();
+    } else if input_matches8(100, 105, 115, 107, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "disk"
+        cmd_disk();
+    } else if input_matches8(114, 117, 110, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "run"
+        cmd_run();
+    } else if input_matches8(101, 108, 102, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "elf" — load ELF from sector 2 and run
+        cmd_elf();
+    } else if input_matches8(116, 105, 99, 107, 115, 0, 0, 0, 5, input_len) == 1 {
+        // "ticks"
+        con_putc(10);
+        con_putc(84); con_putc(105); con_putc(99); con_putc(107); con_putc(115); // "Ticks"
+        con_putc(58); con_putc(32);
+        print_dec(timer_get_ticks());
+        con_putc(10);
+    } else if input_matches(112, 115, 0, 0, 0, 2, input_len) == 1 {
+        // "ps" — show process table
+        cmd_ps();
+    } else if input_matches(108, 115, 0, 0, 0, 2, input_len) == 1 {
+        // "ls" — list files
+        cmd_ls();
+    } else if input_prefix4(99, 97, 116, 0, 3, input_len) == 1 {
+        // "cat" — read file (needs filename after space)
+        var fname_start: i64 = 4;
+        while fname_start < input_len {
+            if input_get(fname_start) != 32 { break; }
+            fname_start = fname_start + 1;
+        }
+        if fname_start < input_len {
+            cmd_cat(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
+        } else {
             con_putc(63); con_putc(10);
         }
+    } else if input_matches(104, 97, 108, 116, 0, 4, input_len) == 1 {
+        // "halt"
+        cmd_halt();
+    } else if input_matches8(105, 108, 115, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "ils" — list initrd files
+        cmd_initrd_ls();
+    } else if input_matches8(105, 116, 114, 101, 101, 0, 0, 0, 5, input_len) == 1 {
+        // "itree" — show initrd directory tree
+        cmd_initrd_tree();
+    } else if input_prefix4(105, 99, 97, 116, 4, input_len) == 1 {
+        // "icat" — read file from initrd
+        var fname_start: i64 = 5;
+        while fname_start < input_len {
+            if input_get(fname_start) != 32 { break; }
+            fname_start = fname_start + 1;
+        }
+        if fname_start < input_len {
+            cmd_initrd_cat(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
+        } else {
+            con_putc(63); con_putc(10);
+        }
+    } else if input_matches8(112, 99, 105, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "pci" — list PCI devices
+        cmd_pci();
+    } else if input_prefix8(116, 111, 117, 99, 104, 0, 0, 0, 5, input_len) == 1 {
+        // "touch" — create empty file
+        var fname_start: i64 = 6;
+        while fname_start < input_len {
+            if input_get(fname_start) != 32 { break; }
+            fname_start = fname_start + 1;
+        }
+        if fname_start < input_len {
+            cmd_touch(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
+        } else {
+            con_putc(63); con_putc(10);
+        }
+    } else if input_prefix4(114, 109, 0, 0, 2, input_len) == 1 {
+        // "rm" — delete file
+        var fname_start: i64 = 3;
+        while fname_start < input_len {
+            if input_get(fname_start) != 32 { break; }
+            fname_start = fname_start + 1;
+        }
+        if fname_start < input_len {
+            cmd_rm(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
+        } else {
+            con_putc(63); con_putc(10);
+        }
+    } else if input_matches8(97, 99, 112, 105, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "acpi" — show ACPI info
+        cmd_acpi();
+    } else if input_matches8(118, 109, 0, 0, 0, 0, 0, 0, 2, input_len) == 1 {
+        // "vm" — test VM mapping
+        cmd_vm();
+    } else if input_matches8(109, 111, 117, 115, 101, 0, 0, 0, 5, input_len) == 1 {
+        // "mouse" — show mouse state
+        cmd_mouse();
+    } else if input_matches8(97, 112, 105, 99, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "apic" — init/show APIC
+        cmd_apic();
+    } else if input_matches8(104, 101, 97, 112, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "heap" — show heap info
+        con_putc(10);
+        con_putc(110); con_putc(101); con_putc(120); con_putc(116); con_putc(58); con_putc(32); // "next: "
+        print_hex(heap_next);
+        con_putc(10);
+    } else if input_matches8(102, 114, 101, 101, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "free" — test heap free
+        con_putc(10);
+        var p1: i64 = heap_alloc(64);
+        var p2: i64 = heap_alloc(128);
+        heap_free(p1);
+        heap_free(p2);
+        con_putc(79); con_putc(75); // "OK"
+        con_putc(10);
+    } else if input_matches8(110, 101, 116, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "net" — init/show network
+        cmd_net();
+    } else if input_matches8(97, 114, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "arp" — show ARP table
+        cmd_arp();
+    } else if input_matches8(112, 115, 116, 97, 116, 115, 0, 0, 6, input_len) == 1 {
+        // "pstats" — ping statistics
+        cmd_ping_stats();
+    } else if input_matches8(100, 104, 99, 112, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "dhcp" — DHCP client
+        cmd_dhcp();
+    } else if input_matches8(116, 104, 114, 101, 97, 100, 115, 0, 7, input_len) == 1 {
+        // "threads" — show kernel threads
+        cmd_threads();
+    } else if input_matches8(115, 99, 104, 101, 100, 0, 0, 0, 5, input_len) == 1 {
+        // "sched" — show scheduler status
+        cmd_sched();
+    } else if input_matches8(102, 98, 0, 0, 0, 0, 0, 0, 2, input_len) == 1 {
+        // "fb" — show framebuffer info
+        cmd_fb();
+    } else if input_matches8(115, 109, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "smp" — boot SMP
+        cmd_smp();
+    } else if input_matches8(100, 109, 97, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "dma" — show DMA info
+        cmd_dma();
+    } else if input_matches8(112, 105, 110, 103, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "ping" — send ICMP echo
+        cmd_ping(0x0A000202);  // ping 10.0.2.2
+    } else if input_matches8(116, 99, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "tcp" — test TCP connection to 10.0.2.2:80
+        cmd_tcp();
+    } else if input_matches(118, 97, 114, 115, 0, 4, input_len) == 1 {
+        // "vars" — show variables
+        cmd_vars();
+    } else {
+        // Unknown
+        con_putc(63); con_putc(10);
     }
 }

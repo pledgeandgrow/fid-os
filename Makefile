@@ -18,8 +18,8 @@
 
 # Use the self-hosted Fides compiler (fides-c3.exe) by default.
 # Fall back to the Rust bootstrap compiler (fidesc) if not available.
-FIDES_SELFHOST = /home/medzer/pledge/p-lang/release/fides-c3.exe
-FIDES_RUST     = /home/medzer/pledge/p-lang/target/release/fidesc
+FIDES_SELFHOST = ../p-lang/release/fides-c3.exe
+FIDES_RUST     = ../p-lang/target/release/fidesc.exe
 FIDES = $(shell if [ -x "$(FIDES_SELFHOST)" ]; then echo "$(FIDES_SELFHOST)"; else echo "$(FIDES_RUST)"; fi)
 QEMU      = qemu-system-x86_64
 GRUB_MKRESCUE = grub-mkrescue

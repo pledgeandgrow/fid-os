@@ -1,0 +1,125 @@
+// kernel/elf.fd — ELF64 loader for bare-metal mode
+// Parses ELF header, validates magic, loads PT_LOAD segments, returns entry.
+
+module elf;
+
+use console;
+use ata;
+
+pub const ELF_MAGIC0: i64 = 0x7F;
+pub const ELF_MAGIC1: i64 = 0x45;  // 'E'
+pub const ELF_MAGIC2: i64 = 0x4C;  // 'L'
+pub const ELF_MAGIC3: i64 = 0x46;  // 'F'
+pub const ELF_CLASS_64: i64 = 2;
+pub const ELF_MACHINE_X86_64: i64 = 62;
+pub const PT_LOAD: i64 = 1;
+
+// Read a little-endian u16 from a memory buffer
+pub fn elf_read_u16(buf: i64, offset: i64) -> i64 {
+    var b0: i64 = p_mem_read8(buf + offset);
+    var b1: i64 = p_mem_read8(buf + offset + 1);
+    return b0 | (b1 << 8);
+}
+
+// Read a little-endian u32 from a memory buffer
+pub fn elf_read_u32(buf: i64, offset: i64) -> i64 {
+    var b0: i64 = p_mem_read8(buf + offset);
+    var b1: i64 = p_mem_read8(buf + offset + 1);
+    var b2: i64 = p_mem_read8(buf + offset + 2);
+    var b3: i64 = p_mem_read8(buf + offset + 3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Read a little-endian u64 from a memory buffer
+pub fn elf_read_u64(buf: i64, offset: i64) -> i64 {
+    var lo: i64 = elf_read_u32(buf, offset);
+    var hi: i64 = elf_read_u32(buf, offset + 4);
+    return lo | (hi << 32);
+}
+
+// Check if a buffer contains a valid ELF64 header
+pub fn elf_is_valid(buf: i64) -> i64 {
+    if p_mem_read8(buf + 0) != ELF_MAGIC0 { return 0; }
+    if p_mem_read8(buf + 1) != ELF_MAGIC1 { return 0; }
+    if p_mem_read8(buf + 2) != ELF_MAGIC2 { return 0; }
+    if p_mem_read8(buf + 3) != ELF_MAGIC3 { return 0; }
+    if p_mem_read8(buf + 4) != ELF_CLASS_64 { return 0; }
+    var machine: i64 = elf_read_u16(buf, 18);
+    if machine != ELF_MACHINE_X86_64 { return 0; }
+    return 1;
+}
+
+// Load an ELF64 binary from a memory buffer. Returns entry point or 0 on error.
+pub fn elf_load(buf: i64) -> i64 {
+    if elf_is_valid(buf) == 0 { return 0; }
+
+    // Parse ELF header
+    var entry: i64 = elf_read_u64(buf, 24);
+    var phoff: i64 = elf_read_u64(buf, 32);
+    var phentsize: i64 = elf_read_u16(buf, 54);
+    var phnum: i64 = elf_read_u16(buf, 56);
+
+    // Load all PT_LOAD segments
+    var i: i64 = 0;
+    while i < phnum {
+        var phdr_offset: i64 = phoff + i * phentsize;
+        var ptype: i64 = elf_read_u32(buf, phdr_offset);
+        if ptype == PT_LOAD {
+            var p_offset: i64 = elf_read_u64(buf, phdr_offset + 8);
+            var p_vaddr: i64 = elf_read_u64(buf, phdr_offset + 16);
+            var p_filesz: i64 = elf_read_u64(buf, phdr_offset + 32);
+            var p_memsz: i64 = elf_read_u64(buf, phdr_offset + 40);
+
+            // Copy file contents to virtual address
+            var j: i64 = 0;
+            while j < p_filesz {
+                var byte: i64 = p_mem_read8(buf + p_offset + j);
+                p_mem_write8(p_vaddr + j, byte);
+                j = j + 1;
+            }
+            // Zero out BSS (memsz - filesz)
+            var k: i64 = p_filesz;
+            while k < p_memsz {
+                p_mem_write8(p_vaddr + k, 0);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    return entry;
+}
+
+// Load and run an ELF program from disk sector 2.
+pub fn cmd_elf() -> void {
+    con_putc(10);
+    con_putc(76); con_putc(111); con_putc(97); con_putc(100); con_putc(105); con_putc(110); con_putc(103); // "Loading"
+    con_putc(32); con_putc(69); con_putc(76); con_putc(70); con_putc(32); con_putc(102); con_putc(114); con_putc(111); con_putc(109); // " ELF from"
+    con_putc(32); con_putc(115); con_putc(101); con_putc(99); con_putc(116); con_putc(111); con_putc(114); con_putc(32); con_putc(50); // " sector 2"
+    con_putc(46); con_putc(46); con_putc(46);
+    con_putc(10);
+    // Read sector 2 into buffer at 0x20000
+    var ok: i64 = ata_read_sector(2, 0x20000);
+    if ok != 0 {
+        con_putc(70); con_putc(97); con_putc(105); con_putc(108); con_putc(101); con_putc(100); // "Failed"
+        con_putc(32); con_putc(116); con_putc(111); con_putc(32); con_putc(114); con_putc(101); con_putc(97); con_putc(100); // " to read"
+        con_putc(10);
+    } else {
+        // Parse ELF
+        var entry: i64 = elf_load(0x20000);
+        if entry == 0 {
+            con_putc(78); con_putc(111); con_putc(116); con_putc(32); con_putc(97); con_putc(110); con_putc(32); con_putc(69); con_putc(76); con_putc(70); // "Not an ELF"
+            con_putc(10);
+        } else {
+            con_putc(69); con_putc(110); con_putc(116); con_putc(114); con_putc(121); con_putc(58); con_putc(32); // "Entry: "
+            print_hex(entry);
+            con_putc(10);
+            // Enter user mode with the ELF entry point
+            con_putc(74); con_putc(117); con_putc(109); con_putc(112); con_putc(105); con_putc(110); con_putc(103); // "Jumping"
+            con_putc(32); con_putc(116); con_putc(111); con_putc(32); con_putc(117); con_putc(115); con_putc(101); con_putc(114); // " to user"
+            con_putc(32); con_putc(109); con_putc(111); con_putc(100); con_putc(101); // " mode"
+            con_putc(10);
+            p_enter_user_mode(entry, 0x12000);
+        }
+    }
+}

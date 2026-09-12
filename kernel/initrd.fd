@@ -1,0 +1,216 @@
+// kernel/initrd.fd — Initrd ramdisk (VFS)
+// Simple ramdisk loaded from disk sector 10.
+// Format: u32 num_entries, then per-entry: u32 name_len, name, u32 type, u64 size, u64 offset
+// File data follows the header.
+
+module initrd;
+
+use console;
+use ata;
+
+pub const INITRD_SECTOR: i64 = 10;
+pub const INITRD_BUF: i64 = 0x140000;   // 1.25MB: ramdisk loaded here (above kernel)
+pub const INITRD_LOADED: i64 = 0x695;   // 1 byte flag
+pub const INITRD_NUM_ENTRIES: i64 = 0x696; // 4 bytes
+
+pub fn initrd_load() -> i64 {
+    var result: i64 = ata_read_sector(INITRD_SECTOR, INITRD_BUF);
+    if result != 0 { return -1; }
+    var num: i64 = p_mem_read32(INITRD_BUF);
+    p_mem_write8(INITRD_LOADED, 1);
+    p_mem_write32(INITRD_NUM_ENTRIES, num);
+    return num;
+}
+
+pub fn initrd_num_entries() -> i64 {
+    if p_mem_read8(INITRD_LOADED) != 1 { return 0; }
+    return p_mem_read32(INITRD_NUM_ENTRIES);
+}
+
+// Get entry header offset by index
+pub fn initrd_entry_offset(index: i64) -> i64 {
+    // Skip u32 num_entries (4 bytes), then iterate to find the index-th entry
+    var offset: i64 = 4;
+    var i: i64 = 0;
+    while i < index {
+        var name_len: i64 = p_mem_read32(INITRD_BUF + offset);
+        offset = offset + 4 + name_len + 4 + 8 + 8; // name_len + name + type + size + data_offset
+        i = i + 1;
+    }
+    return offset;
+}
+
+// Get entry name by index (writes to a buffer, returns length)
+pub fn initrd_get_name(index: i64, buf: i64) -> i64 {
+    var off: i64 = initrd_entry_offset(index);
+    var name_len: i64 = p_mem_read32(INITRD_BUF + off);
+    var i: i64 = 0;
+    while i < name_len {
+        p_mem_write8(buf + i, p_mem_read8(INITRD_BUF + off + 4 + i));
+        i = i + 1;
+    }
+    return name_len;
+}
+
+// Get entry size by index
+pub fn initrd_get_size(index: i64) -> i64 {
+    var off: i64 = initrd_entry_offset(index);
+    var name_len: i64 = p_mem_read32(INITRD_BUF + off);
+    // size is at off + 4 + name_len + 4
+    var size_off: i64 = off + 4 + name_len + 4;
+    return p_mem_read64(INITRD_BUF + size_off);
+}
+
+// Get entry data offset by index
+pub fn initrd_get_data_offset(index: i64) -> i64 {
+    var off: i64 = initrd_entry_offset(index);
+    var name_len: i64 = p_mem_read32(INITRD_BUF + off);
+    // data_offset is at off + 4 + name_len + 4 + 8
+    var doff: i64 = off + 4 + name_len + 4 + 8;
+    return p_mem_read64(INITRD_BUF + doff);
+}
+
+// Find file by name (returns index or -1)
+pub fn initrd_find(name_addr: i64, name_len: i64) -> i64 {
+    var num: i64 = initrd_num_entries();
+    var i: i64 = 0;
+    while i < num {
+        var entry_name_len: i64 = initrd_get_name(i, INPUT_BUF_ADDR + 256);
+        if entry_name_len == name_len {
+            var is_match: i64 = 1;
+            var j: i64 = 0;
+            while j < name_len {
+                if p_mem_read8(INPUT_BUF_ADDR + 256 + j) != p_mem_read8(name_addr + j) {
+                    is_match = 0;
+                }
+                j = j + 1;
+            }
+            if is_match == 1 { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// List initrd files
+pub fn cmd_initrd_ls() -> void {
+    con_putc(10);
+    if p_mem_read8(INITRD_LOADED) != 1 {
+        con_putc(78); con_putc(111); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116); con_putc(114); con_putc(100); // "No initrd"
+        con_putc(10);
+        return;
+    }
+    var num: i64 = initrd_num_entries();
+    var i: i64 = 0;
+    while i < num {
+        var name_len: i64 = initrd_get_name(i, INPUT_BUF_ADDR + 256);
+        var j: i64 = 0;
+        while j < name_len {
+            con_putc(p_mem_read8(INPUT_BUF_ADDR + 256 + j));
+            j = j + 1;
+        }
+        con_putc(32);
+        var size: i64 = initrd_get_size(i);
+        print_dec(size);
+        con_putc(32); con_putc(66); // " B"
+        con_putc(10);
+        i = i + 1;
+    }
+}
+
+// Get entry type by index (0=file, 1=directory)
+pub fn initrd_get_type(index: i64) -> i64 {
+    var off: i64 = initrd_entry_offset(index);
+    var name_len: i64 = p_mem_read32(INITRD_BUF + off);
+    // type is at off + 4 + name_len
+    return p_mem_read32(INITRD_BUF + off + 4 + name_len);
+}
+
+// Find file by path (supports "/" separator for hierarchical dirs)
+pub fn initrd_find_path(path_addr: i64, path_len: i64) -> i64 {
+    // For now, just match the full path against entry names
+    // (entries can contain "/" in their names for hierarchical structure)
+    return initrd_find(path_addr, path_len);
+}
+
+// List entries in a directory path (entries that start with the path prefix)
+pub fn cmd_initrd_tree() -> void {
+    con_putc(10);
+    if p_mem_read8(INITRD_LOADED) != 1 {
+        con_putc(78); con_putc(111); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116); con_putc(114); con_putc(100); // "No initrd"
+        con_putc(10);
+        return;
+    }
+    var num: i64 = initrd_num_entries();
+    con_putc(73); con_putc(110); con_putc(105); con_putc(116); con_putc(114); con_putc(100); // "Initrd"
+    con_putc(32);
+    con_putc(40); // "("
+    print_dec(num);
+    con_putc(32);
+    con_putc(101); con_putc(110); con_putc(116); con_putc(114); con_putc(105); con_putc(101); con_putc(115); // "entries"
+    con_putc(41); // ")"
+    con_putc(10);
+    var i: i64 = 0;
+    while i < num {
+        var name_len: i64 = initrd_get_name(i, INPUT_BUF_ADDR + 256);
+        var entry_type: i64 = initrd_get_type(i);
+        // Indent based on path depth (count "/" in name)
+        var depth: i64 = 0;
+        var j: i64 = 0;
+        while j < name_len {
+            if p_mem_read8(INPUT_BUF_ADDR + 256 + j) == 47 { depth = depth + 1; } // "/"
+            j = j + 1;
+        }
+        // Print indentation
+        var k: i64 = 0;
+        while k < depth {
+            con_putc(32); con_putc(32);
+            k = k + 1;
+        }
+        // Print name (last component only)
+        var last_slash: i64 = -1;
+        j = 0;
+        while j < name_len {
+            if p_mem_read8(INPUT_BUF_ADDR + 256 + j) == 47 { last_slash = j; }
+            j = j + 1;
+        }
+        j = last_slash + 1;
+        while j < name_len {
+            con_putc(p_mem_read8(INPUT_BUF_ADDR + 256 + j));
+            j = j + 1;
+        }
+        // Print type indicator
+        if entry_type == 1 {
+            con_putc(47); // "/" for directories
+        }
+        con_putc(32);
+        var size: i64 = initrd_get_size(i);
+        print_dec(size);
+        con_putc(10);
+        i = i + 1;
+    }
+}
+
+// Cat a file from initrd
+pub fn cmd_initrd_cat(name_addr: i64, name_len: i64) -> void {
+    con_putc(10);
+    if p_mem_read8(INITRD_LOADED) != 1 {
+        con_putc(78); con_putc(111); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116); con_putc(114); con_putc(100); // "No initrd"
+        con_putc(10);
+        return;
+    }
+    var idx: i64 = initrd_find(name_addr, name_len);
+    if idx < 0 {
+        con_putc(78); con_putc(111); con_putc(116); con_putc(32); con_putc(102); con_putc(111); con_putc(117); con_putc(110); con_putc(100); // "Not found"
+        con_putc(10);
+        return;
+    }
+    var size: i64 = initrd_get_size(idx);
+    var doff: i64 = initrd_get_data_offset(idx);
+    var i: i64 = 0;
+    while i < size {
+        con_putc(p_mem_read8(INITRD_BUF + doff + i));
+        i = i + 1;
+    }
+    con_putc(10);
+}

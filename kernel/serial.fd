@@ -1,0 +1,11 @@
+// kernel/serial.fd — Serial output (COM1)
+
+module serial;
+
+pub fn serial_putc(c: i64) -> void {
+    var ready: i64 = 0;
+    while ready == 0 {
+        ready = p_inb(0x3FD) & 0x20;
+    }
+    p_outb(0x3F8, c);
+}

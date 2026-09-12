@@ -1,328 +1,109 @@
-// stdlib/pci.fd — PCI bus enumeration and config space access
-//
-// Provides:
-//   - PCI config space access (0xCF8/0xCFC)
-//   - Device enumeration (bus/device/function scan)
-//   - BAR (Base Address Register) parsing
-//   - IRQ routing
-//   - Device class identification
-//
-// Usage:
-//   use pci;
-//   pci_init();
-//   var count = pci_scan();
-//   var i = 0;
-//   while i < count {
-//       var dev = pci_get_device(i);
-//       // dev.vendor, dev.device, dev.class, dev.bar[0]...
-//       i = i + 1;
-//   }
-//
-// Only works in --bare or --boot mode.
+// kernel/pci.fd — PCI bus enumeration
+// PCI config space access via ports 0xCF8 (address) and 0xCFC (data)
 
 module pci;
 
-use vec;
-use string;
+use console;
 
-// ─── PCI Config Space Ports ───────────────────────────────────────────────
+pub const PCI_ADDR: i64 = 0xCF8;
+pub const PCI_DATA: i64 = 0xCFC;
 
-const PCI_CONFIG_ADDR: i64 = 0xCF8;
-const PCI_CONFIG_DATA: i64 = 0xCFC;
-
-const PCI_MAX_BUSES: i64 = 256;
-const PCI_MAX_DEVICES: i64 = 32;
-const PCI_MAX_FUNCTIONS: i64 = 8;
-
-// ─── PCI Config Register Offsets ──────────────────────────────────────────
-
-const PCI_VENDOR_ID:   i64 = 0x00;
-const PCI_DEVICE_ID:   i64 = 0x02;
-const PCI_COMMAND:     i64 = 0x04;
-const PCI_STATUS:      i64 = 0x06;
-const PCI_REVISION:    i64 = 0x08;
-const PCI_PROG_IF:     i64 = 0x09;
-const PCI_SUBCLASS:    i64 = 0x0A;
-const PCI_CLASS:        i64 = 0x0B;
-const PCI_CACHE_SIZE:  i64 = 0x0C;
-const PCI_LATENCY:     i64 = 0x0D;
-const PCI_HEADER_TYPE: i64 = 0x0E;
-const PCI_BIST:        i64 = 0x0F;
-const PCI_BAR0:        i64 = 0x10;
-const PCI_BAR1:        i64 = 0x14;
-const PCI_BAR2:        i64 = 0x18;
-const PCI_BAR3:        i64 = 0x1C;
-const PCI_BAR4:        i64 = 0x20;
-const PCI_BAR5:        i64 = 0x24;
-const PCI_INTERRUPT_LINE: i64 = 0x3C;
-const PCI_INTERRUPT_PIN:  i64 = 0x3D;
-
-// ─── PCI Device Classes ───────────────────────────────────────────────────
-
-const PCI_CLASS_UNCLASSIFIED:    i64 = 0x00;
-const PCI_CLASS_STORAGE:          i64 = 0x01;
-const PCI_CLASS_NETWORK:          i64 = 0x02;
-const PCI_CLASS_DISPLAY:          i64 = 0x03;
-const PCI_CLASS_MULTIMEDIA:       i64 = 0x04;
-const PCI_CLASS_MEMORY:           i64 = 0x05;
-const PCI_CLASS_BRIDGE:           i64 = 0x06;
-const PCI_CLASS_COMMUNICATION:    i64 = 0x07;
-const PCI_CLASS_GENERIC_SYSTEM:   i64 = 0x08;
-const PCI_CLASS_INPUT:            i64 = 0x09;
-const PCI_CLASS_DOCKING:          i64 = 0x0A;
-const PCI_CLASS_PROCESSOR:        i64 = 0x0B;
-const PCI_CLASS_SERIAL_BUS:       i64 = 0x0C;
-const PCI_CLASS_WIRELESS:         i64 = 0x0D;
-const PCI_CLASS_INTELLIGENT_IO:   i64 = 0x0E;
-const PCI_CLASS_SATELLITE:        i64 = 0x0F;
-const PCI_CLASS_ENCRYPTION:       i64 = 0x10;
-const PCI_CLASS_SIGNAL_PROCESSING: i64 = 0x11;
-const PCI_CLASS_PROCESSOR_ACCEL:  i64 = 0x12;
-
-// ─── PCI Device Structure ─────────────────────────────────────────────────
-
-pub struct PciDevice {
-    pub bus: i64,
-    pub device: i64,
-    pub func: i64,
-    pub vendor_id: i64,
-    pub device_id: i64,
-    pub class: i64,
-    pub subclass: i64,
-    pub prog_if: i64,
-    pub revision: i64,
-    pub header_type: i64,
-    pub bars: Vec<i64>,
-    pub interrupt_line: i64,
-    pub interrupt_pin: i64,
+pub fn pci_config_read(bus: i64, dev: i64, func: i64, offset: i64) -> i64 {
+    // Enable bit 31, bus 23-16, dev 15-11, func 10-8, offset 7-2
+    var addr: i64 = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC);
+    p_outl(PCI_ADDR, addr);
+    return p_inl(PCI_DATA);
 }
 
-var devices: Vec<PciDevice> = Vec::new();
-
-// ─── Config Space Access ──────────────────────────────────────────────────
-
-fn pci_config_address(bus: i64, device: i64, func: i64, offset: i64) -> i64 {
-    return (1 << 31) | (bus << 16) | (device << 11) | (func << 8) | (offset & 0xFC);
+pub fn pci_config_write(bus: i64, dev: i64, func: i64, offset: i64, val: i64) {
+    var addr: i64 = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC);
+    p_outl(PCI_ADDR, addr);
+    p_outl(PCI_DATA, val);
 }
 
-pub fn pci_config_read32(bus: i64, device: i64, func: i64, offset: i64) -> i64 {
-    var addr: i64 = pci_config_address(bus, device, func, offset);
-    p_outl(PCI_CONFIG_ADDR, addr);
-    return p_inl(PCI_CONFIG_DATA);
+pub fn pci_get_vendor(bus: i64, dev: i64, func: i64) -> i64 {
+    return pci_config_read(bus, dev, func, 0) & 0xFFFF;
 }
 
-pub fn pci_config_read16(bus: i64, device: i64, func: i64, offset: i64) -> i64 {
-    var val: i64 = pci_config_read32(bus, device, func, offset & ~3);
-    var shift: i64 = (offset & 2) * 8;
-    return (val >> shift) & 0xFFFF;
+pub fn pci_get_device(bus: i64, dev: i64, func: i64) -> i64 {
+    return (pci_config_read(bus, dev, func, 0) >> 16) & 0xFFFF;
 }
 
-pub fn pci_config_read8(bus: i64, device: i64, func: i64, offset: i64) -> i64 {
-    var val: i64 = pci_config_read32(bus, device, func, offset & ~3);
-    var shift: i64 = (offset & 3) * 8;
-    return (val >> shift) & 0xFF;
+pub fn pci_get_class(bus: i64, dev: i64, func: i64) -> i64 {
+    return (pci_config_read(bus, dev, func, 8) >> 24) & 0xFF;
 }
 
-pub fn pci_config_write32(bus: i64, device: i64, func: i64, offset: i64, val: i64) {
-    var addr: i64 = pci_config_address(bus, device, func, offset);
-    p_outl(PCI_CONFIG_ADDR, addr);
-    p_outl(PCI_CONFIG_DATA, val);
+pub fn pci_get_subclass(bus: i64, dev: i64, func: i64) -> i64 {
+    return (pci_config_read(bus, dev, func, 8) >> 16) & 0xFF;
 }
 
-pub fn pci_config_write16(bus: i64, device: i64, func: i64, offset: i64, val: i64) {
-    var addr: i64 = pci_config_address(bus, device, func, offset);
-    p_outl(PCI_CONFIG_ADDR, addr);
-    var current: i64 = p_inl(PCI_CONFIG_DATA);
-    var shift: i64 = (offset & 2) * 8;
-    var mask: i64 = 0xFFFF << shift;
-    var new_val: i64 = (current & ~mask) | ((val << shift) & mask);
-    p_outl(PCI_CONFIG_ADDR, addr);
-    p_outl(PCI_CONFIG_DATA, new_val);
-}
-
-// ─── Device Enumeration ───────────────────────────────────────────────────
-
-pub fn pci_init() {
-    devices = Vec::new();
-}
+// PCI device table at 0x150000 (up to 256 entries × 16 bytes)
+pub const PCI_TABLE: i64 = 0x150000;
+pub var pci_device_count: i64 = 0;
 
 pub fn pci_scan() -> i64 {
-    devices = Vec::new();
-
+    pci_device_count = 0;
     var bus: i64 = 0;
-    while bus < PCI_MAX_BUSES {
-        var device: i64 = 0;
-        while device < PCI_MAX_DEVICES {
+    while bus < 256 {
+        var dev: i64 = 0;
+        while dev < 32 {
             var func: i64 = 0;
-            while func < PCI_MAX_FUNCTIONS {
-                var vendor: i64 = pci_config_read16(bus, device, func, PCI_VENDOR_ID);
+            while func < 8 {
+                var vendor: i64 = pci_get_vendor(bus, dev, func);
                 if vendor != 0xFFFF {
-                    pci_add_device(bus, device, func, vendor);
+                    var device: i64 = pci_get_device(bus, dev, func);
+                    var class_code: i64 = pci_get_class(bus, dev, func);
+                    var subclass: i64 = pci_get_subclass(bus, dev, func);
+                    // Store in table: vendor, device, class, subclass
+                    var idx: i64 = pci_device_count * 16;
+                    p_mem_write64(PCI_TABLE + idx, vendor);
+                    p_mem_write64(PCI_TABLE + idx + 8, (device << 48) | (class_code << 40) | (subclass << 32) | (bus << 16) | (dev << 8) | func);
+                    pci_device_count = pci_device_count + 1;
+                    if pci_device_count >= 256 { return pci_device_count; }
                 }
                 func = func + 1;
             }
-            device = device + 1;
+            dev = dev + 1;
         }
         bus = bus + 1;
     }
-
-    return devices.len();
+    return pci_device_count;
 }
 
-fn pci_add_device(bus: i64, device: i64, func: i64, vendor: i64) {
-    var dev_id: i64 = pci_config_read16(bus, device, func, PCI_DEVICE_ID);
-    var class: i64 = pci_config_read8(bus, device, func, PCI_CLASS);
-    var subclass: i64 = pci_config_read8(bus, device, func, PCI_SUBCLASS);
-    var prog_if: i64 = pci_config_read8(bus, device, func, PCI_PROG_IF);
-    var revision: i64 = pci_config_read8(bus, device, func, PCI_REVISION);
-    var header_type: i64 = pci_config_read8(bus, device, func, PCI_HEADER_TYPE);
-    var int_line: i64 = pci_config_read8(bus, device, func, PCI_INTERRUPT_LINE);
-    var int_pin: i64 = pci_config_read8(bus, device, func, PCI_INTERRUPT_PIN);
-
-    var bars: Vec<i64> = Vec::new();
+pub fn cmd_pci() -> void {
+    con_putc(10);
+    // "PCI Devices:"
+    con_putc(80); con_putc(67); con_putc(73); con_putc(32); con_putc(68); con_putc(101); con_putc(118); con_putc(105); con_putc(99); con_putc(101); con_putc(115); con_putc(58);
+    con_putc(10);
     var i: i64 = 0;
-    while i < 6 {
-        bars.push(pci_config_read32(bus, device, func, PCI_BAR0 + i * 4));
+    while i < pci_device_count {
+        var idx: i64 = i * 16;
+        var vendor: i64 = p_mem_read64(PCI_TABLE + idx);
+        var packed_val: i64 = p_mem_read64(PCI_TABLE + idx + 8);
+        var device: i64 = (packed_val >> 48) & 0xFFFF;
+        var class_code: i64 = (packed_val >> 40) & 0xFF;
+        var bus: i64 = (packed_val >> 16) & 0xFF;
+        var dev: i64 = (packed_val >> 8) & 0xFF;
+        var func: i64 = packed_val & 0xFF;
+        // Print bus:dev.func vendor:device class
+        print_dec(bus); con_putc(58); print_dec(dev); con_putc(46); print_dec(func);
+        con_putc(32);
+        con_putc(118); con_putc(101); con_putc(110); con_putc(100); con_putc(111); con_putc(114); con_putc(58); // "vendor:"
+        con_putc(32);
+        print_hex(vendor);
+        con_putc(32);
+        con_putc(100); con_putc(101); con_putc(118); con_putc(58); // "dev:"
+        con_putc(32);
+        print_hex(device);
+        con_putc(32);
+        con_putc(99); con_putc(108); con_putc(115); con_putc(58); // "cls:"
+        con_putc(32);
+        print_hex(class_code);
+        con_putc(10);
         i = i + 1;
     }
-
-    devices.push(PciDevice {
-        bus: bus,
-        device: device,
-        func: func,
-        vendor_id: vendor,
-        device_id: dev_id,
-        class: class,
-        subclass: subclass,
-        prog_if: prog_if,
-        revision: revision,
-        header_type: header_type,
-        bars: bars,
-        interrupt_line: int_line,
-        interrupt_pin: int_pin,
-    });
-}
-
-pub fn pci_get_device(index: i64) -> PciDevice {
-    return devices.get(index);
-}
-
-pub fn pci_device_count() -> i64 {
-    return devices.len();
-}
-
-// ─── BAR Parsing ──────────────────────────────────────────────────────────
-
-pub fn pci_bar_address(bar: i64) -> i64 {
-    if (bar & 1) != 0 {
-        // I/O space: bit 0 = 1
-        return bar & ~0x3;
-    } else {
-        // Memory space: bit 0 = 0
-        if ((bar >> 1) & 3) == 0 {
-            // 32-bit memory
-            return bar & ~0xF;
-        } else if ((bar >> 1) & 3) == 2 {
-            // 64-bit memory (lower 32 bits)
-            return bar & ~0xF;
-        }
-        return bar & ~0xF;
+    if pci_device_count == 0 {
+        con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
+        con_putc(10);
     }
-}
-
-pub fn pci_bar_is_io(bar: i64) -> bool {
-    return (bar & 1) != 0;
-}
-
-pub fn pci_bar_is_64bit(bar: i64) -> bool {
-    if (bar & 1) != 0 { return false; }  // I/O
-    return ((bar >> 1) & 3) == 2;
-}
-
-pub fn pci_bar_size(bar: i64) -> i64 {
-    // Write 0xFFFFFFFF to BAR, read back, then restore
-    // The size is ~(value & ~0xF) + 1 for memory, ~(value & ~3) + 1 for I/O
-    // This requires write access — caller must provide bus/dev/func
-    return 0;  // stub — requires bus/dev/func context
-}
-
-// ─── Device Class Names ───────────────────────────────────────────────────
-
-pub fn pci_class_name(class: i64) -> str {
-    if class == PCI_CLASS_STORAGE { return "Storage"; }
-    if class == PCI_CLASS_NETWORK { return "Network"; }
-    if class == PCI_CLASS_DISPLAY { return "Display"; }
-    if class == PCI_CLASS_MULTIMEDIA { return "Multimedia"; }
-    if class == PCI_CLASS_MEMORY { return "Memory"; }
-    if class == PCI_CLASS_BRIDGE { return "Bridge"; }
-    if class == PCI_CLASS_COMMUNICATION { return "Communication"; }
-    if class == PCI_CLASS_INPUT { return "Input"; }
-    if class == PCI_CLASS_PROCESSOR { return "Processor"; }
-    if class == PCI_CLASS_SERIAL_BUS { return "Serial Bus"; }
-    if class == PCI_CLASS_WIRELESS { return "Wireless"; }
-    return "Unknown";
-}
-
-// ─── Common Vendor Names ───────────────────────────────────────────────────
-
-pub fn pci_vendor_name(vendor_id: i64) -> str {
-    if vendor_id == 0x8086 { return "Intel"; }
-    if vendor_id == 0x1022 { return "AMD"; }
-    if vendor_id == 0x10DE { return "NVIDIA"; }
-    if vendor_id == 0x10EC { return "Realtek"; }
-    if vendor_id == 0x80EE { return "VirtualBox"; }
-    if vendor_id == 0x1234 { return "QEMU/Bochs"; }
-    if vendor_id == 0x15AD { return "VMware"; }
-    if vendor_id == 0x1AF4 { return "Virtio"; }
-    return "Unknown (0x" + int_to_hex(vendor_id) + ")";
-}
-
-fn int_to_hex(val: i64) -> str {
-    var hex: str = "0123456789ABCDEF";
-    var result: str = "";
-    if val == 0 { return "0"; }
-    var v: i64 = val;
-    while v > 0 {
-        var digit: i64 = v & 0xF;
-        result = str_slice(hex, digit, digit + 1) + result;
-        v = v >> 4;
-    }
-    return result;
-}
-
-// ─── Device Enable ────────────────────────────────────────────────────────
-
-pub fn pci_enable_device(bus: i64, device: i64, func: i64) {
-    // Enable I/O, memory, and bus mastering
-    var cmd: i64 = pci_config_read16(bus, device, func, PCI_COMMAND);
-    cmd = cmd | 0x07;  // IO | Memory | Bus Master
-    pci_config_write16(bus, device, func, PCI_COMMAND, cmd);
-}
-
-pub fn pci_disable_device(bus: i64, device: i64, func: i64) {
-    var cmd: i64 = pci_config_read16(bus, device, func, PCI_COMMAND);
-    cmd = cmd & ~0x07;
-    pci_config_write16(bus, device, func, PCI_COMMAND, cmd);
-}
-
-// ─── Find by Class ────────────────────────────────────────────────────────
-
-pub fn pci_find_by_class(class: i64) -> i64 {
-    var i: i64 = 0;
-    while i < devices.len() {
-        var dev: PciDevice = devices.get(i);
-        if dev.class == class { return i; }
-        i = i + 1;
-    }
-    return -1;
-}
-
-pub fn pci_find_by_vendor_device(vendor: i64, device: i64) -> i64 {
-    var i: i64 = 0;
-    while i < devices.len() {
-        var dev: PciDevice = devices.get(i);
-        if dev.vendor_id == vendor && dev.device_id == device { return i; }
-        i = i + 1;
-    }
-    return -1;
 }

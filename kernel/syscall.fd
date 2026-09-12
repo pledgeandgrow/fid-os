@@ -1,286 +1,328 @@
-// stdlib/syscall.fd — User mode and syscall interface
-//
-// Provides:
-//   - Ring 0 → Ring 3 transition (user mode entry)
-//   - syscall/sysret setup (MSR STAR/LSTAR/FMASK)
-//   - Syscall table: read, write, open, close, exit, mmap, brk, etc.
-//   - TSS RSP0 for kernel stack on syscall entry
-//   - Syscall dispatch
-//
-// Usage:
-//   use syscall;
-//   syscall_init();
-//   syscall_register(1, sys_write);
-//   syscall_register(60, sys_exit);
-//
-// Only works in --bare or --boot mode.
+// kernel/syscall.fd — Syscall dispatch + user-mode program loading
+// Handles int 0x80 syscalls from ring 3 user programs.
 
 module syscall;
 
-use vec;
-use string;
+use console;
+use keyboard;
+use initrd;
+use ata;
 
-// ─── Syscall Numbers ──────────────────────────────────────────────────────
+// Syscall numbers
+pub const SYS_EXIT: i64 = 0;
+pub const SYS_WRITE: i64 = 1;
+pub const SYS_READ: i64 = 2;
+pub const SYS_OPEN: i64 = 5;
+pub const SYS_CLOSE: i64 = 6;
+pub const SYS_GETPID: i64 = 3;
+pub const SYS_YIELD: i64 = 4;
 
-const SYS_READ:    i64 = 0;
-const SYS_WRITE:   i64 = 1;
-const SYS_OPEN:    i64 = 2;
-const SYS_CLOSE:   i64 = 3;
-const SYS_EXIT:    i64 = 60;
-const SYS_MMAP:    i64 = 9;
-const SYS_BRK:     i64 = 12;
-const SYS_GETPID:  i64 = 39;
-const SYS_FORK:    i64 = 57;
-const SYS_EXEC:    i64 = 59;
-const SYS_WAIT:    i64 = 61;
+// File descriptor table at 0x190000 (16 entries × 32 bytes)
+// Each entry: in_use(4), initrd_idx(4), offset(8), size(8), reserved(8)
+pub const FD_TABLE: i64 = 0x190000;
+pub const FD_MAX: i64 = 16;
+pub const FD_ENTRY_SIZE: i64 = 32;
 
-const MAX_SYSCALLS: i64 = 512;
-
-// ─── MSR Addresses ────────────────────────────────────────────────────────
-
-const MSR_STAR:    i64 = 0xC0000081;
-const MSR_LSTAR:   i64 = 0xC0000082;
-const MSR_CSTAR:   i64 = 0xC0000083;
-const MSR_FMASK:   i64 = 0xC0000084;
-const MSR_EFER:    i64 = 0xC0000080;
-
-// EFER bits
-const EFER_SCE:    i64 = 1;     // Syscall enable
-
-// ─── GDT Selectors ────────────────────────────────────────────────────────
-
-const GDT_KERNEL_CODE: i64 = 0x08;
-const GDT_KERNEL_DATA: i64 = 0x10;
-const GDT_USER_CODE:   i64 = 0x1B;  // Ring 3 code (RPL=3)
-const GDT_USER_DATA:   i64 = 0x23;  // Ring 3 data (RPL=3)
-
-// ─── Syscall Handler Table ────────────────────────────────────────────────
-
-var syscall_table: Vec<i64> = Vec::new();
-
-// ─── Initialization ────────────────────────────────────────────────────────
-
-pub fn syscall_init() {
-    // Initialize syscall table
-    syscall_table = Vec::new();
+pub fn fd_init() -> void {
     var i: i64 = 0;
-    while i < MAX_SYSCALLS {
-        syscall_table.push(0);
+    while i < FD_MAX {
+        p_mem_write32(FD_TABLE + i * FD_ENTRY_SIZE, 0);
         i = i + 1;
     }
-
-    // Set up MSRs for syscall/sysret
-    // STAR: [63:48] = user CS, [47:32] = kernel CS
-    var star_val: i64 = (GDT_USER_CODE << 48) | (GDT_KERNEL_CODE << 32);
-    p_msr_write(MSR_STAR, star_val);
-
-    // LSTAR: syscall entry point (the assembly stub)
-    // This must be the address of the syscall entry handler
-    p_msr_write(MSR_LSTAR, syscall_entry_addr());
-
-    // FMASK: clear IF on syscall
-    p_msr_write(MSR_FMASK, 0x200);
-
-    // Enable syscall in EFER
-    var efer: i64 = p_msr_read(MSR_EFER);
-    p_msr_write(MSR_EFER, efer | EFER_SCE);
 }
 
-// ─── Syscall Registration ─────────────────────────────────────────────────
-
-pub fn syscall_register(num: i64, handler: i64) {
-    if num < 0 || num >= MAX_SYSCALLS { return; }
-    syscall_table.set(num, handler);
-}
-
-pub fn syscall_unregister(num: i64) {
-    if num < 0 || num >= MAX_SYSCALLS { return; }
-    syscall_table.set(num, 0);
-}
-
-// ─── Syscall Dispatch ─────────────────────────────────────────────────────
-
-// Called by the syscall entry stub.
-// Args: syscall number in rax, args in rdi, rsi, rdx, r10, r8, r9
-// Returns: result in rax
-pub fn syscall_dispatch(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, arg5: i64) -> i64 {
-    if num < 0 || num >= MAX_SYSCALLS { return -1; }
-
-    var handler: i64 = syscall_table.get(num);
-    if handler == 0 { return -1; }
-
-    // Call the handler function pointer
-    // In bare-metal mode: ((i64(*)(i64,i64,i64,i64,i64,i64))handler)(arg1, arg2, arg3, arg4, arg5)
-    // For now, we return -1 as we can't call function pointers directly
-    return -1;
-}
-
-// ─── Ring 3 Entry ─────────────────────────────────────────────────────────
-
-// Enter user mode (ring 3) and jump to a user program.
-// This sets up the user stack and entry point, then uses
-// sysret to transition to ring 3.
-pub fn syscall_enter_ring3(entry: i64, stack: i64, arg: i64) {
-    // Set up TSS RSP0 for kernel stack on syscall
-    // p_tss_set_rsp0(kernel_stack);
-
-    // Set up user mode:
-    // 1. Push user SS (0x23)
-    // 2. Push user RSP
-    // 3. Push RFLAGS (with IF set)
-    // 4. Push user CS (0x1B)
-    // 5. Push user RIP (entry point)
-    // 6. Set RAX = arg
-    // 7. Execute IRETQ or SYSRETQ
-
-    // In bare-metal mode, this would be inline asm:
-    //   mov ax, 0x23
-    //   mov ds, ax
-    //   mov es, ax
-    //   mov fs, ax
-    //   mov gs, ax
-    //   push 0x23        ; SS
-    //   push stack       ; RSP
-    //   push 0x202       ; RFLAGS (IF=1)
-    //   push 0x1B        ; CS
-    //   push entry       ; RIP
-    //   mov rax, arg
-    //   iretq
-
-    // For now, use the builtin
-    p_ring3_enter(entry, stack, arg);
-}
-
-// ─── Standard Syscall Implementations ────────────────────────────────────
-
-// These are stubs that a real OS would implement
-
-pub fn sys_write(fd: i64, buf: i64, count: i64) -> i64 {
-    // Write to file descriptor
-    // fd=1 (stdout), fd=2 (stderr) → serial output
-    if fd == 1 || fd == 2 {
-        var i: i64 = 0;
-        while i < count {
-            var c: i64 = p_phys_read8(buf + i);
-            p_serial_putc(c);
-            i = i + 1;
+pub fn sys_open(path: i64, path_len: i64, flags: i64) -> i64 {
+    // Find file in initrd
+    var idx: i64 = initrd_find(path, path_len);
+    if idx < 0 { return -1; }
+    var size: i64 = initrd_get_size(idx);
+    // Find a free FD slot
+    var i: i64 = 0;
+    while i < FD_MAX {
+        var in_use: i64 = p_mem_read32(FD_TABLE + i * FD_ENTRY_SIZE);
+        if in_use == 0 {
+            p_mem_write32(FD_TABLE + i * FD_ENTRY_SIZE, 1);
+            p_mem_write32(FD_TABLE + i * FD_ENTRY_SIZE + 4, idx);
+            p_mem_write32(FD_TABLE + i * FD_ENTRY_SIZE + 8, 0);  // offset
+            p_mem_write32(FD_TABLE + i * FD_ENTRY_SIZE + 12, 0);
+            p_mem_write32(FD_TABLE + i * FD_ENTRY_SIZE + 16, size);  // size
+            p_mem_write32(FD_TABLE + i * FD_ENTRY_SIZE + 20, 0);
+            return i;
         }
-        return count;
+        i = i + 1;
     }
-    return -1;
+    return -1;  // no free FDs
 }
 
-pub fn sys_read(fd: i64, buf: i64, count: i64) -> i64 {
-    // Read from file descriptor
-    // fd=0 (stdin) → keyboard
-    if fd == 0 {
-        // Read from keyboard (blocking)
-        var i: i64 = 0;
-        while i < count {
-            // Wait for key
-            p_hlt();
-            // Read key and store in buffer
-            i = i + 1;
-        }
-        return count;
-    }
-    return -1;
-}
-
-pub fn sys_exit(code: i64) -> i64 {
-    // Terminate current process
-    // In a real OS, this would:
-    // 1. Clean up resources
-    // 2. Switch to scheduler
-    // For now, just halt
-    p_cli();
-    p_hlt();
-    return code;
-}
-
-pub fn sys_getpid() -> i64 {
-    // Return current process ID
-    return 1;  // stub
-}
-
-// ─── Syscall Entry Address ────────────────────────────────────────────────
-
-// This returns the address of the syscall entry assembly stub.
-// The stub saves registers, calls syscall_dispatch, and returns via sysret.
-// In a real implementation, this would be a label in the kernel's
-// assembly code.
-fn syscall_entry_addr() -> i64 {
-    // The actual address would be set by the linker or runtime.
-    // For now, return 0 — the real address must be registered.
+pub fn sys_close(fd: i64) -> i64 {
+    if fd < 0 || fd >= FD_MAX { return -1; }
+    p_mem_write32(FD_TABLE + fd * FD_ENTRY_SIZE, 0);
     return 0;
 }
 
-pub fn syscall_set_entry(addr: i64) {
-    p_msr_write(MSR_LSTAR, addr);
-}
-
-// ─── User Mode Helpers ────────────────────────────────────────────────────
-
-// Set up user segment selectors
-pub fn syscall_setup_user_segments() {
-    // In bare-metal mode:
-    //   mov ax, 0x23  ; user data segment
-    //   mov ds, ax
-    //   mov es, ax
-    //   mov fs, ax
-    //   mov gs, ax
-    // For now, this is a stub
-}
-
-// Check if we're in ring 0 (kernel mode)
-pub fn syscall_is_kernel() -> bool {
-    var cs: i64 = 0;
-    // Read CS register
-    // In bare-metal mode: asm!("mov %cs, %0" : "=r"(cs));
-    return (cs & 3) == 0;
-}
-
-// ─── File Descriptor Table ────────────────────────────────────────────────
-
-const MAX_FDS: i64 = 256;
-
-pub struct FileDescriptor {
-    pub used: bool,
-    pub type: i64,     // 0=stdin, 1=stdout, 2=stderr, 3=file, 4=pipe, 5=socket
-    pub data: i64,    // type-specific data (file offset, pipe id, etc.)
-}
-
-var fd_table: Vec<FileDescriptor> = Vec::new();
-
-pub fn syscall_init_fds() {
-    fd_table = Vec::new();
+pub fn sys_read_fd(fd: i64, buf: i64, len: i64) -> i64 {
+    // Read from a file descriptor (for SYS_READ with fd)
+    if fd < 0 || fd >= FD_MAX { return -1; }
+    var in_use: i64 = p_mem_read32(FD_TABLE + fd * FD_ENTRY_SIZE);
+    if in_use == 0 { return -1; }
+    var idx: i64 = p_mem_read32(FD_TABLE + fd * FD_ENTRY_SIZE + 4);
+    var offset: i64 = p_mem_read32(FD_TABLE + fd * FD_ENTRY_SIZE + 8);
+    var size: i64 = p_mem_read32(FD_TABLE + fd * FD_ENTRY_SIZE + 16);
+    var doff: i64 = initrd_get_data_offset(idx);
     var i: i64 = 0;
-    while i < MAX_FDS {
-        fd_table.push(FileDescriptor { used: false, type: 0, data: 0 });
+    while i < len && offset < size {
+        p_mem_write8(buf + i, p_mem_read8(INITRD_BUF + doff + offset));
+        offset = offset + 1;
         i = i + 1;
     }
-
-    // Set up standard descriptors
-    var stdin: FileDescriptor = fd_table.get(0);
-    stdin.used = true; stdin.type = 0;
-    fd_table.set(0, stdin);
-
-    var stdout: FileDescriptor = fd_table.get(1);
-    stdout.used = true; stdout.type = 1;
-    fd_table.set(1, stdout);
-
-    var stderr: FileDescriptor = fd_table.get(2);
-    stderr.used = true; stderr.type = 2;
-    fd_table.set(2, stderr);
+    p_mem_write32(FD_TABLE + fd * FD_ENTRY_SIZE + 8, offset);
+    return i;
 }
 
-pub fn syscall_alloc_fd() -> i64 {
-    var i: i64 = 3;
-    while i < MAX_FDS {
-        var fd: FileDescriptor = fd_table.get(i);
-        if !fd.used {
-            fd.used = true;
-            fd_table.set(i, fd);
+// Syscall dispatch — called by the assembly syscall handler.
+// Args: syscall_num (RCX), arg1 (RDX), arg2 (R8), arg3 (R9)
+// Returns 0 to continue user mode, non-zero to exit to kernel.
+pub fn syscall_dispatch(syscall_num: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
+    // Syscall numbers:
+    //   0 = sys_exit(exit_code)  — returns to kernel
+    //   1 = sys_write(buf_ptr, len) — writes to VGA/serial, returns bytes written
+    //   2 = sys_read(buf_ptr, len) — reads from keyboard (stub, returns 0)
+    //   3 = sys_getpid() — returns PID
+    //   4 = sys_yield() — yields CPU (stub, returns 0)
+
+    if syscall_num == 0 {
+        // sys_exit: print exit code, return to kernel
+        con_putc(10);
+        con_putc(69); con_putc(120); con_putc(105); con_putc(116); con_putc(40); // "Exit("
+        print_hex(arg1);
+        con_putc(41); con_putc(10); // ")"
+        return 0; // return value doesn't matter; handler checks syscall_num==0
+    }
+
+    if syscall_num == 1 {
+        // sys_write(buf_ptr, len): write string to VGA/serial
+        var i: i64 = 0;
+        while i < arg2 {
+            con_putc(p_mem_read8(arg1 + i));
+            i = i + 1;
+        }
+        return arg2; // return bytes written
+    }
+
+    if syscall_num == 2 {
+        // sys_read(buf_ptr, len): read from keyboard buffer into user buffer
+        // Reads one character at a time (blocking until a key is available)
+        // Returns the number of bytes actually read (1 if a key was read, 0 on error)
+        if arg2 <= 0 { return 0; }
+        // Read one scancode from the keyboard buffer (blocks until key pressed)
+        var sc: i64 = kbd_read_scancode();
+        var ch: i64 = scancode_to_ascii(sc);
+        if ch < 0 { return 0; }
+        // Write the character to the user buffer
+        p_mem_write8(arg1, ch);
+        return 1;
+    }
+
+    if syscall_num == 3 {
+        // sys_getpid: return PID (always 1 for now)
+        return 1;
+    }
+
+    if syscall_num == 4 {
+        // sys_yield: stub — no scheduler yet
+        return 0;
+    }
+
+    if syscall_num == 5 {
+        // sys_open(path, path_len, flags)
+        return sys_open(arg1, arg2, arg3);
+    }
+
+    if syscall_num == 6 {
+        // sys_close(fd)
+        return sys_close(arg1);
+    }
+
+    if syscall_num == 9 {
+        // sys_mmap(addr, length, prot, flags, fd, offset)
+        return sys_mmap(arg1, arg2, arg3, 0, 0, 0);
+    }
+
+    if syscall_num == 12 {
+        // sys_brk(new_brk)
+        return sys_brk(arg1);
+    }
+
+    if syscall_num == 39 {
+        // sys_getpid
+        return current_pid;
+    }
+
+    if syscall_num == 57 {
+        // sys_fork
+        return sys_fork();
+    }
+
+    if syscall_num == 59 {
+        // sys_exec(path, path_len)
+        return sys_exec(arg1, arg2);
+    }
+
+    if syscall_num == 61 {
+        // sys_wait(pid)
+        return sys_wait(arg1);
+    }
+
+    if syscall_num == 62 {
+        // sys_kill(pid, sig)
+        return sys_kill(arg1, arg2);
+    }
+
+    if syscall_num == 134 {
+        // sys_sigaction(sig, handler)
+        return sys_sigaction(arg1, arg2);
+    }
+
+    if syscall_num == 200 {
+        // sys_pipe
+        return sys_pipe();
+    }
+
+    if syscall_num == 201 {
+        // sys_shmget(key, size, flags)
+        return sys_shmget(arg1, arg2, arg3);
+    }
+
+    // Unknown syscall — print debug and continue
+    con_putc(10);
+    con_putc(83); con_putc(58); // "S:"
+    print_hex(syscall_num);
+    con_putc(32);
+    con_putc(82); con_putc(58); // "R:"
+    print_hex(arg1);
+    con_putc(32);
+    con_putc(80); con_putc(58); // "P:"
+    print_hex(arg2);
+    con_putc(32);
+    con_putc(65); con_putc(58); // "A:"
+    print_hex(arg3);
+    con_putc(10);
+    return 0;
+}
+
+// ─── Extended Syscalls ──────────────────────────────────────────────────
+
+// User heap state at 0x6B0: [brk_current:8]
+pub const USER_BRK: i64 = 0x6B0;
+pub const USER_HEAP_START: i64 = 0x13000;  // user heap starts above user stack
+
+// Process table at 0x160000 (up to 64 processes × 32 bytes)
+pub const PROC_TABLE: i64 = 0x160000;
+pub const MAX_PROCS: i64 = 64;
+pub var current_pid: i64 = 1;
+pub var next_pid: i64 = 2;
+
+// Signal handler table at 0x170000 (64 signals × 8 bytes per process)
+pub const SIGNAL_TABLE: i64 = 0x170000;
+
+// Pipe buffer at 0x180000 (up to 16 pipes × 4096 bytes)
+pub const PIPE_TABLE: i64 = 0x180000;
+pub const MAX_PIPES: i64 = 16;
+pub const PIPE_SIZE: i64 = 4096;
+
+pub fn proc_init() {
+    current_pid = 1;
+    next_pid = 2;
+    // Initialize process 1 (kernel shell)
+    p_mem_write64(PROC_TABLE, 1);        // pid
+    p_mem_write64(PROC_TABLE + 8, 1);    // state = running
+    p_mem_write64(PROC_TABLE + 16, 0x10000); // entry
+    p_mem_write64(PROC_TABLE + 24, 0x72000); // pml4
+    // Initialize user brk
+    p_mem_write64(USER_BRK, USER_HEAP_START);
+}
+
+pub fn sys_brk(new_brk: i64) -> i64 {
+    // G7: Set program break (user heap)
+    var current_brk: i64 = p_mem_read64(USER_BRK);
+    if new_brk == 0 {
+        // Query current brk
+        return current_brk;
+    }
+    if new_brk < USER_HEAP_START || new_brk > 0x1F000 {
+        return current_brk;  // invalid range, return current
+    }
+    p_mem_write64(USER_BRK, new_brk);
+    return new_brk;
+}
+
+pub fn sys_mmap(addr: i64, length: i64, prot: i64, flags: i64, fd: i64, offset: i64) -> i64 {
+    // G7: Simple mmap — allocate anonymous pages in user space
+    // For now, just extend the user break
+    var current_brk: i64 = p_mem_read64(USER_BRK);
+    if length <= 0 { return 0; }
+    // Align to page boundary
+    var aligned_len: i64 = (length + 0xFFF) & 0xFFFFFFFFFFFFF000;
+    var result: i64 = current_brk;
+    p_mem_write64(USER_BRK, current_brk + aligned_len);
+    return result;
+}
+
+pub fn sys_fork() -> i64 {
+    // G2: Fork — create a copy of the current process
+    // In a real OS, this would copy page tables (COW) and create a new process.
+    // For now, return -1 (not implemented in single-process mode)
+    return -1;
+}
+
+pub fn sys_exec(path: i64, path_len: i64) -> i64 {
+    // G2: Exec — replace current process with a new program
+    // For now, load from initrd and jump to it
+    var idx: i64 = initrd_find(path, path_len);
+    if idx < 0 { return -1; }
+    var size: i64 = initrd_get_size(idx);
+    var doff: i64 = initrd_get_data_offset(idx);
+    // Copy to 0x10000
+    var i: i64 = 0;
+    while i < size {
+        p_mem_write8(0x10000 + i, p_mem_read8(INITRD_BUF + doff + i));
+        i = i + 1;
+    }
+    // Enter user mode
+    p_enter_user_mode(0x10000, 0x12000);
+    return 0;  // never reached
+}
+
+pub fn sys_wait(pid: i64) -> i64 {
+    // G2: Wait — block until child exits
+    // For now, return 0 (no children to wait for)
+    return 0;
+}
+
+pub fn sys_kill(pid: i64, sig: i64) -> i64 {
+    // G8: Send signal to process
+    // For now, just return 0
+    return 0;
+}
+
+pub fn sys_sigaction(sig: i64, handler: i64) -> i64 {
+    // G8: Set signal handler
+    if sig < 0 || sig >= 64 { return -1; }
+    p_mem_write64(SIGNAL_TABLE + sig * 8, handler);
+    return 0;
+}
+
+pub fn sys_pipe() -> i64 {
+    // G21: Create a pipe — returns pipe id
+    // Find a free pipe slot
+    var i: i64 = 0;
+    while i < MAX_PIPES {
+        var in_use: i64 = p_mem_read8(PIPE_TABLE + i * (PIPE_SIZE + 16));
+        if in_use == 0 {
+            p_mem_write8(PIPE_TABLE + i * (PIPE_SIZE + 16), 1);
+            // Initialize read/write offsets
+            p_mem_write64(PIPE_TABLE + i * (PIPE_SIZE + 16) + 8, 0);  // read offset
+            p_mem_write64(PIPE_TABLE + i * (PIPE_SIZE + 16) + 16, 0); // write offset
             return i;
         }
         i = i + 1;
@@ -288,11 +330,61 @@ pub fn syscall_alloc_fd() -> i64 {
     return -1;
 }
 
-pub fn syscall_close_fd(fd: i64) -> i64 {
-    if fd < 0 || fd >= MAX_FDS { return -1; }
-    var entry: FileDescriptor = fd_table.get(fd);
-    if !entry.used { return -1; }
-    entry.used = false;
-    fd_table.set(fd, entry);
-    return 0;
+pub fn sys_shmget(key: i64, size: i64, flags: i64) -> i64 {
+    // G21: Allocate shared memory — return virtual address
+    // Use a fixed shared memory region at 0x200000
+    var current: i64 = p_mem_read64(0x6C0);
+    if current == 0 { current = 0x200000; }
+    var aligned: i64 = (size + 0xFFF) & 0xFFFFFFFFFFFFF000;
+    var result: i64 = current;
+    p_mem_write64(0x6C0, current + aligned);
+    return result;
+}
+
+// Load and run a user-mode program from disk sector 1.
+// The user program is a flat binary loaded at 0x10000.
+// User stack is at 0x12000 (grows down).
+// The user program writes to VGA at 0xB8000 and calls int 0x80 to exit.
+pub fn cmd_run() -> void {
+    con_putc(10);
+    // "Loading user program from sector 1..."
+    con_putc(76); con_putc(111); con_putc(97); con_putc(100); con_putc(105);
+    con_putc(110); con_putc(103); con_putc(32); con_putc(117); con_putc(115);
+    con_putc(101); con_putc(114); con_putc(32); con_putc(112); con_putc(114);
+    con_putc(111); con_putc(103); con_putc(114); con_putc(97); con_putc(109);
+    con_putc(32); con_putc(102); con_putc(114); con_putc(111); con_putc(109);
+    con_putc(32); con_putc(115); con_putc(101); con_putc(99); con_putc(116);
+    con_putc(111); con_putc(114); con_putc(32); con_putc(49); con_putc(46); con_putc(46); con_putc(46);
+    con_putc(10);
+
+    // Load user program from disk sector 1 to address 0x10000
+    var result: i64 = ata_read_sector(1, 0x10000);
+    if result != 0 {
+        // "Failed to load user program"
+        con_putc(70); con_putc(97); con_putc(105); con_putc(108); con_putc(101);
+        con_putc(100); con_putc(32); con_putc(116); con_putc(111); con_putc(32);
+        con_putc(108); con_putc(111); con_putc(97); con_putc(100); con_putc(32);
+        con_putc(117); con_putc(115); con_putc(101); con_putc(114); con_putc(32);
+        con_putc(112); con_putc(114); con_putc(111); con_putc(103); con_putc(114);
+        con_putc(97); con_putc(109);
+        con_putc(10);
+        return;
+    }
+
+    // "Entering ring 3 (user mode)..."
+    con_putc(69); con_putc(110); con_putc(116); con_putc(101); con_putc(114);
+    con_putc(105); con_putc(110); con_putc(103); con_putc(32); con_putc(114);
+    con_putc(105); con_putc(110); con_putc(103); con_putc(32); con_putc(51);
+    con_putc(32); con_putc(40); con_putc(117); con_putc(115); con_putc(101);
+    con_putc(114); con_putc(32); con_putc(109); con_putc(111); con_putc(100);
+    con_putc(101); con_putc(41); con_putc(46); con_putc(46); con_putc(46);
+    con_putc(10);
+
+    // Enter user mode: entry at 0x10000, stack at 0x12000
+    // This does iret to ring 3 and never returns.
+    // When the user calls int 0x80, the syscall handler returns to
+    // user_program_done() in the kernel.
+    p_enter_user_mode(0x10000, 0x12000);
+
+    // This code is never reached — p_enter_user_mode does iret
 }

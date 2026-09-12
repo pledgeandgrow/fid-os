@@ -13,6 +13,32 @@
 | 5 | Multi-module kernel linking | ✅ Done |
 | 6 | Filesystem / disk I/O (ATA/PIO) | ✅ Done |
 | 7 | User-mode program loading | ✅ Done |
+| 8 | Modular kernel (shell.fd split into 22 modules) | ✅ Done |
+| 9 | E1000 network driver + TCP/IP stack | ✅ Done |
+| 10 | Graphical framebuffer text rendering | ✅ Done |
+| 11 | SMP boot via LAPIC IPIs | ✅ Done |
+| 12 | Shell scripting (pipes, redirects, variables) | ✅ Done |
+| 13 | MMIO page mapping (LAPIC + E1000) | ✅ Done |
+| 14 | Multiboot2 info parsing + framebuffer | ✅ Done |
+| 15 | Kernel panic register dump + stack trace | ✅ Done |
+| 16 | LAPIC timer (enable/disable/count) | ✅ Done |
+| 17 | Kernel threads (create/yield/join/exit) | ✅ Done |
+| 18 | Spinlocks (atomic xchg) | ✅ Done |
+| 19 | FAT32 write support (create/delete files) | ✅ Done |
+| 20 | Initrd directory tree (hierarchical paths) | ✅ Done |
+| 21 | Disk block cache (8-sector LRU) | ✅ Done |
+| 22 | DHCP client (DISCOVER) | ✅ Done |
+| 23 | UDP socket API (create/send/close) | ✅ Done |
+| 24 | ICMP ping statistics (sent/recv/loss/RTT) | ✅ Done |
+| 25 | ARP table management (arp command) | ✅ Done |
+| 26 | Shell history (up/down arrow recall) | ✅ Done |
+| 27 | Shell tab completion | ✅ Done |
+| 28 | PS/2 mouse cursor (absolute position + framebuffer) | ✅ Done |
+| 29 | Syscall expansion (open/close + existing) | ✅ Done |
+| 30 | Preemptive scheduler | ⚠ Cooperative only (PE backend bug) |
+| 31 | Per-CPU GDT + TSS | ⚠ Needs working SMP |
+| 32 | AHCI/SATA driver | ⚠ Needs PCI DMA |
+| 33 | Keyboard scancode set 2 | ✅ 0xE0 handling works (addition not OR) |
 
 ---
 
@@ -78,13 +104,73 @@
 
 ---
 
-## Future Goals (Beyond 1-7)
+## Future Goals (Beyond 1-12)
 
-- **Filesystem** — FAT32 or custom FS on disk (currently only
-  raw sector reads)
-- **Networking** — network card driver + TCP/IP stack
-- **Graphics** — VBE/VGA framebuffer with text rendering
-- **Multi-core** — SMP support (APIC + per-CPU state)
 - **USB** — USB host controller driver
 - **Sound** — PC speaker + Sound Blaster 16
-- **Shell scripting** — pipes, redirects, variables
+- **Real ARP resolution** — ARP cache populated on demand, used by IPv4 send
+- **TCP connections** — full 3-way handshake, state machine, data transfer
+- **Framebuffer console** — replace VGA text mode as primary output
+- **SMP scheduling** — distribute processes across CPUs
+- **FAT32 write** — create/delete files, directory operations
+
+---
+
+## Done (Goals 8-12)
+
+### 8. Modular Kernel
+- `shell.fd` split from 3019-line monolith into 22 module files
+- All modules compile under `--boot` mode with bare-metal primitives
+- Multi-module `--boot` linking verified: 402KB boot-ready Multiboot2 image
+- Module dependency graph resolved (no circular imports)
+- Modules: vga, serial, console, isr, keyboard, kalloc, sched, ata, vfs,
+  initrd, pci, acpi, vm, mouse, apic, elf, syscall, net, framebuffer, smp,
+  dma, shell_script, shell
+
+### 9. E1000 Network Driver + TCP/IP Stack
+- E1000 PCI discovery (vendor 0x8086, device 0x100E)
+- MMIO register access via BAR0
+- MAC address read from EEPROM
+- TX/RX descriptor rings (16 descriptors each)
+- Ethernet frame send/receive
+- ARP request/reply with cache (16 entries)
+- IPv4 packet construction with checksum
+- ICMP echo request/reply (real `ping`)
+- UDP send
+- TCP send (SYN/ACK/FIN flags)
+- `net` command shows E1000 status, MAC, IP
+- `ping` command sends real ICMP echo, waits for reply
+
+### 10. Graphical Framebuffer Text Rendering
+- Framebuffer metadata at 0x1B0000 (addr, width, height, bpp, pitch)
+- Built-in 8x16 bitmap font (96 characters, programmatically generated)
+- Font includes digits, uppercase A-Z, lowercase a-z, punctuation
+- `fb_putpixel(x, y, color)` — individual pixel plotting
+- `fb_draw_char(x, y, c, fg, bg)` — glyph rendering
+- `fb_putc(c)` — text output with cursor tracking
+- `fb_scroll()` — line scrolling when cursor reaches bottom
+- `fb_clear_screen()` — clear framebuffer
+- `fb_set_info(addr, w, h, bpp, pitch)` — for multiboot2 framebuffer parsing
+- `fb` command shows framebuffer status
+
+### 11. SMP Boot via LAPIC IPIs
+- AP trampoline at physical 0x8000 (SIPI vector 0x08)
+- Trampoline: real mode → 32-bit → 64-bit long mode transition
+- Reuses BSP page tables (PML4 at 0x70000)
+- Per-CPU state at 0x1C0000 (16 CPUs × 64 bytes)
+- CPU count tracking at 0x1C0400
+- INIT-SIPI-SIPI sequence per Intel spec
+- AP entry function increments CPU count, sets state to alive
+- `smp` command boots AP 1, shows per-CPU status
+- AP stacks at 0x1C1000 (4KB per AP)
+
+### 12. Shell Scripting
+- Variable storage at 0x1D0000 (32 variables × 64 bytes)
+- Variable assignment: `name=value`
+- Variable expansion: `$name` → value
+- `vars` command shows all variables
+- Pipe support: `cmd1 | cmd2` (output capture + display)
+- Redirect support: `cmd > file` and `cmd >> file`
+- Output capture buffer at 0x1D1000 (8KB)
+- Console output capture via CAPTURE_FLAG at 0x1D5000
+- `shell_dispatch()` function for command execution

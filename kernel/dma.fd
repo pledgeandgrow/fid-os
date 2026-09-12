@@ -1,167 +1,47 @@
-// stdlib/dma.fd — DMA (Direct Memory Access) controller driver
-//
-// Provides DMA channel management for 8237 DMA controller.
-// Allows peripheral devices to transfer data to/from memory without CPU.
-//
-// Usage:
-//   use dma;
-//   dma::init();
-//   dma::transfer(0, buf_phys, 512, DMA_MODE_READ);  // Channel 0, read from device
-//
-// Limitations:
-//   - Only 8237 DMA controller (legacy)
-//   - Channels 0-3 (8-bit transfers, 64KB max)
-//   - No bus master DMA (no PCI DMA)
-//   - For modern systems, use AHCI/NVMe instead
-//
-// References:
-//   - 8237 DMA controller datasheet
-//   - OSDev Wiki: ISA DMA
+// kernel/dma.fd — ATA DMA (bus-master DMA for ATA/IDE)
+// PCI device 0:1.1 is the PIIX3 IDE controller.
+// BAR4 (offset 0x20) is the Bus Master IDE I/O base.
 
 module dma;
 
-// ─── DMA I/O ports ──────────────────────────────────────────────────────
+use console;
+use pci;
 
-const DMA_REG_STATUS: i64    = 0x08;
-const DMA_REG_COMMAND: i64   = 0x08;
-const DMA_REG_MASK: i64      = 0x0A;
-const DMA_REG_MODE: i64      = 0x0B;
-const DMA_REG_FF: i64        = 0x0C;
-const DMA_REG_MASTER_CLEAR: i64 = 0x0D;
-const DMA_REG_CLEAR_FF: i64  = 0x0C;
-const DMA_REG_TEMP: i64      = 0x0D;
-const DMA_REG_ARBITRATION: i64 = 0x10;
+pub var ata_dma_base: i64 = 0;
 
-// Channel-specific ports (channel N)
-// Address register: 0x00 + 2*N
-// Count register:   0x01 + 2*N
-// Page register:    0x87 - N (for channels 0-3)
-
-const DMA_PAGE_REG_CH0: i64 = 0x87;
-const DMA_PAGE_REG_CH1: i64 = 0x83;
-const DMA_PAGE_REG_CH2: i64 = 0x81;
-const DMA_PAGE_REG_CH3: i64 = 0x82;
-
-// ─── DMA modes ──────────────────────────────────────────────────────────
-
-const DMA_MODE_READ: i64  = 0x44;  // Read from memory → device
-const DMA_MODE_WRITE: i64 = 0x48;  // Write to memory ← device
-const DMA_MODE_AUTO: i64  = 0x10;  // Auto-initialize
-
-// ─── Public API ─────────────────────────────────────────────────────────
-
-// Initialize the DMA controller.
-pub fn dma_init() -> i64 {
-    // Reset the DMA controller
-    p_outb(DMA_REG_MASTER_CLEAR, 0x01);
-
-    // Enable DMA controller
-    p_outb(DMA_REG_COMMAND, 0x00);
-
-    return 0;
-}
-
-// Get the page register for a channel.
-fn page_reg(channel: i64) -> i64 {
-    if channel == 0 { return DMA_PAGE_REG_CH0; }
-    if channel == 1 { return DMA_PAGE_REG_CH1; }
-    if channel == 2 { return DMA_PAGE_REG_CH2; }
-    if channel == 3 { return DMA_PAGE_REG_CH3; }
-    return 0;
-}
-
-// Get the address register for a channel.
-fn addr_reg(channel: i64) -> i64 {
-    return 0x00 + 2 * channel;
-}
-
-// Get the count register for a channel.
-fn count_reg(channel: i64) -> i64 {
-    return 0x01 + 2 * channel;
-}
-
-// Set up a DMA transfer.
-// channel: DMA channel (0-3)
-// buffer_phys: physical address of the buffer (must be < 16MB, 64KB boundary aligned)
-// size: transfer size in bytes (must be < 65536)
-// mode: DMA_MODE_READ or DMA_MODE_WRITE
-// Returns 0 on success, negative on error.
-pub fn dma_transfer(channel: i64, buffer_phys: i64, size: i64, mode: i64) -> i64 {
-    if channel < 0 || channel > 3 {
-        return -1;
+pub fn ata_dma_init() -> i64 {
+    // Find PIIX3 IDE controller (vendor 0x8086, device 0x7010)
+    var i: i64 = 0;
+    while i < pci_device_count {
+        var idx: i64 = i * 16;
+        var vendor: i64 = p_mem_read64(PCI_TABLE + idx);
+        var packed_val: i64 = p_mem_read64(PCI_TABLE + idx + 8);
+        var device: i64 = (packed_val >> 48) & 0xFFFF;
+        if vendor == 0x8086 && device == 0x7010 {
+            var bus: i64 = (packed_val >> 16) & 0xFF;
+            var dev: i64 = (packed_val >> 8) & 0xFF;
+            var func: i64 = packed_val & 0xFF;
+            // Read BAR4 (bus master base)
+            var bar4: i64 = pci_config_read(bus, dev, func, 0x20);
+            ata_dma_base = bar4 & 0xFFFC;
+            return 0;
+        }
+        i = i + 1;
     }
-    if size < 1 || size > 65535 {
-        return -2;
-    }
-    if buffer_phys < 0 || buffer_phys > 0xFFFFFF {
-        return -3;
-    }
-
-    // Disable the channel
-    p_outb(DMA_REG_MASK, channel | 0x04);
-
-    // Clear flip-flop
-    p_outb(DMA_REG_CLEAR_FF, 0x00);
-
-    // Set the address (low byte, then high byte)
-    val addr_port = addr_reg(channel);
-    p_outb(addr_port, buffer_phys & 0xFF);
-    p_outb(addr_port, (buffer_phys >> 8) & 0xFF);
-
-    // Set the page (bits 16-23 of the address)
-    p_outb(page_reg(channel), (buffer_phys >> 16) & 0xFF);
-
-    // Clear flip-flop again
-    p_outb(DMA_REG_CLEAR_FF, 0x00);
-
-    // Set the count (low byte, then high byte)
-    // Count = size - 1
-    val count = size - 1;
-    val count_port = count_reg(channel);
-    p_outb(count_port, count & 0xFF);
-    p_outb(count_port, (count >> 8) & 0xFF);
-
-    // Set the mode
-    p_outb(DMA_REG_MODE, mode | channel);
-
-    // Unmask the channel (enable)
-    p_outb(DMA_REG_MASK, channel);
-
-    return 0;
+    return -1;
 }
 
-// Stop a DMA transfer on a channel.
-pub fn dma_stop(channel: i64) -> i64 {
-    if channel < 0 || channel > 3 {
-        return -1;
+pub fn cmd_dma() -> void {
+    con_putc(10);
+    // "DMA: "
+    con_putc(68); con_putc(77); con_putc(65); con_putc(58); con_putc(32);
+    var result: i64 = ata_dma_init();
+    if result == 0 {
+        con_putc(98); con_putc(97); con_putc(115); con_putc(101); con_putc(58); // "base:"
+        con_putc(32);
+        print_hex(ata_dma_base);
+    } else {
+        con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
     }
-    // Mask the channel (disable)
-    p_outb(DMA_REG_MASK, channel | 0x04);
-    return 0;
-}
-
-// Get the remaining transfer count for a channel.
-pub fn dma_remaining_count(channel: i64) -> i64 {
-    if channel < 0 || channel > 3 {
-        return -1;
-    }
-    // Clear flip-flop
-    p_outb(DMA_REG_CLEAR_FF, 0x00);
-    // Read count (low byte, then high byte)
-    val count_port = count_reg(channel);
-    val lo = p_inb(count_port);
-    val hi = p_inb(count_port);
-    return lo | (hi << 8);
-}
-
-// Check if a DMA transfer is complete.
-pub fn dma_is_complete(channel: i64) -> bool {
-    if channel < 0 || channel > 3 {
-        return false;
-    }
-    // Read status register
-    val status = p_inb(DMA_REG_STATUS);
-    // Bit (channel*2 + 1) is set when transfer is complete
-    val mask = 1 << (channel * 2 + 1);
-    return (status & mask) != 0;
+    con_putc(10);
 }

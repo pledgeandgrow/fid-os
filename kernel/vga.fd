@@ -1,0 +1,77 @@
+// kernel/vga.fd — VGA text mode output
+//
+// VGA text buffer at 0xB8000. 80 columns x 25 rows.
+// Each cell: 2 bytes — [ASCII char][attribute byte]
+
+module vga;
+
+pub const VGA_ADDR:  i64 = 0xB8000;
+pub const VGA_COLS:  i64 = 80;
+pub const VGA_ROWS:  i64 = 25;
+pub const VGA_ATTR:  i64 = 0x07;
+
+pub var vga_col: i64 = 0;
+pub var vga_row: i64 = 0;
+
+pub fn vga_putc_at(col: i64, row: i64, c: i64) -> void {
+    var offset: i64 = (row * VGA_COLS + col) * 2;
+    p_mem_write8(VGA_ADDR + offset, c);
+    p_mem_write8(VGA_ADDR + offset + 1, VGA_ATTR);
+}
+
+pub fn vga_scroll() -> void {
+    var row: i64 = 0;
+    while row < VGA_ROWS - 1 {
+        var col: i64 = 0;
+        while col < VGA_COLS {
+            var src: i64 = VGA_ADDR + ((row + 1) * VGA_COLS + col) * 2;
+            var dst: i64 = VGA_ADDR + (row * VGA_COLS + col) * 2;
+            p_mem_write8(dst, p_mem_read8(src));
+            p_mem_write8(dst + 1, p_mem_read8(src + 1));
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    var col2: i64 = 0;
+    while col2 < VGA_COLS {
+        vga_putc_at(col2, VGA_ROWS - 1, 32);
+        col2 = col2 + 1;
+    }
+}
+
+pub fn vga_putc(c: i64) -> void {
+    if c == 10 {
+        vga_col = 0;
+        vga_row = vga_row + 1;
+        if vga_row >= VGA_ROWS { vga_scroll(); vga_row = VGA_ROWS - 1; }
+        return;
+    }
+    if c == 8 {
+        if vga_col > 0 {
+            vga_col = vga_col - 1;
+            vga_putc_at(vga_col, vga_row, 32);
+        }
+        return;
+    }
+    vga_putc_at(vga_col, vga_row, c);
+    vga_col = vga_col + 1;
+    if vga_col >= VGA_COLS {
+        vga_col = 0;
+        vga_row = vga_row + 1;
+        if vga_row >= VGA_ROWS { vga_scroll(); vga_row = VGA_ROWS - 1; }
+    }
+}
+
+pub fn vga_clear() -> void {
+    var row: i64 = 0;
+    while row < VGA_ROWS {
+        var col: i64 = 0;
+        while col < VGA_COLS {
+            vga_putc_at(col, row, 32);
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    vga_col = 0;
+    vga_row = 0;
+}

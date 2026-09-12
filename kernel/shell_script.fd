@@ -1,0 +1,329 @@
+// kernel/shell_script.fd — Shell scripting: variables, pipes, redirects
+//
+// Provides:
+//   - Variable storage and expansion ($var)
+//   - Pipe support (cmd1 | cmd2)
+//   - Output redirect (cmd > file, cmd >> file)
+//   - Command chaining (cmd1 ; cmd2)
+//
+// Variable table at 0x1D0000 (32 variables × 64 bytes)
+//   Each entry: [name:32 bytes][value:32 bytes]
+//
+// Output capture buffer at 0x1D1000 (8KB)
+//   Used for pipe and redirect output capture.
+
+module shell_script;
+
+use console;
+
+// Variable table at 0x1D0000 (32 vars × 64 bytes)
+pub const VAR_TABLE: i64 = 0x1D0000;
+pub const VAR_MAX: i64 = 32;
+pub const VAR_NAME_SIZE: i64 = 32;
+pub const VAR_VALUE_SIZE: i64 = 32;
+pub const VAR_ENTRY_SIZE: i64 = 64;
+
+// Output capture buffer at 0x1D1000 (8KB)
+pub const CAPTURE_BUF: i64 = 0x1D1000;
+pub const CAPTURE_MAX: i64 = 8192;
+
+// Capture state
+pub var capture_active: i64 = 0;
+pub var capture_len: i64 = 0;
+pub var capture_redirect: i64 = 0;  // 0=none, 1=write, 2=append
+pub var capture_filename_addr: i64 = 0;
+pub var capture_filename_len: i64 = 0;
+
+// Initialize variables
+pub fn vars_init() {
+    var i: i64 = 0;
+    while i < VAR_MAX * VAR_ENTRY_SIZE {
+        p_mem_write8(VAR_TABLE + i, 0);
+        i = i + 1;
+    }
+    capture_active = 0;
+    capture_len = 0;
+}
+
+// Find a variable by name (returns entry address or 0 if not found)
+pub fn var_find(name_addr: i64, name_len: i64) -> i64 {
+    var i: i64 = 0;
+    while i < VAR_MAX {
+        var entry: i64 = VAR_TABLE + i * VAR_ENTRY_SIZE;
+        // Check if name matches
+        var found: i64 = 1;
+        var j: i64 = 0;
+        while j < name_len {
+            if p_mem_read8(entry + j) != p_mem_read8(name_addr + j) {
+                found = 0;
+                j = name_len;
+            }
+            j = j + 1;
+        }
+        // Also check that the stored name has the same length (null-terminated)
+        if found == 1 && name_len > 0 && p_mem_read8(entry) != 0 {
+            if p_mem_read8(entry + name_len) == 0 {
+                return entry;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Set a variable (name = value)
+pub fn var_set(name_addr: i64, name_len: i64, value_addr: i64, value_len: i64) {
+    // Find existing entry or empty slot
+    var entry: i64 = var_find(name_addr, name_len);
+    if entry == 0 {
+        // Find empty slot
+        var i: i64 = 0;
+        while i < VAR_MAX {
+            var e: i64 = VAR_TABLE + i * VAR_ENTRY_SIZE;
+            if p_mem_read8(e) == 0 {
+                entry = e;
+                i = VAR_MAX;
+            }
+            i = i + 1;
+        }
+    }
+    if entry == 0 { return; }  // table full
+
+    // Copy name
+    var i: i64 = 0;
+    while i < name_len && i < VAR_NAME_SIZE - 1 {
+        p_mem_write8(entry + i, p_mem_read8(name_addr + i));
+        i = i + 1;
+    }
+    p_mem_write8(entry + i, 0);  // null-terminate
+
+    // Copy value
+    var val_off: i64 = VAR_NAME_SIZE;
+    i = 0;
+    while i < value_len && i < VAR_VALUE_SIZE - 1 {
+        p_mem_write8(entry + val_off + i, p_mem_read8(value_addr + i));
+        i = i + 1;
+    }
+    p_mem_write8(entry + val_off + i, 0);  // null-terminate
+}
+
+// Get a variable's value (returns value length, 0 if not found)
+pub fn var_get(name_addr: i64, name_len: i64, value_buf: i64) -> i64 {
+    var entry: i64 = var_find(name_addr, name_len);
+    if entry == 0 { return 0; }
+
+    var val_off: i64 = VAR_NAME_SIZE;
+    var i: i64 = 0;
+    while i < VAR_VALUE_SIZE {
+        var c: i64 = p_mem_read8(entry + val_off + i);
+        if c == 0 { break; }
+        p_mem_write8(value_buf + i, c);
+        i = i + 1;
+    }
+    return i;
+}
+
+// ─── Output Capture ────────────────────────────────────────────────────
+// When capture is active, con_putc output is redirected to the capture buffer.
+// This is used for pipes and redirects.
+
+pub fn capture_start() {
+    capture_active = 1;
+    capture_len = 0;
+}
+
+pub fn capture_stop() {
+    capture_active = 0;
+}
+
+// Capture a character (called by con_putc when capture is active)
+pub fn capture_putc(c: i64) {
+    if capture_len < CAPTURE_MAX {
+        p_mem_write8(CAPTURE_BUF + capture_len, c);
+        capture_len = capture_len + 1;
+    }
+}
+
+// Check if capture is active
+pub fn is_capturing() -> i64 {
+    return capture_active;
+}
+
+// Get capture buffer length
+pub fn get_capture_len() -> i64 {
+    return capture_len;
+}
+
+// ─── Input Line Parsing ────────────────────────────────────────────────
+// Parse the input line for:
+//   - Variable assignment (name=value)
+//   - Pipes (|)
+//   - Redirects (>, >>)
+//   - Command chaining (;)
+
+// Check if the input contains a specific character
+pub fn input_contains_char(input_addr: i64, input_len: i64, c: i64) -> i64 {
+    var i: i64 = 0;
+    while i < input_len {
+        if p_mem_read8(input_addr + i) == c { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Check if input is a variable assignment (contains '=' before any space)
+pub fn is_var_assignment(input_addr: i64, input_len: i64) -> i64 {
+    var i: i64 = 0;
+    while i < input_len {
+        var c: i64 = p_mem_read8(input_addr + i);
+        if c == 61 {  // '='
+            if i > 0 { return i; }  // return position of '='
+        }
+        if c == 32 { return -1; }  // space before '=' → not assignment
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Expand variables in the input line ($var → value)
+// Writes expanded line to output buffer, returns new length.
+pub fn expand_vars(input_addr: i64, input_len: i64, output_addr: i64, output_max: i64) -> i64 {
+    var out_len: i64 = 0;
+    var i: i64 = 0;
+    while i < input_len && out_len < output_max {
+        var c: i64 = p_mem_read8(input_addr + i);
+        if c == 36 {  // '$' — variable expansion
+            // Read variable name (alphanumeric until space or end)
+            var name_start: i64 = i + 1;
+            var name_end: i64 = name_start;
+            while name_end < input_len {
+                var nc: i64 = p_mem_read8(input_addr + name_end);
+                if nc == 32 || nc == 36 || nc == 124 || nc == 62 || nc == 59 { break; }
+                name_end = name_end + 1;
+            }
+            var name_len: i64 = name_end - name_start;
+            if name_len > 0 {
+                // Get variable value
+                var val_len: i64 = var_get(input_addr + name_start, name_len, output_addr + out_len);
+                out_len = out_len + val_len;
+                i = name_end;
+            } else {
+                // Just a '$' with no name — output as-is
+                p_mem_write8(output_addr + out_len, c);
+                out_len = out_len + 1;
+                i = i + 1;
+            }
+        } else {
+            p_mem_write8(output_addr + out_len, c);
+            out_len = out_len + 1;
+            i = i + 1;
+        }
+    }
+    return out_len;
+}
+
+// Split input on a delimiter character, return position of first occurrence
+// (skipping spaces around the delimiter)
+pub fn find_delimiter(input_addr: i64, input_len: i64, delim: i64) -> i64 {
+    var i: i64 = 0;
+    while i < input_len {
+        if p_mem_read8(input_addr + i) == delim { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Trim leading and trailing spaces from input
+// Returns new start offset, sets length via output_len_addr
+pub fn trim_spaces(input_addr: i64, input_len: i64, output_len_addr: i64) -> i64 {
+    var start: i64 = 0;
+    var end: i64 = input_len;
+    while start < end {
+        if p_mem_read8(input_addr + start) != 32 { break; }
+        start = start + 1;
+    }
+    while end > start {
+        if p_mem_read8(input_addr + end - 1) != 32 { break; }
+        end = end - 1;
+    }
+    p_mem_write8(output_len_addr, end - start);
+    return start;
+}
+
+// ─── Pipe Handling ─────────────────────────────────────────────────────
+// For pipes, we capture the output of the first command and provide it
+// as input to the next command. Since our shell commands don't read from
+// stdin, we store the captured output and make it available via a
+// "pipe input" buffer.
+
+pub const PIPE_INPUT_BUF: i64 = 0x1D3000;  // pipe input buffer (4KB)
+pub const PIPE_INPUT_LEN: i64 = 0x1D4000;   // pipe input length (8 bytes)
+pub var pipe_input_active: i64 = 0;
+
+pub fn pipe_set_input(buf: i64, len: i64) {
+    p_mem_write8(PIPE_INPUT_LEN, len);
+    var i: i64 = 0;
+    while i < len && i < 4096 {
+        p_mem_write8(PIPE_INPUT_BUF + i, p_mem_read8(buf + i));
+        i = i + 1;
+    }
+    pipe_input_active = 1;
+}
+
+pub fn pipe_clear_input() {
+    pipe_input_active = 0;
+    p_mem_write8(PIPE_INPUT_LEN, 0);
+}
+
+pub fn pipe_get_input_len() -> i64 {
+    if pipe_input_active == 0 { return 0; }
+    return p_mem_read8(PIPE_INPUT_LEN);
+}
+
+// ─── Redirect Handling ─────────────────────────────────────────────────
+// For redirects, we capture output and write it to a file on disk.
+
+pub fn redirect_set(filename_addr: i64, filename_len: i64, append: i64) {
+    capture_redirect = 1;
+    if append != 0 { capture_redirect = 2; }
+    capture_filename_addr = filename_addr;
+    capture_filename_len = filename_len;
+}
+
+pub fn redirect_clear() {
+    capture_redirect = 0;
+    capture_filename_addr = 0;
+    capture_filename_len = 0;
+}
+
+// ─── Variables Command ──────────────────────────────────────────────────
+pub fn cmd_vars() -> void {
+    con_putc(10);
+    con_putc(86); con_putc(97); con_putc(114); con_putc(105); con_putc(97); con_putc(98); con_putc(108); con_putc(101); con_putc(115); con_putc(58); // "Variables:"
+    con_putc(10);
+    var i: i64 = 0;
+    while i < VAR_MAX {
+        var entry: i64 = VAR_TABLE + i * VAR_ENTRY_SIZE;
+        if p_mem_read8(entry) != 0 {
+            // Print name
+            var j: i64 = 0;
+            while j < VAR_NAME_SIZE {
+                var c: i64 = p_mem_read8(entry + j);
+                if c == 0 { break; }
+                con_putc(c);
+                j = j + 1;
+            }
+            con_putc(61);  // '='
+            // Print value
+            j = 0;
+            while j < VAR_VALUE_SIZE {
+                var c: i64 = p_mem_read8(entry + VAR_NAME_SIZE + j);
+                if c == 0 { break; }
+                con_putc(c);
+                j = j + 1;
+            }
+            con_putc(10);
+        }
+        i = i + 1;
+    }
+}

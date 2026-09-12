@@ -1,343 +1,46 @@
-// stdlib/acpi.fd — ACPI (Advanced Configuration and Power Interface)
-//
-// Provides:
-//   - RSDP (Root System Description Pointer) search
-//   - RSDT/XSDT parsing
-//   - FADT (Fixed ACPI Description Table) parsing
-//   - DSDT (Differentiated System Description Table) detection
-//   - Power off via SLP_TYPa/b in PM1a/b_CNT
-//   - System reset
-//
-// Usage:
-//   use acpi;
-//   if acpi_init() {
-//       acpi_power_off();
-//   }
-//
-// Only works in --bare or --boot mode.
+// kernel/acpi.fd — ACPI power management
+// QEMU ACPI shutdown port is used for poweroff.
 
 module acpi;
 
-use vec;
-use string;
+use console;
 
-// ─── ACPI Signature Constants ──────────────────────────────────────────────
-
-const ACPI_SIG_RSDP:   str = "RSD PTR ";
-const ACPI_SIG_RSDT:   str = "RSDT";
-const ACPI_SIG_XSDT:   str = "XSDT";
-const ACPI_SIG_FADT:   str = "FADT";
-const ACPI_SIG_DSDT:   str = "DSDT";
-const ACPI_SIG_SSDT:   str = "SSDT";
-const ACPI_SIG_MADT:   str = "APIC";
-const ACPI_SIG_HPET:   str = "HPET";
-const ACPI_SIG_FACS:   str = "FACS";
-
-// ─── RSDP Search Areas ─────────────────────────────────────────────────────
-
-const EBDA_BASE:       i64 = 0x9FC00;  // Extended BIOS Data Area
-const BIOS_ROM_BASE:   i64 = 0xE0000;
-const BIOS_ROM_END:    i64 = 0xFFFFF;
-
-// ─── ACPI Table Structures ─────────────────────────────────────────────────
-
-pub struct AcpiRsdp {
-    pub signature: str,
-    pub revision: i64,
-    pub rsdt_addr: i64,
-    pub xsdt_addr: i64,
-    pub is_v2: bool,
+pub fn acpi_init() -> void {
+    // In a real OS, we'd parse ACPI tables via RSDP.
+    // For QEMU, the PM ports are fixed:
+    //   PM1a_CNT = 0x604 (QEMU)
+    //   PM1b_CNT = 0xB004 (older QEMU)
+    //   Reset    = 0x604 with bit 6 set
+    // Just verify ports are accessible — nothing to init for QEMU.
 }
 
-pub struct AcpiHeader {
-    pub signature: str,
-    pub length: i64,
-    pub revision: i64,
-    pub checksum: i64,
-    pub oem_id: str,
-    pub oem_table_id: str,
+pub fn cmd_acpi() -> void {
+    con_putc(10);
+    // "ACPI: QEMU PM ports"
+    con_putc(65); con_putc(67); con_putc(80); con_putc(73); con_putc(58); con_putc(32);
+    con_putc(81); con_putc(69); con_putc(77); con_putc(85); con_putc(32); con_putc(80); con_putc(77);
+    con_putc(10);
+    // "  poweroff - S5 (ACPI shutdown)"
+    con_putc(32); con_putc(32);
+    con_putc(112); con_putc(111); con_putc(119); con_putc(101); con_putc(114); con_putc(111); con_putc(102); con_putc(102);
+    con_putc(32); con_putc(45); con_putc(32); con_putc(83); con_putc(53);
+    con_putc(10);
+    // "  reset    - ACPI reset (port 0x604)"
+    con_putc(32); con_putc(32);
+    con_putc(114); con_putc(101); con_putc(115); con_putc(101); con_putc(116);
+    con_putc(32); con_putc(45); con_putc(32); con_putc(65); con_putc(67); con_putc(80); con_putc(73);
+    con_putc(10);
 }
 
-pub struct AcpiFadt {
-    pub header: AcpiHeader,
-    pub pm1a_cnt: i64,
-    pub pm1b_cnt: i64,
-    pub pm1_cnt_len: i64,
-    pub slp_typa: i64,
-    pub slp_typb: i64,
-    pub sci_int: i64,
-    pub smi_cmd: i64,
-    pub acpi_enable: i64,
-    pub acpi_disable: i64,
-}
-
-// ─── Global State ──────────────────────────────────────────────────────────
-
-var rsdp: AcpiRsdp = AcpiRsdp {
-    signature: "",
-    revision: 0,
-    rsdt_addr: 0,
-    xsdt_addr: 0,
-    is_v2: false,
-};
-
-var fadt: AcpiFadt = AcpiFadt {
-    header: AcpiHeader { signature: "", length: 0, revision: 0, checksum: 0, oem_id: "", oem_table_id: "" },
-    pm1a_cnt: 0,
-    pm1b_cnt: 0,
-    pm1_cnt_len: 0,
-    slp_typa: 0,
-    slp_typb: 0,
-    sci_int: 0,
-    smi_cmd: 0,
-    acpi_enable: 0,
-    acpi_disable: 0,
-};
-
-var acpi_initialized: bool = false;
-
-// ─── Helpers ──────────────────────────────────────────────────────────────
-
-fn read_u8_at(addr: i64) -> i64 {
-    return p_phys_read8(addr);
-}
-
-fn read_u16_at(addr: i64) -> i64 {
-    return p_phys_read8(addr) | (p_phys_read8(addr + 1) << 8);
-}
-
-fn read_u32_at(addr: i64) -> i64 {
-    return p_phys_read8(addr) |
-           (p_phys_read8(addr + 1) << 8) |
-           (p_phys_read8(addr + 2) << 16) |
-           (p_phys_read8(addr + 3) << 24);
-}
-
-fn read_u64_at(addr: i64) -> i64 {
-    var lo: i64 = read_u32_at(addr);
-    var hi: i64 = read_u32_at(addr + 4);
-    return lo | (hi << 32);
-}
-
-fn read_str_at(addr: i64, len: i64) -> str {
-    var result: str = "";
-    var i: i64 = 0;
-    while i < len {
-        var c: i64 = p_phys_read8(addr + i);
-        if c == 0 { i = len; } else {
-            result = result + char_to_str(c);
-        }
-        i = i + 1;
-    }
-    return result;
-}
-
-// ─── RSDP Search ──────────────────────────────────────────────────────────
-
-pub fn acpi_init() -> bool {
-    // Search for RSDP in EBDA and BIOS ROM
-    var addr: i64 = acpi_find_rsdp();
-    if addr == 0 { return false; }
-
-    // Parse RSDP
-    rsdp = acpi_parse_rsdp(addr);
-    if rsdp.rsdt_addr == 0 && rsdp.xsdt_addr == 0 { return false; }
-
-    // Parse RSDT/XSDT to find FADT
-    if rsdp.is_v2 && rsdp.xsdt_addr != 0 {
-        acpi_parse_xsdt(rsdp.xsdt_addr);
-    } else {
-        acpi_parse_rsdt(rsdp.rsdt_addr);
-    }
-
-    acpi_initialized = true;
-    return true;
-}
-
-fn acpi_find_rsdp() -> i64 {
-    // Search EBDA first
-    var ebda_addr: i64 = read_u16_at(0x40E) << 4;
-    if ebda_addr != 0 {
-        var result: i64 = acpi_search_area(ebda_addr, 1024);
-        if result != 0 { return result; }
-    }
-
-    // Search BIOS ROM area (0xE0000 - 0xFFFFF)
-    return acpi_search_area(BIOS_ROM_BASE, BIOS_ROM_END - BIOS_ROM_BASE);
-}
-
-fn acpi_search_area(start: i64, size: i64) -> i64 {
-    var addr: i64 = start;
-    while addr < start + size {
-        // Check for "RSD PTR " signature
-        var sig: str = read_str_at(addr, 8);
-        if str_equal(sig, ACPI_SIG_RSDP) {
-            // Verify checksum
-            if acpi_verify_checksum(addr, 20) {
-                return addr;
-            }
-        }
-        addr = addr + 16;  // RSDP is 16-byte aligned
-    }
-    return 0;
-}
-
-fn acpi_verify_checksum(addr: i64, len: i64) -> bool {
-    var sum: i64 = 0;
-    var i: i64 = 0;
-    while i < len {
-        sum = sum + p_phys_read8(addr + i);
-        i = i + 1;
-    }
-    return (sum & 0xFF) == 0;
-}
-
-fn acpi_parse_rsdp(addr: i64) -> AcpiRsdp {
-    var rsdp_result: AcpiRsdp = AcpiRsdp {
-        signature: "",
-        revision: 0,
-        rsdt_addr: 0,
-        xsdt_addr: 0,
-        is_v2: false,
-    };
-
-    rsdp_result.signature = read_str_at(addr, 8);
-    rsdp_result.revision = read_u8_at(addr + 15);
-    rsdp_result.rsdt_addr = read_u32_at(addr + 16);
-
-    // ACPI 2.0+ has extended fields
-    if rsdp_result.revision >= 2 {
-        rsdp_result.xsdt_addr = read_u64_at(addr + 24);
-        rsdp_result.is_v2 = true;
-    }
-
-    return rsdp_result;
-}
-
-// ─── RSDT/XSDT Parsing ────────────────────────────────────────────────────
-
-fn acpi_parse_rsdt(addr: i64) {
-    var length: i64 = read_u32_at(addr + 4);
-    var num_entries: i64 = (length - 36) / 4;
-
-    var i: i64 = 0;
-    while i < num_entries {
-        var table_addr: i64 = read_u32_at(addr + 36 + i * 4);
-        acpi_process_table(table_addr);
-        i = i + 1;
-    }
-}
-
-fn acpi_parse_xsdt(addr: i64) {
-    var length: i64 = read_u32_at(addr + 4);
-    var num_entries: i64 = (length - 36) / 8;
-
-    var i: i64 = 0;
-    while i < num_entries {
-        var table_addr: i64 = read_u64_at(addr + 36 + i * 8);
-        acpi_process_table(table_addr);
-        i = i + 1;
-    }
-}
-
-fn acpi_process_table(addr: i64) {
-    var sig: str = read_str_at(addr, 4);
-
-    if str_equal(sig, ACPI_SIG_FADT) {
-        acpi_parse_fadt(addr);
-    }
-}
-
-fn acpi_parse_fadt(addr: i64) {
-    fadt.header.signature = read_str_at(addr, 4);
-    fadt.header.length = read_u32_at(addr + 4);
-    fadt.header.revision = read_u8_at(addr + 8);
-
-    // FADT fields (offsets vary by revision)
-    // For ACPI 1.0:
-    //   offset 36: PM1a_CNT_BLK
-    //   offset 38: PM1b_CNT_BLK
-    //   offset 56: PM1_CNT_LEN
-    //   offset 46: SCI_INT
-    //   offset 48: SMI_CMD
-    //   offset 52: ACPI_ENABLE
-    //   offset 53: ACPI_DISABLE
-
-    fadt.pm1a_cnt = read_u32_at(addr + 36);
-    fadt.pm1b_cnt = read_u32_at(addr + 38);
-    fadt.pm1_cnt_len = read_u8_at(addr + 56);
-    fadt.sci_int = read_u16_at(addr + 46);
-    fadt.smi_cmd = read_u32_at(addr + 48);
-    fadt.acpi_enable = read_u8_at(addr + 52);
-    fadt.acpi_disable = read_u8_at(addr + 53);
-
-    // SLP_TYPa and SLP_TYPb are in the FACS or DSDT
-    // For now, use common values
-    fadt.slp_typa = 5;  // S5 (soft off) — common value
-    fadt.slp_typb = 0;
-}
-
-// ─── Power Management ──────────────────────────────────────────────────────
-
-pub fn acpi_power_off() {
-    if !acpi_initialized { return; }
-
-    // Write SLP_TYPa | SLP_EN to PM1a_CNT
-    var val: i64 = (fadt.slp_typa << 10) | (1 << 13);  // SLP_EN = bit 13
-    p_outw(fadt.pm1a_cnt, val);
-
-    // If PM1b_CNT exists, write there too
-    if fadt.pm1b_cnt != 0 {
-        var val_b: i64 = (fadt.slp_typb << 10) | (1 << 13);
-        p_outw(fadt.pm1b_cnt, val_b);
-    }
-
-    // If that didn't work, try the legacy method
-    p_outw(0x604, 0x2000);  // QEMU/Bochs shutdown port
-    p_outw(0xB004, 0x2000); // Older QEMU shutdown port
-
-    // Wait for power off
-    p_cli();
-    while true {
-        p_hlt();
-    }
-    return;
-}
-
-pub fn acpi_reboot() {
-    if !acpi_initialized {
-        // Try keyboard controller reset
-        p_outb(0x64, 0xFE);
-        return;
-    }
-
-    // ACPI reset via FADT reset register (if supported)
-    // Reset register is at FADT offset 128 (ACPI 2.0+)
-    // For now, use keyboard controller reset
+pub fn cmd_acpi_reset() -> void {
+    con_putc(10);
+    // "ACPI reset..."
+    con_putc(65); con_putc(67); con_putc(80); con_putc(73); con_putc(32); con_putc(114); con_putc(101); con_putc(115); con_putc(101); con_putc(116);
+    con_putc(10);
+    // ACPI reset: write 0x06 to PM1 control register (bit 6 = reset)
+    p_outw(0x604, 0x06);
+    // Fallback: keyboard controller reset
     p_outb(0x64, 0xFE);
-
-    // Wait
     p_cli();
-    while true {
-        p_hlt();
-    }
-    return;
-}
-
-// ─── Query Functions ───────────────────────────────────────────────────────
-
-pub fn acpi_is_available() -> bool {
-    return acpi_initialized;
-}
-
-pub fn acpi_get_rsdp() -> AcpiRsdp {
-    return rsdp;
-}
-
-pub fn acpi_get_fadt() -> AcpiFadt {
-    return fadt;
-}
-
-pub fn acpi_get_sci_interrupt() -> i64 {
-    return fadt.sci_int;
+    while true { p_hlt(); }
 }
