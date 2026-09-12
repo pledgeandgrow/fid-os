@@ -1,0 +1,208 @@
+// kernel/gamepad.fd — PS/2 gamepad input and keyboard-as-gamepad support
+//
+// Provides a unified input API for games:
+//   - PS/2 gamepad (if connected via PS/2 port)
+//   - Keyboard-as-gamepad (arrow keys + WASD + space + enter)
+//   - Mouse-as-gamepad (for pointer-based games)
+//
+// Button mapping (keyboard fallback):
+//   Up:     Arrow Up (0x148) or W (0x11)
+//   Down:   Arrow Down (0x150) or S (0x1F)
+//   Left:   Arrow Left (0x14B) or A (0x1E)
+//   Right:  Arrow Right (0x14D) or D (0x20)
+//   A:      Space (0x39) or Enter (0x1C)
+//   B:      Backspace (0x0E) or Esc (0x01)
+//   Start:  Enter (0x1C)
+//   Select: Tab (0x0F)
+//
+// Gamepad state at 0x6C0:
+//   [buttons:1] — bit 0=up, 1=down, 2=left, 3=right, 4=A, 5=B, 6=start, 7=select
+//   [prev_buttons:1] — previous frame state for edge detection
+//   [x_axis:1] — -1=left, 0=center, 1=right
+//   [y_axis:1] — -1=up, 0=center, 1=down
+
+module gamepad;
+
+use console;
+use keyboard;
+use mouse;
+
+// Gamepad state
+pub const GP_BUTTONS: i64 = 0x6C0;
+pub const GP_PREV: i64 = 0x6C1;
+pub const GP_X_AXIS: i64 = 0x6C2;
+pub const GP_Y_AXIS: i64 = 0x6C3;
+
+// Button bit masks
+pub const GP_UP: i64 = 0x01;
+pub const GP_DOWN: i64 = 0x02;
+pub const GP_LEFT: i64 = 0x04;
+pub const GP_RIGHT: i64 = 0x08;
+pub const GP_A: i64 = 0x10;
+pub const GP_B: i64 = 0x20;
+pub const GP_START: i64 = 0x40;
+pub const GP_SELECT: i64 = 0x80;
+
+// Initialize gamepad state
+pub fn gamepad_init() {
+    p_mem_write8(GP_BUTTONS, 0);
+    p_mem_write8(GP_PREV, 0);
+    p_mem_write8(GP_X_AXIS, 0);
+    p_mem_write8(GP_Y_AXIS, 0);
+}
+
+// Poll the gamepad state from keyboard input.
+// This is non-blocking — it reads whatever scancodes are available
+// and updates the button state. Should be called once per frame.
+//
+// Returns the current button state (8 bits).
+pub fn gamepad_poll() -> i64 {
+    // Save previous state
+    var prev: i64 = p_mem_read8(GP_BUTTONS);
+    p_mem_write8(GP_PREV, prev);
+
+    // Start with cleared state (buttons are momentary, not held)
+    var buttons: i64 = 0;
+
+    // Read all available scancodes (non-blocking)
+    var sc: i64 = p_mem_read8(KBD_RAW_SCANCODE);
+    while sc != 0 {
+        p_mem_write8(KBD_RAW_SCANCODE, 0);
+        // Process the scancode
+        sc = kbd_process_modifiers(sc);
+        if sc != -1 {
+            // Map scancode to gamepad button
+            // Arrow keys (extended scancodes)
+            if sc == 0x148 { buttons = buttons | GP_UP; }      // Up arrow
+            if sc == 0x150 { buttons = buttons | GP_DOWN; }    // Down arrow
+            if sc == 0x14B { buttons = buttons | GP_LEFT; }    // Left arrow
+            if sc == 0x14D { buttons = buttons | GP_RIGHT; }   // Right arrow
+            // WASD (regular scancodes, only on make code)
+            if sc == 0x11 { buttons = buttons | GP_UP; }       // W
+            if sc == 0x1F { buttons = buttons | GP_DOWN; }     // S
+            if sc == 0x1E { buttons = buttons | GP_LEFT; }     // A
+            if sc == 0x20 { buttons = buttons | GP_RIGHT; }    // D
+            // Action buttons
+            if sc == 0x39 { buttons = buttons | GP_A; }        // Space
+            if sc == 0x1C { buttons = buttons | GP_A | GP_START; }  // Enter
+            if sc == 0x0E { buttons = buttons | GP_B; }       // Backspace
+            if sc == 0x01 { buttons = buttons | GP_B; }       // Esc
+            if sc == 0x0F { buttons = buttons | GP_SELECT; }  // Tab
+        }
+        sc = p_mem_read8(KBD_RAW_SCANCODE);
+    }
+
+    p_mem_write8(GP_BUTTONS, buttons);
+
+    // Compute axis from buttons
+    var x_axis: i64 = 0;
+    var y_axis: i64 = 0;
+    if (buttons & GP_LEFT) != 0 { x_axis = -1; }
+    if (buttons & GP_RIGHT) != 0 { x_axis = 1; }
+    if (buttons & GP_UP) != 0 { y_axis = -1; }
+    if (buttons & GP_DOWN) != 0 { y_axis = 1; }
+    p_mem_write8(GP_X_AXIS, x_axis);
+    p_mem_write8(GP_Y_AXIS, y_axis);
+
+    return buttons;
+}
+
+// Check if a button is currently held
+pub fn gamepad_held(button_mask: i64) -> i64 {
+    var buttons: i64 = p_mem_read8(GP_BUTTONS);
+    if (buttons & button_mask) != 0 { return 1; }
+    return 0;
+}
+
+// Check if a button was just pressed this frame (edge detection)
+pub fn gamepad_pressed(button_mask: i64) -> i64 {
+    var buttons: i64 = p_mem_read8(GP_BUTTONS);
+    var prev: i64 = p_mem_read8(GP_PREV);
+    // Pressed = held now AND not held before
+    if (buttons & button_mask) != 0 && (prev & button_mask) == 0 {
+        return 1;
+    }
+    return 0;
+}
+
+// Check if a button was just released this frame
+pub fn gamepad_released(button_mask: i64) -> i64 {
+    var buttons: i64 = p_mem_read8(GP_BUTTONS);
+    var prev: i64 = p_mem_read8(GP_PREV);
+    // Released = not held now AND was held before
+    if (buttons & button_mask) == 0 && (prev & button_mask) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+// Wait for any button press (blocking)
+pub fn gamepad_wait_press() -> i64 {
+    while true {
+        var buttons: i64 = gamepad_poll();
+        if buttons != 0 { return buttons; }
+        p_hlt();
+    }
+    return 0;
+}
+
+// Get X axis (-1, 0, 1)
+pub fn gamepad_x() -> i64 {
+    return p_mem_read8(GP_X_AXIS);
+}
+
+// Get Y axis (-1, 0, 1)
+pub fn gamepad_y() -> i64 {
+    return p_mem_read8(GP_Y_AXIS);
+}
+
+// ─── PS/2 Gamepad Driver (optional hardware) ────────────────────────────────
+// Some PS/2 gamepads send a 6-byte packet:
+//   Byte 0: 0xFF (header)
+//   Byte 1: buttons (bit 0=digital, bit 1=analog, ...)
+//   Byte 2: X axis (0-255, 128=center)
+//   Byte 3: Y axis (0-255, 128=center)
+//   Byte 4: extra buttons
+//   Byte 5: checksum
+//
+// This is optional — most setups use keyboard-as-gamepad.
+
+pub const GP_PS2_PRESENT: i64 = 0x6C4;
+pub const GP_PS2_X: i64 = 0x6C5;    // 0-255, 128=center
+pub const GP_PS2_Y: i64 = 0x6C6;
+pub const GP_PS2_BTN: i64 = 0x6C7;
+
+// Initialize PS/2 gamepad (returns 0 if found, -1 if not)
+pub fn ps2_gamepad_init() -> i64 {
+    // Try to detect a PS/2 gamepad by sending a reset command
+    p_outb(0x64, 0xD4);  // send to auxiliary device
+    p_outb(0x60, 0xFF);  // reset
+    var ack: i64 = p_inb(0x60);
+    if ack == 0xFA {
+        p_mem_write8(GP_PS2_PRESENT, 1);
+        p_mem_write8(GP_PS2_X, 128);
+        p_mem_write8(GP_PS2_Y, 128);
+        p_mem_write8(GP_PS2_BTN, 0);
+        return 0;
+    }
+    p_mem_write8(GP_PS2_PRESENT, 0);
+    return -1;
+}
+
+// ─── Gamepad command ───────────────────────────────────────────────────────
+
+pub fn cmd_gamepad() {
+    con_putc(10);
+    con_putc(71); con_putc(97); con_putc(109); con_putc(101); con_putc(112); con_putc(97); con_putc(100); con_putc(58); con_putc(32);
+    var buttons: i64 = p_mem_read8(GP_BUTTONS);
+    con_putc(98); con_putc(116); con_putc(110); con_putc(61); con_putc(48); con_putc(120);
+    print_hex(buttons);
+    con_putc(10);
+    con_putc(32); con_putc(32); con_putc(85); con_putc(112); con_putc(61);    con_putc(48 + gamepad_held(GP_UP));
+    con_putc(32); con_putc(68); con_putc(111); con_putc(119); con_putc(110); con_putc(61);   con_putc(48 + gamepad_held(GP_DOWN));
+    con_putc(32); con_putc(76); con_putc(101); con_putc(102); con_putc(116); con_putc(61);   con_putc(48 + gamepad_held(GP_LEFT));
+    con_putc(32); con_putc(82); con_putc(105); con_putc(103); con_putc(104); con_putc(116); con_putc(61);  con_putc(48 + gamepad_held(GP_RIGHT));
+    con_putc(32); con_putc(65); con_putc(61);      con_putc(48 + gamepad_held(GP_A));
+    con_putc(32); con_putc(66); con_putc(61);      con_putc(48 + gamepad_held(GP_B));
+    con_putc(10);
+}

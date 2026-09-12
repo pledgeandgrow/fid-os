@@ -26,6 +26,7 @@ use syscall;
 use net;
 use framebuffer;
 use dma;
+use audio;
 use shell_script;
 
 // ─── Shell Commands ─────────────────────────────────────────────────────

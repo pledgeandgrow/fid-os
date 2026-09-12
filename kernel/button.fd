@@ -1,0 +1,184 @@
+// kernel/button.fd — Button input driver for embedded devices
+//
+// Provides a simple button abstraction for devices like the Flipper Zero:
+//   - 5-way D-pad (up, down, left, right, center)
+//   - Back button
+//   - Configurable GPIO pin mapping
+//
+// On x86-64, buttons are mapped to keyboard keys as a fallback.
+// On ARM/embedded, buttons are read via GPIO.
+//
+// Button state at 0x6D2:
+//   [buttons:1] — bit 0=up, 1=down, 2=left, 3=right, 4=center, 5=back
+//   [prev_buttons:1] — previous frame for edge detection
+//   [debounce:1] — debounce counter
+//   [pin_map:6] — GPIO pin numbers for each button (6 bytes)
+
+module button;
+
+use console;
+use keyboard;
+use gpio;
+
+// Button state
+pub const BTN_STATE: i64 = 0x6D2;
+pub const BTN_PREV: i64 = 0x6D3;
+pub const BTN_DEBOUNCE: i64 = 0x6D4;
+pub const BTN_PIN_MAP: i64 = 0x6D5;  // 6 bytes: up,down,left,right,center,back
+
+// Button bit masks
+pub const BTN_UP: i64 = 0x01;
+pub const BTN_DOWN: i64 = 0x02;
+pub const BTN_LEFT: i64 = 0x04;
+pub const BTN_RIGHT: i64 = 0x08;
+pub const BTN_CENTER: i64 = 0x10;
+pub const BTN_BACK: i64 = 0x20;
+
+// Initialize button driver
+// On embedded: set up GPIO pins as inputs with pull-ups
+// On x86: use keyboard fallback
+pub fn button_init() {
+    p_mem_write8(BTN_STATE, 0);
+    p_mem_write8(BTN_PREV, 0);
+    p_mem_write8(BTN_DEBOUNCE, 0);
+
+    // Default pin map for Flipper Zero (STM32F407):
+    //   Up    = PC0  (pin 16)
+    //   Down  = PC1  (pin 17)
+    //   Left  = PC2  (pin 18)
+    //   Right = PC3  (pin 19)
+    //   Center= PC4  (pin 20)
+    //   Back  = PC5  (pin 21)
+    p_mem_write8(BTN_PIN_MAP, 16);      // up
+    p_mem_write8(BTN_PIN_MAP + 1, 17);  // down
+    p_mem_write8(BTN_PIN_MAP + 2, 18);  // left
+    p_mem_write8(BTN_PIN_MAP + 3, 19);  // right
+    p_mem_write8(BTN_PIN_MAP + 4, 20);  // center
+    p_mem_write8(BTN_PIN_MAP + 5, 21);  // back
+
+    // Configure GPIO pins if on embedded platform
+    if gpio_available() != 0 {
+        var i: i64 = 0;
+        while i < 6 {
+            var pin: i64 = p_mem_read8(BTN_PIN_MAP + i);
+            gpio_set_mode(pin, GPIO_INPUT);
+            gpio_set_pull(pin, GPIO_PULL_UP);  // active low
+            i = i + 1;
+        }
+    }
+}
+
+// Set custom GPIO pin mapping for buttons
+pub fn button_set_pins(up: i64, down: i64, left: i64, right: i64, center: i64, back: i64) {
+    p_mem_write8(BTN_PIN_MAP, up);
+    p_mem_write8(BTN_PIN_MAP + 1, down);
+    p_mem_write8(BTN_PIN_MAP + 2, left);
+    p_mem_write8(BTN_PIN_MAP + 3, right);
+    p_mem_write8(BTN_PIN_MAP + 4, center);
+    p_mem_write8(BTN_PIN_MAP + 5, back);
+
+    // Reconfigure GPIO if available
+    if gpio_available() != 0 {
+        var i: i64 = 0;
+        while i < 6 {
+            var pin: i64 = p_mem_read8(BTN_PIN_MAP + i);
+            gpio_set_mode(pin, GPIO_INPUT);
+            gpio_set_pull(pin, GPIO_PULL_UP);
+            i = i + 1;
+        }
+    }
+}
+
+// Poll button state (non-blocking)
+// Returns current button state (6 bits)
+pub fn button_poll() -> i64 {
+    // Save previous state
+    var prev: i64 = p_mem_read8(BTN_STATE);
+    p_mem_write8(BTN_PREV, prev);
+
+    var buttons: i64 = 0;
+
+    if gpio_available() != 0 {
+        // Read from GPIO (active low: 0 = pressed)
+        if gpio_read(p_mem_read8(BTN_PIN_MAP)) == 0 { buttons = buttons | BTN_UP; }
+        if gpio_read(p_mem_read8(BTN_PIN_MAP + 1)) == 0 { buttons = buttons | BTN_DOWN; }
+        if gpio_read(p_mem_read8(BTN_PIN_MAP + 2)) == 0 { buttons = buttons | BTN_LEFT; }
+        if gpio_read(p_mem_read8(BTN_PIN_MAP + 3)) == 0 { buttons = buttons | BTN_RIGHT; }
+        if gpio_read(p_mem_read8(BTN_PIN_MAP + 4)) == 0 { buttons = buttons | BTN_CENTER; }
+        if gpio_read(p_mem_read8(BTN_PIN_MAP + 5)) == 0 { buttons = buttons | BTN_BACK; }
+    }
+
+    if gpio_available() == 0 {
+        // x86 fallback: use keyboard scancodes
+        var sc: i64 = p_mem_read8(KBD_RAW_SCANCODE);
+        while sc != 0 {
+            p_mem_write8(KBD_RAW_SCANCODE, 0);
+            sc = kbd_process_modifiers(sc);
+            if sc != -1 {
+                // Arrow keys
+                if sc == 0x148 { buttons = buttons | BTN_UP; }      // Up
+                if sc == 0x150 { buttons = buttons | BTN_DOWN; }    // Down
+                if sc == 0x14B { buttons = buttons | BTN_LEFT; }    // Left
+                if sc == 0x14D { buttons = buttons | BTN_RIGHT; }   // Right
+                if sc == 0x1C { buttons = buttons | BTN_CENTER; }  // Enter
+                if sc == 0x01 { buttons = buttons | BTN_BACK; }     // Esc
+                if sc == 0x39 { buttons = buttons | BTN_CENTER; }  // Space
+                if sc == 0x0E { buttons = buttons | BTN_BACK; }     // Backspace
+            }
+            sc = p_mem_read8(KBD_RAW_SCANCODE);
+        }
+    }
+
+    p_mem_write8(BTN_STATE, buttons);
+    return buttons;
+}
+
+// Check if a button is currently held
+pub fn button_held(mask: i64) -> i64 {
+    var buttons: i64 = p_mem_read8(BTN_STATE);
+    if (buttons & mask) != 0 { return 1; }
+    return 0;
+}
+
+// Check if a button was just pressed (edge detection)
+pub fn button_pressed(mask: i64) -> i64 {
+    var buttons: i64 = p_mem_read8(BTN_STATE);
+    var prev: i64 = p_mem_read8(BTN_PREV);
+    if (buttons & mask) != 0 && (prev & mask) == 0 { return 1; }
+    return 0;
+}
+
+// Check if a button was just released
+pub fn button_released(mask: i64) -> i64 {
+    var buttons: i64 = p_mem_read8(BTN_STATE);
+    var prev: i64 = p_mem_read8(BTN_PREV);
+    if (buttons & mask) == 0 && (prev & mask) != 0 { return 1; }
+    return 0;
+}
+
+// Wait for any button press (blocking)
+pub fn button_wait_press() -> i64 {
+    while true {
+        var buttons: i64 = button_poll();
+        if buttons != 0 { return buttons; }
+        p_hlt();
+    }
+    return 0;
+}
+
+// Button command — show button state
+pub fn cmd_button() {
+    con_putc(10);
+    con_putc(66); con_putc(117); con_putc(116); con_putc(116); con_putc(111); con_putc(110); con_putc(115); con_putc(58); con_putc(32);
+    var buttons: i64 = p_mem_read8(BTN_STATE);
+    con_putc(48); con_putc(120);
+    print_hex(buttons);
+    con_putc(10);
+    con_putc(32); con_putc(32); con_putc(85); con_putc(61); con_putc(48 + button_held(BTN_UP));
+    con_putc(32); con_putc(68); con_putc(61); con_putc(48 + button_held(BTN_DOWN));
+    con_putc(32); con_putc(76); con_putc(61); con_putc(48 + button_held(BTN_LEFT));
+    con_putc(32); con_putc(82); con_putc(61); con_putc(48 + button_held(BTN_RIGHT));
+    con_putc(32); con_putc(67); con_putc(61); con_putc(48 + button_held(BTN_CENTER));
+    con_putc(32); con_putc(66); con_putc(61); con_putc(48 + button_held(BTN_BACK));
+    con_putc(10);
+}

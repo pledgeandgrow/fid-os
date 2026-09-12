@@ -29,6 +29,18 @@ const cmds = [
   'sendkey e','sendkey c','sendkey h','sendkey o','sendkey spc','sendkey h','sendkey e','sendkey l','sendkey l','sendkey o','sendkey spc','sendkey shift-backslash','sendkey c','sendkey a','sendkey t','sendkey ret',
   // Test: tcp (connect to 10.0.2.2:80)
   'sendkey t','sendkey c','sendkey p','sendkey ret',
+  // Test: audio (play tones)
+  'sendkey a','sendkey u','sendkey d','sendkey i','sendkey o','sendkey ret',
+  // Test: gfx (graphics info)
+  'sendkey g','sendkey f','sendkey x','sendkey ret',
+  // Test: gpad (gamepad state)
+  'sendkey g','sendkey p','sendkey a','sendkey d','sendkey ret',
+  // Test: gpio (GPIO info)
+  'sendkey g','sendkey p','sendkey i','sendkey o','sendkey ret',
+  // Test: btn (button state)
+  'sendkey b','sendkey t','sendkey n','sendkey ret',
+  // Test: arm (ARM target info)
+  'sendkey a','sendkey r','sendkey m','sendkey ret',
   'quit'
 ];
 let i = 0;

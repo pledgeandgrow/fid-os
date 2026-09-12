@@ -1,0 +1,138 @@
+// kernel/arm_boot.fd — ARM Cortex-M bare-metal boot and vector table generation
+//
+// ARM Cortex-M microcontrollers (STM32, nRF52, RP2040, etc.) use a
+// different boot mechanism than x86 Multiboot2:
+//
+//   1. Vector table at address 0x0 (16 standard entries + N IRQ handlers)
+//   2. First word = initial stack pointer
+//   3. Second word = reset handler address (with thumb bit set)
+//   4. Entries 2-15 = system exception handlers
+//   5. Entry 16+ = peripheral IRQ handlers
+//
+// This module provides:
+//   - Vector table generation for ARM Cortex-M
+//   - Reset handler stub
+//   - Simple delay function
+//   - C codegen integration (generate C, cross-compile with arm-none-eabi-gcc)
+//
+// NOTE: On x86-64, this module is a no-op. It's designed to be compiled
+// with --bare mode for ARM targets.
+//
+// Vector table layout (Cortex-M):
+//   Offset 0x00: Initial SP (stack pointer)
+//   Offset 0x04: Reset handler (with thumb bit)
+//   Offset 0x08: NMI handler
+//   Offset 0x0C: HardFault handler
+//   Offset 0x10: MemManage handler
+//   Offset 0x14: BusFault handler
+//   Offset 0x18: UsageFault handler
+//   Offset 0x1C-0x27: Reserved
+//   Offset 0x28: SVCall handler
+//   Offset 0x2C: Debug Monitor handler
+//   Offset 0x30: Reserved
+//   Offset 0x34: PendSV handler
+//   Offset 0x38: SysTick handler
+//   Offset 0x3C+: IRQ handlers (device-specific)
+
+module arm_boot;
+
+use console;
+
+// ARM Cortex-M vector table constants
+pub const ARM_VECTOR_TABLE_SIZE: i64 = 256;  // 16 system + up to 56 IRQ
+pub const ARM_VECTOR_TABLE_ADDR: i64 = 0x0;  // Must be at address 0
+
+// Default stack pointer for STM32F407 (256KB SRAM at 0x20000000)
+pub const STM32_STACK_TOP: i64 = 0x20040000;
+// Default stack pointer for nRF52 (64KB RAM at 0x20000000)
+pub const NRF52_STACK_TOP: i64 = 0x20010000;
+// Default stack pointer for RP2040 (264KB SRAM at 0x20040000)
+pub const RP2040_STACK_TOP: i64 = 0x20040000;
+
+// Build an ARM Cortex-M vector table in memory
+// Writes the vector table to the specified address
+// reset_handler: address of the reset handler function (with thumb bit)
+// platform: 1=STM32, 2=RP2040, 3=nRF52
+pub fn arm_build_vector_table(addr: i64, reset_handler: i64, platform: i64) {
+    // Entry 0: Initial stack pointer
+    var sp: i64 = STM32_STACK_TOP;
+    if platform == 3 { sp = NRF52_STACK_TOP; }
+    if platform == 2 { sp = RP2040_STACK_TOP; }
+    p_mem_write32(addr, sp);
+
+    // Entry 1: Reset handler (set thumb bit)
+    p_mem_write32(addr + 4, reset_handler | 1);
+
+    // Entries 2-15: System exception handlers (default to a simple handler)
+    var default_handler: i64 = reset_handler | 1;  // reuse reset as default
+    var i: i64 = 2;
+    while i < 16 {
+        p_mem_write32(addr + i * 4, default_handler);
+        i = i + 1;
+    }
+
+    // Entries 16+: IRQ handlers (initialize to default)
+    i = 16;
+    while i < 64 {
+        p_mem_write32(addr + i * 4, default_handler);
+        i = i + 1;
+    }
+}
+
+// ─── ARM C Codegen Integration ──────────────────────────────────────────────
+//
+// To compile Fides code for ARM Cortex-M:
+//
+// 1. Generate C code:
+//    fidesc dump-c program.fd > program.c
+//
+// 2. Cross-compile with arm-none-eabi-gcc:
+//    arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -Os \
+//      -ffreestanding -nostdlib -T linker.ld \
+//      program.c -o program.elf
+//
+// 3. Convert to binary:
+//    arm-none-eabi-objcopy -O binary program.elf program.bin
+//
+// 4. Flash to device:
+//    st-flash write program.bin 0x08000000  (STM32)
+//    openocd -f interface/stlink.cfg -f target/stm32f4x.cfg \
+//      -c "program program.bin 0x08000000 verify reset exit"
+//
+// Example linker script for STM32F407:
+//   MEMORY { FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 1024K
+//            RAM (rwx)  : ORIGIN = 0x20000000, LENGTH = 128K }
+//   SECTIONS {
+//     .text : { *(.isr_vector) *(.text*) } > FLASH
+//     .data : { *(.data*) } > RAM AT > FLASH
+//     .bss : { *(.bss*) } > RAM
+//   }
+
+// ─── Simple ARM delay (busy-wait) ──────────────────────────────────────────
+// On a 168MHz Cortex-M4, each loop iteration is ~3 cycles.
+// delay_ms(1) ≈ 168000000 / 3 / 1000 = 56000 iterations
+
+pub fn arm_delay_ms(ms: i64) {
+    var i: i64 = 0;
+    while i < ms {
+        var j: i64 = 0;
+        while j < 56000 {
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ─── ARM boot command (x86 stub) ─────────────────────────────────────────────
+
+pub fn cmd_arm() {
+    con_putc(10);
+    con_putc(65); con_putc(82); con_putc(77); con_putc(32); con_putc(67); con_putc(111); con_putc(114); con_putc(116); con_putc(101); con_putc(120); con_putc(45); con_putc(77); con_putc(32); con_putc(116); con_putc(97); con_putc(114); con_putc(103); con_putc(101); con_putc(116); con_putc(32); con_putc(115); con_putc(117); con_putc(112); con_putc(112); con_putc(111); con_putc(114); con_putc(116);
+    con_putc(10);
+    con_putc(85); con_putc(115); con_putc(101); con_putc(58); con_putc(32); con_putc(102); con_putc(105); con_putc(100); con_putc(101); con_putc(115); con_putc(99); con_putc(32); con_putc(100); con_putc(117); con_putc(109); con_putc(112); con_putc(45); con_putc(99); con_putc(32); con_putc(112); con_putc(114); con_putc(111); con_putc(103); con_putc(114); con_putc(97); con_putc(109); con_putc(46); con_putc(102); con_putc(100); con_putc(32); con_putc(62); con_putc(32); con_putc(112); con_putc(114); con_putc(111); con_putc(103); con_putc(114); con_putc(97); con_putc(109); con_putc(46); con_putc(99);
+    con_putc(10);
+    con_putc(84); con_putc(104); con_putc(101); con_putc(110); con_putc(32); con_putc(99); con_putc(114); con_putc(111); con_putc(115); con_putc(115); con_putc(45); con_putc(99); con_putc(111); con_putc(109); con_putc(112); con_putc(105); con_putc(108); con_putc(101); con_putc(32); con_putc(119); con_putc(105); con_putc(116); con_putc(104); con_putc(32); con_putc(97); con_putc(114); con_putc(109); con_putc(45); con_putc(110); con_putc(111); con_putc(110); con_putc(101); con_putc(45); con_putc(101); con_putc(97); con_putc(98); con_putc(105); con_putc(45); con_putc(103); con_putc(99); con_putc(99);
+    con_putc(10);
+    con_putc(80); con_putc(108); con_putc(97); con_putc(116); con_putc(102); con_putc(111); con_putc(114); con_putc(109); con_putc(115); con_putc(58); con_putc(32); con_putc(83); con_putc(84); con_putc(77); con_putc(51); con_putc(50); con_putc(44); con_putc(32); con_putc(110); con_putc(82); con_putc(70); con_putc(53); con_putc(50); con_putc(44); con_putc(32); con_putc(82); con_putc(80); con_putc(50); con_putc(48); con_putc(52); con_putc(48);
+    con_putc(10);
+}

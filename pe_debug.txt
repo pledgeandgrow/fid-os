@@ -1,1 +1,1 @@
-[pe] Registering func: main
+[pe] Registering func: shell_dispatch

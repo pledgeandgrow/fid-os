@@ -1,0 +1,423 @@
+// kernel/graphics.fd — Double buffering, sprite engine, and drawing primitives
+//
+// Provides:
+//   - Off-screen back buffer for flicker-free rendering
+//   - fb_flip() to copy back buffer to front framebuffer
+//   - Sprite blitting (transparent and opaque)
+//   - Line and circle drawing
+//   - 1-bit framebuffer mode for monochrome LCDs (Flipper Zero style)
+//
+// Memory layout:
+//   Back buffer at 0x200000 (up to 2MB for 640x480x32bpp = 1.2MB)
+//   Back buffer metadata at 0x1B0100 (initialized flag, width, height, bpp)
+//   1-bit buffer at 0x380000 (for monochrome mode, up to 8KB for 128x64)
+
+module graphics;
+
+use console;
+use framebuffer;
+
+// Back buffer for double buffering
+pub const BACK_BUF_ADDR: i64 = 0x200000;
+pub const BACK_BUF_INIT: i64 = 0x1B0100;   // initialized flag
+pub const BACK_BUF_W: i64 = 0x1B0104;      // back buffer width
+pub const BACK_BUF_H: i64 = 0x1B0108;      // back buffer height
+pub const BACK_BUF_BPP: i64 = 0x1B010C;    // back buffer bpp
+
+// 1-bit monochrome buffer (for Flipper Zero style displays)
+pub const MONO_BUF_ADDR: i64 = 0x380000;
+pub const MONO_BUF_W: i64 = 0x1B0110;
+pub const MONO_BUF_H: i64 = 0x1B0114;
+pub const MONO_BUF_PITCH: i64 = 0x1B0118;
+
+// Initialize the back buffer to match the framebuffer dimensions
+pub fn gfx_init() -> i64 {
+    var w: i64 = fb_read64(FB_WIDTH);
+    var h: i64 = fb_read64(FB_HEIGHT);
+    var bpp: i64 = fb_read64(FB_BPP);
+
+    if w == 0 || h == 0 {
+        // No framebuffer — use default 640x480
+        w = 640;
+        h = 480;
+        bpp = 32;
+    }
+
+    // Clear the back buffer
+    var buf_size: i64 = w * h * (bpp / 8);
+    if buf_size > 0x200000 {
+        buf_size = 0x200000;  // cap at 2MB
+    }
+    var i: i64 = 0;
+    while i < buf_size {
+        p_mem_write8(BACK_BUF_ADDR + i, 0);
+        i = i + 1;
+    }
+
+    p_mem_write8(BACK_BUF_INIT, 1);
+    p_mem_write32(BACK_BUF_W, w);
+    p_mem_write32(BACK_BUF_H, h);
+    p_mem_write32(BACK_BUF_BPP, bpp);
+
+    return 0;
+}
+
+// Set a pixel on the back buffer (off-screen)
+pub fn gfx_putpixel(x: i64, y: i64, color: i64) {
+    var init: i64 = p_mem_read8(BACK_BUF_INIT);
+    if init == 0 { return; }
+    var w: i64 = p_mem_read32(BACK_BUF_W);
+    var h: i64 = p_mem_read32(BACK_BUF_H);
+    if x < 0 || x >= w { return; }
+    if y < 0 || y >= h { return; }
+    var bpp: i64 = p_mem_read32(BACK_BUF_BPP);
+    var offset: i64 = y * w * (bpp / 8) + x * (bpp / 8);
+    p_mem_write32(BACK_BUF_ADDR + offset, color);
+}
+
+// Get a pixel from the back buffer
+pub fn gfx_getpixel(x: i64, y: i64) -> i64 {
+    var init: i64 = p_mem_read8(BACK_BUF_INIT);
+    if init == 0 { return 0; }
+    var w: i64 = p_mem_read32(BACK_BUF_W);
+    var h: i64 = p_mem_read32(BACK_BUF_H);
+    if x < 0 || x >= w { return 0; }
+    if y < 0 || y >= h { return 0; }
+    var bpp: i64 = p_mem_read32(BACK_BUF_BPP);
+    var offset: i64 = y * w * (bpp / 8) + x * (bpp / 8);
+    return p_mem_read32(BACK_BUF_ADDR + offset);
+}
+
+// Fill a rectangle on the back buffer
+pub fn gfx_fillrect(x: i64, y: i64, w: i64, h: i64, color: i64) {
+    var i: i64 = 0;
+    while i < h {
+        var j: i64 = 0;
+        while j < w {
+            gfx_putpixel(x + j, y + i, color);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Clear the back buffer to a color
+pub fn gfx_clear(color: i64) {
+    var w: i64 = p_mem_read32(BACK_BUF_W);
+    var h: i64 = p_mem_read32(BACK_BUF_H);
+    gfx_fillrect(0, 0, w, h, color);
+}
+
+// Copy the back buffer to the front framebuffer (page flip)
+// This is the key function for flicker-free animation.
+pub fn gfx_flip() {
+    var init: i64 = p_mem_read8(BACK_BUF_INIT);
+    if init == 0 { return; }
+
+    var fb_addr: i64 = fb_read64(FB_ADDR);
+    var fb_pitch: i64 = fb_read64(FB_PITCH);
+    var fb_w: i64 = fb_read64(FB_WIDTH);
+    var fb_h: i64 = fb_read64(FB_HEIGHT);
+    var fb_bpp: i64 = fb_read64(FB_BPP);
+
+    if fb_addr == 0 || fb_w == 0 || fb_h == 0 { return; }
+
+    var bytes_per_pixel: i64 = fb_bpp / 8;
+    var bw: i64 = p_mem_read32(BACK_BUF_W);
+    var bh: i64 = p_mem_read32(BACK_BUF_H);
+
+    var y: i64 = 0;
+    while y < fb_h {
+        if y >= bh { break; }
+        var x: i64 = 0;
+        while x < fb_w {
+            if x >= bw { break; }
+            var src_off: i64 = y * bw * bytes_per_pixel + x * bytes_per_pixel;
+            var dst_off: i64 = y * fb_pitch + x * bytes_per_pixel;
+            var pixel: i64 = p_mem_read32(BACK_BUF_ADDR + src_off);
+            p_mem_write32(fb_addr + dst_off, pixel);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// ─── Sprite Engine ─────────────────────────────────────────────────────────
+
+// Blit a sprite (opaque — copies all pixels including background)
+// src_addr: address of sprite data (w * h * bytes_per_pixel)
+// x, y: destination position on back buffer
+// w, h: sprite dimensions
+pub fn gfx_blit(x: i64, y: i64, w: i64, h: i64, src_addr: i64) {
+    var row: i64 = 0;
+    while row < h {
+        var col: i64 = 0;
+        while col < w {
+            var pixel: i64 = p_mem_read32(src_addr + row * w * 4 + col * 4);
+            gfx_putpixel(x + col, y + row, pixel);
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+// Blit a sprite with transparent color (color-key transparency)
+// Pixels matching transparent_color are skipped.
+pub fn gfx_blit_transparent(x: i64, y: i64, w: i64, h: i64, src_addr: i64, transparent_color: i64) {
+    var row: i64 = 0;
+    while row < h {
+        var col: i64 = 0;
+        while col < w {
+            var pixel: i64 = p_mem_read32(src_addr + row * w * 4 + col * 4);
+            if pixel != transparent_color {
+                gfx_putpixel(x + col, y + row, pixel);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+// Blit a 1-bit sprite (monochrome — for Flipper Zero style)
+// Each byte = 8 pixels, bit 7 = leftmost.
+// on_color: color for set bits, off_color: color for clear bits
+pub fn gfx_blit_mono(x: i64, y: i64, w: i64, h: i64, src_addr: i64, on_color: i64, off_color: i64) {
+    var row: i64 = 0;
+    while row < h {
+        var col: i64 = 0;
+        while col < w {
+            var byte_idx: i64 = row * ((w + 7) / 8) + col / 8;
+            var bit: i64 = p_mem_read8(src_addr + byte_idx);
+            var mask: i64 = 0x80 >> (col & 7);
+            if (bit & mask) != 0 {
+                gfx_putpixel(x + col, y + row, on_color);
+            }
+            if (bit & mask) == 0 {
+                gfx_putpixel(x + col, y + row, off_color);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+// ─── Drawing Primitives ────────────────────────────────────────────────────
+
+// Draw a line using Bresenham's algorithm
+pub fn gfx_draw_line(x0: i64, y0: i64, x1: i64, y1: i64, color: i64) {
+    var dx: i64 = x1 - x0;
+    var dy: i64 = y1 - y0;
+    if dx < 0 { dx = -dx; }
+    if dy < 0 { dy = -dy; }
+
+    var sx: i64 = 1;
+    if x0 > x1 { sx = -1; }
+    var sy: i64 = 1;
+    if y0 > y1 { sy = -1; }
+
+    var err: i64 = dx - dy;
+    var x: i64 = x0;
+    var y: i64 = y0;
+
+    while true {
+        gfx_putpixel(x, y, color);
+        if x == x1 && y == y1 { break; }
+        var e2: i64 = err * 2;
+        if e2 > -dy {
+            err = err - dy;
+            x = x + sx;
+        }
+        if e2 < dx {
+            err = err + dx;
+            y = y + sy;
+        }
+    }
+}
+
+// Draw a rectangle outline
+pub fn gfx_draw_rect(x: i64, y: i64, w: i64, h: i64, color: i64) {
+    gfx_draw_line(x, y, x + w - 1, y, color);           // top
+    gfx_draw_line(x, y + h - 1, x + w - 1, y + h - 1, color);  // bottom
+    gfx_draw_line(x, y, x, y + h - 1, color);           // left
+    gfx_draw_line(x + w - 1, y, x + w - 1, y + h - 1, color);  // right
+}
+
+// Draw a circle using midpoint circle algorithm
+pub fn gfx_draw_circle(cx: i64, cy: i64, radius: i64, color: i64) {
+    var x: i64 = radius;
+    var y: i64 = 0;
+    var err: i64 = 0;
+
+    while x >= y {
+        gfx_putpixel(cx + x, cy + y, color);
+        gfx_putpixel(cx + y, cy + x, color);
+        gfx_putpixel(cx - y, cy + x, color);
+        gfx_putpixel(cx - x, cy + y, color);
+        gfx_putpixel(cx - x, cy - y, color);
+        gfx_putpixel(cx - y, cy - x, color);
+        gfx_putpixel(cx + y, cy - x, color);
+        gfx_putpixel(cx + x, cy - y, color);
+
+        y = y + 1;
+        if err <= 0 {
+            err = err + 2 * y + 1;
+        }
+        if err > 0 {
+            x = x - 1;
+            err = err - 2 * x + 1;
+        }
+    }
+}
+
+// Fill a circle
+pub fn gfx_fill_circle(cx: i64, cy: i64, radius: i64, color: i64) {
+    var y: i64 = -radius;
+    while y <= radius {
+        var x: i64 = -radius;
+        while x <= radius {
+            if x * x + y * y <= radius * radius {
+                gfx_putpixel(cx + x, cy + y, color);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// ─── 1-bit Monochrome Mode (Flipper Zero style) ────────────────────────────
+
+// Initialize 1-bit monochrome buffer
+// width x height pixels, 1 bit per pixel, 8 pixels per byte
+pub const MONO_INIT: i64 = 0x1B011C;
+
+pub fn mono_init(width: i64, height: i64) {
+    p_mem_write32(MONO_BUF_W, width);
+    p_mem_write32(MONO_BUF_H, height);
+    var pitch: i64 = (width + 7) / 8;
+    p_mem_write32(MONO_BUF_PITCH, pitch);
+    p_mem_write8(MONO_INIT, 1);
+    // Clear buffer
+    var buf_size: i64 = pitch * height;
+    var i: i64 = 0;
+    while i < buf_size {
+        p_mem_write8(MONO_BUF_ADDR + i, 0);
+        i = i + 1;
+    }
+}
+
+// Set a pixel in the 1-bit monochrome buffer
+// on = 1 for black (set), 0 for white (clear)
+pub fn mono_putpixel(x: i64, y: i64, on: i64) {
+    var init: i64 = p_mem_read8(MONO_INIT);
+    if init == 0 { return; }
+    var w: i64 = p_mem_read32(MONO_BUF_W);
+    var h: i64 = p_mem_read32(MONO_BUF_H);
+    if x < 0 || x >= w { return; }
+    if y < 0 || y >= h { return; }
+    var pitch: i64 = p_mem_read32(MONO_BUF_PITCH);
+    var byte_idx: i64 = y * pitch + x / 8;
+    var bit_mask: i64 = 0x80 >> (x & 7);
+    var current: i64 = p_mem_read8(MONO_BUF_ADDR + byte_idx);
+    if on != 0 {
+        current = current | bit_mask;
+    }
+    if on == 0 {
+        current = current & (0xFF ^ bit_mask);
+    }
+    p_mem_write8(MONO_BUF_ADDR + byte_idx, current);
+}
+
+// Get a pixel from the 1-bit monochrome buffer
+pub fn mono_getpixel(x: i64, y: i64) -> i64 {
+    var w: i64 = p_mem_read32(MONO_BUF_W);
+    var h: i64 = p_mem_read32(MONO_BUF_H);
+    if x < 0 || x >= w { return 0; }
+    if y < 0 || y >= h { return 0; }
+    var pitch: i64 = p_mem_read32(MONO_BUF_PITCH);
+    var byte_idx: i64 = y * pitch + x / 8;
+    var bit_mask: i64 = 0x80 >> (x & 7);
+    var current: i64 = p_mem_read8(MONO_BUF_ADDR + byte_idx);
+    if (current & bit_mask) != 0 { return 1; }
+    return 0;
+}
+
+// Clear the monochrome buffer
+pub fn mono_clear() {
+    var pitch: i64 = p_mem_read32(MONO_BUF_PITCH);
+    var h: i64 = p_mem_read32(MONO_BUF_H);
+    var buf_size: i64 = pitch * h;
+    var i: i64 = 0;
+    while i < buf_size {
+        p_mem_write8(MONO_BUF_ADDR + i, 0);
+        i = i + 1;
+    }
+}
+
+// Fill a rect in the monochrome buffer
+pub fn mono_fillrect(x: i64, y: i64, w: i64, h: i64, on: i64) {
+    var i: i64 = 0;
+    while i < h {
+        var j: i64 = 0;
+        while j < w {
+            mono_putpixel(x + j, y + i, on);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Draw a character to the monochrome buffer (8x16 font)
+pub fn mono_draw_char(x: i64, y: i64, c: i64) {
+    if c < 32 || c > 127 { c = 32; }
+    var font_off: i64 = FB_FONT_ADDR + (c - 32) * 16;
+    var row: i64 = 0;
+    while row < 16 {
+        var bits: i64 = p_mem_read8(font_off + row);
+        var col: i64 = 0;
+        while col < 8 {
+            if (bits & (0x80 >> col)) != 0 {
+                mono_putpixel(x + col, y + row, 1);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+// Print a string to the monochrome buffer
+pub fn mono_print(x: i64, y: i64, text_addr: i64, text_len: i64) {
+    var i: i64 = 0;
+    var cx: i64 = x;
+    while i < text_len {
+        var c: i64 = p_mem_read8(text_addr + i);
+        if c == 10 {
+            y = y + 16;
+            cx = x;
+        }
+        if c != 10 {
+            mono_draw_char(cx, y, c);
+            cx = cx + 8;
+        }
+        i = i + 1;
+    }
+}
+
+// ─── Graphics command ──────────────────────────────────────────────────────
+
+pub fn cmd_gfx() {
+    con_putc(10);
+    var init: i64 = p_mem_read8(BACK_BUF_INIT);
+    if init == 0 {
+        con_putc(71); con_putc(70); con_putc(88); con_putc(58); con_putc(32); con_putc(110); con_putc(111); con_putc(116); con_putc(32); con_putc(105); con_putc(110); con_putc(105); con_putc(116);
+        con_putc(10);
+        return;
+    }
+    var w: i64 = p_mem_read32(BACK_BUF_W);
+    var h: i64 = p_mem_read32(BACK_BUF_H);
+    con_putc(71); con_putc(70); con_putc(88); con_putc(58); con_putc(32);
+    print_dec(w);
+    con_putc(120);  // 'x'
+    print_dec(h);
+    con_putc(32); con_putc(100); con_putc(111); con_putc(117); con_putc(98); con_putc(108); con_putc(101); con_putc(45); con_putc(98); con_putc(117); con_putc(102);
+    con_putc(10);
+}

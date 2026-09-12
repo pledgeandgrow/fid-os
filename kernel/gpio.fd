@@ -1,0 +1,459 @@
+// kernel/gpio.fd — GPIO, I2C, and SPI drivers for embedded targets
+//
+// These are register-mapped peripheral drivers designed for:
+//   - ARM Cortex-M microcontrollers (STM32, nRF52, etc.)
+//   - Flipper Zero (STM32F407)
+//   - Raspberry Pi (Broadcom BCM2835)
+//   - Any platform with memory-mapped GPIO/I2C/SPI
+//
+// On x86-64 (current OS), these are stubs that return error codes.
+// On ARM/embedded targets, the platform-specific base addresses
+// are configured via gpio_set_base().
+//
+// GPIO state:
+//   0x700000 — GPIO base address (8 bytes)
+//   0x700008 — I2C base address (8 bytes)
+//   0x700010 — SPI base address (8 bytes)
+//   0x700018 — platform type (4 bytes: 0=x86, 1=STM32, 2=RPi, 3=nRF52)
+
+module gpio;
+
+use console;
+
+// Base addresses (configurable at runtime)
+pub const GPIO_BASE_ADDR: i64 = 0x700000;
+pub const I2C_BASE_ADDR: i64 = 0x700008;
+pub const SPI_BASE_ADDR: i64 = 0x700010;
+pub const PLATFORM_TYPE: i64 = 0x700018;
+
+// Platform types
+pub const PLAT_X86: i64 = 0;
+pub const PLAT_STM32: i64 = 1;
+pub const PLAT_RPI: i64 = 2;
+pub const PLAT_NRF52: i64 = 3;
+
+// GPIO modes
+pub const GPIO_INPUT: i64 = 0;
+pub const GPIO_OUTPUT: i64 = 1;
+pub const GPIO_ALT_FUNC: i64 = 2;
+pub const GPIO_ANALOG: i64 = 3;
+
+// GPIO pull resistor
+pub const GPIO_PULL_NONE: i64 = 0;
+pub const GPIO_PULL_UP: i64 = 1;
+pub const GPIO_PULL_DOWN: i64 = 2;
+
+// GPIO edge trigger
+pub const GPIO_EDGE_NONE: i64 = 0;
+pub const GPIO_EDGE_RISING: i64 = 1;
+pub const GPIO_EDGE_FALLING: i64 = 2;
+pub const GPIO_EDGE_BOTH: i64 = 3;
+
+// ─── Platform Configuration ─────────────────────────────────────────────────
+
+// Set the platform type and configure base addresses
+pub fn gpio_set_platform(platform: i64) {
+    p_mem_write32(PLATFORM_TYPE, platform);
+    if platform == PLAT_STM32 {
+        // STM32F407 GPIO base: 0x40020000 (GPIOA)
+        p_mem_write32(GPIO_BASE_ADDR, 0x40020000);
+        p_mem_write32(I2C_BASE_ADDR, 0x40005400);  // I2C1
+        p_mem_write32(SPI_BASE_ADDR, 0x40013000);  // SPI1
+    }
+    if platform == PLAT_RPI {
+        // BCM2835 GPIO base: 0x3F200000
+        p_mem_write32(GPIO_BASE_ADDR, 0x3F200000);
+        p_mem_write32(I2C_BASE_ADDR, 0x3F804000);  // BSC1
+        p_mem_write32(SPI_BASE_ADDR, 0x3F204000);  // SPI0
+    }
+    if platform == PLAT_NRF52 {
+        // nRF52 GPIO base: 0x50000000
+        p_mem_write32(GPIO_BASE_ADDR, 0x50000000);
+        p_mem_write32(I2C_BASE_ADDR, 0x40003000);  // TWI0
+        p_mem_write32(SPI_BASE_ADDR, 0x40004000);  // SPI0
+    }
+    if platform == PLAT_X86 {
+        p_mem_write32(GPIO_BASE_ADDR, 0);
+        p_mem_write32(I2C_BASE_ADDR, 0);
+        p_mem_write32(SPI_BASE_ADDR, 0);
+    }
+}
+
+// Check if GPIO is available on this platform
+pub fn gpio_available() -> i64 {
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    if platform == PLAT_X86 { return 0; }
+    return 1;
+}
+
+// ─── GPIO Operations ────────────────────────────────────────────────────────
+
+// STM32F4 GPIO register offsets (per port, 0x400 per port)
+//   MODER:   offset 0x00 (2 bits per pin, 16 pins)
+//   OTYPER:  offset 0x04 (1 bit per pin)
+//   OSPEEDR: offset 0x08 (2 bits per pin)
+//   PUPDR:   offset 0x0C (2 bits per pin)
+//   IDR:     offset 0x10 (input data, 1 bit per pin)
+//   ODR:     offset 0x14 (output data, 1 bit per pin)
+//   BSRR:    offset 0x18 (set/reset, write 1 to set bit n, write 1 to bit n+16 to reset)
+//   LCKR:    offset 0x1C
+//   AFRL:    offset 0x20 (alternate function low, 4 bits per pin, pins 0-7)
+//   AFRH:    offset 0x24 (alternate function high, pins 8-15)
+
+// Set GPIO pin mode (0-15 for STM32, 0-53 for RPi)
+// pin: pin number (0-15 for STM32 port A, 16-31 for port B, etc.)
+pub fn gpio_set_mode(pin: i64, mode: i64) {
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    if platform == PLAT_X86 { return; }
+
+    if platform == PLAT_STM32 {
+        // Each port is 0x400 apart. Port = pin / 16, pin_in_port = pin % 16
+        var port: i64 = pin / 16;
+        var pin_in_port: i64 = pin % 16;
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR) + port * 0x400;
+        // MODER: 2 bits per pin
+        var reg: i64 = p_mem_read32(base + 0x00);
+        reg = reg & ~(3 << (pin_in_port * 2));
+        reg = reg | (mode << (pin_in_port * 2));
+        p_mem_write32(base + 0x00, reg);
+    }
+
+    if platform == PLAT_RPI {
+        // BCM2835 GPFSEL: 3 bits per pin, 10 pins per register
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR);
+        var reg_idx: i64 = pin / 10;
+        var bit_pos: i64 = (pin % 10) * 3;
+        var reg: i64 = p_mem_read32(base + reg_idx * 4);
+        reg = reg & ~(7 << bit_pos);
+        reg = reg | (mode << bit_pos);
+        p_mem_write32(base + reg_idx * 4, reg);
+    }
+
+    if platform == PLAT_NRF52 {
+        // nRF52: PIN_CNF[n] at base + 0x700 + n*4
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR);
+        // Direction: bit 0 (0=input, 1=output)
+        var conf: i64 = 0;
+        if mode == GPIO_OUTPUT { conf = 1; }
+        if mode == GPIO_INPUT { conf = 0; }
+        p_mem_write32(base + 0x700 + pin * 4, conf);
+    }
+}
+
+// Set GPIO pin high (1) or low (0)
+pub fn gpio_write(pin: i64, value: i64) {
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    if platform == PLAT_X86 { return; }
+
+    if platform == PLAT_STM32 {
+        var port: i64 = pin / 16;
+        var pin_in_port: i64 = pin % 16;
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR) + port * 0x400;
+        // BSRR: bit n = set, bit n+16 = reset
+        if value != 0 {
+            p_mem_write32(base + 0x18, 1 << pin_in_port);
+        }
+        if value == 0 {
+            p_mem_write32(base + 0x18, 1 << (pin_in_port + 16));
+        }
+    }
+
+    if platform == PLAT_RPI {
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR);
+        if value != 0 {
+            // GPSET0: offset 0x1C, bit = pin
+            p_mem_write32(base + 0x1C, 1 << pin);
+        }
+        if value == 0 {
+            // GPCLR0: offset 0x28, bit = pin
+            p_mem_write32(base + 0x28, 1 << pin);
+        }
+    }
+
+    if platform == PLAT_NRF52 {
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR);
+        if value != 0 {
+            // OUTSET: offset 0x08
+            p_mem_write32(base + 0x08, 1 << pin);
+        }
+        if value == 0 {
+            // OUTCLR: offset 0x0C
+            p_mem_write32(base + 0x0C, 1 << pin);
+        }
+    }
+}
+
+// Read GPIO pin (returns 0 or 1)
+pub fn gpio_read(pin: i64) -> i64 {
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    if platform == PLAT_X86 { return 0; }
+
+    if platform == PLAT_STM32 {
+        var port: i64 = pin / 16;
+        var pin_in_port: i64 = pin % 16;
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR) + port * 0x400;
+        // IDR: offset 0x10
+        var reg: i64 = p_mem_read32(base + 0x10);
+        if (reg & (1 << pin_in_port)) != 0 { return 1; }
+        return 0;
+    }
+
+    if platform == PLAT_RPI {
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR);
+        // GPLEV0: offset 0x34
+        var reg: i64 = p_mem_read32(base + 0x34);
+        if (reg & (1 << pin)) != 0 { return 1; }
+        return 0;
+    }
+
+    if platform == PLAT_NRF52 {
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR);
+        // IN: offset 0x10
+        var reg: i64 = p_mem_read32(base + 0x10);
+        if (reg & (1 << pin)) != 0 { return 1; }
+        return 0;
+    }
+
+    return 0;
+}
+
+// Set pull resistor for a GPIO pin
+pub fn gpio_set_pull(pin: i64, pull: i64) {
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    if platform == PLAT_X86 { return; }
+
+    if platform == PLAT_STM32 {
+        var port: i64 = pin / 16;
+        var pin_in_port: i64 = pin % 16;
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR) + port * 0x400;
+        // PUPDR: offset 0x0C, 2 bits per pin
+        var pupd: i64 = 0;
+        if pull == GPIO_PULL_UP { pupd = 1; }
+        if pull == GPIO_PULL_DOWN { pupd = 2; }
+        var reg: i64 = p_mem_read32(base + 0x0C);
+        reg = reg & ~(3 << (pin_in_port * 2));
+        reg = reg | (pupd << (pin_in_port * 2));
+        p_mem_write32(base + 0x0C, reg);
+    }
+
+    if platform == PLAT_RPI {
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR);
+        // BCM2835: GPPUD (offset 0x94), GPPUDCLK0 (offset 0x98)
+        p_mem_write32(base + 0x94, pull);
+        // Wait 150 cycles
+        var i: i64 = 0;
+        while i < 150 { i = i + 1; }
+        p_mem_write32(base + 0x98, 1 << pin);
+        i = 0;
+        while i < 150 { i = i + 1; }
+        p_mem_write32(base + 0x94, 0);
+        p_mem_write32(base + 0x98, 0);
+    }
+
+    if platform == PLAT_NRF52 {
+        var base: i64 = p_mem_read32(GPIO_BASE_ADDR);
+        // PIN_CNF[n]: bits 2-3 = pull (0=none, 1=pulldown, 3=pullup)
+        var conf: i64 = p_mem_read32(base + 0x700 + pin * 4);
+        conf = conf & ~(3 << 2);
+        if pull == GPIO_PULL_DOWN { conf = conf | (1 << 2); }
+        if pull == GPIO_PULL_UP { conf = conf | (3 << 2); }
+        p_mem_write32(base + 0x700 + pin * 4, conf);
+    }
+}
+
+// Toggle a GPIO pin
+pub fn gpio_toggle(pin: i64) {
+    var current: i64 = gpio_read(pin);
+    if current != 0 {
+        gpio_write(pin, 0);
+    }
+    if current == 0 {
+        gpio_write(pin, 1);
+    }
+}
+
+// ─── I2C Operations ─────────────────────────────────────────────────────────
+// I2C is a 2-wire serial bus: SDA (data) + SCL (clock)
+// Used for sensors, displays, EEPROMs, etc.
+
+// STM32F4 I2C1 register offsets:
+//   CR1:   0x00 — control register 1
+//   CR2:   0x04 — control register 2
+//   DR:    0x10 — data register
+//   SR1:   0x14 — status register 1
+//   SR2:   0x18 — status register 2
+//   OAR1:  0x08 — own address register 1
+//   CCR:   0x0C — clock control register
+//   TRISE: 0x10 — rise time register
+
+// Write a byte to an I2C device
+// addr: 7-bit I2C address
+// reg: register address
+// data: byte to write
+pub fn i2c_write_byte(addr: i64, reg: i64, data: i64) -> i64 {
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    if platform == PLAT_X86 { return -1; }
+
+    var base: i64 = p_mem_read32(I2C_BASE_ADDR);
+    if base == 0 { return -1; }
+
+    if platform == PLAT_STM32 {
+        // Generate START
+        p_mem_write32(base + 0x00, 0x0100);  // CR1: START
+        // Wait for SB (start bit sent)
+        var timeout: i64 = 0;
+        while (p_mem_read32(base + 0x14) & 0x01) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        // Send address + write bit
+        p_mem_write32(base + 0x10, (addr << 1) & 0xFE);  // DR: address + W
+        // Wait for ADDR (address sent)
+        timeout = 0;
+        while (p_mem_read32(base + 0x14) & 0x02) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        p_mem_read32(base + 0x18);  // clear ADDR by reading SR2
+        // Send register
+        p_mem_write32(base + 0x10, reg);
+        // Wait for TXE (tx empty)
+        timeout = 0;
+        while (p_mem_read32(base + 0x14) & 0x80) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        // Send data
+        p_mem_write32(base + 0x10, data);
+        // Wait for BTF (byte transfer finished)
+        timeout = 0;
+        while (p_mem_read32(base + 0x14) & 0x04) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        // Generate STOP
+        p_mem_write32(base + 0x00, 0x0200);  // CR1: STOP
+        return 0;
+    }
+
+    return -1;  // TODO: RPi and nRF52 I2C
+}
+
+// Read a byte from an I2C device
+pub fn i2c_read_byte(addr: i64, reg: i64) -> i64 {
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    if platform == PLAT_X86 { return -1; }
+
+    var base: i64 = p_mem_read32(I2C_BASE_ADDR);
+    if base == 0 { return -1; }
+
+    if platform == PLAT_STM32 {
+        // Generate START
+        p_mem_write32(base + 0x00, 0x0100);
+        var timeout: i64 = 0;
+        while (p_mem_read32(base + 0x14) & 0x01) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        // Send address + write
+        p_mem_write32(base + 0x10, (addr << 1) & 0xFE);
+        timeout = 0;
+        while (p_mem_read32(base + 0x14) & 0x02) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        p_mem_read32(base + 0x18);
+        // Send register
+        p_mem_write32(base + 0x10, reg);
+        timeout = 0;
+        while (p_mem_read32(base + 0x14) & 0x80) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        // Repeated START
+        p_mem_write32(base + 0x00, 0x0100);
+        timeout = 0;
+        while (p_mem_read32(base + 0x14) & 0x01) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        // Send address + read
+        p_mem_write32(base + 0x10, (addr << 1) | 1);
+        timeout = 0;
+        while (p_mem_read32(base + 0x14) & 0x02) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        p_mem_read32(base + 0x18);
+        // Enable ACK + POS
+        p_mem_write32(base + 0x00, 0x0400);  // CR1: ACK
+        // Wait for RXNE
+        timeout = 0;
+        while (p_mem_read32(base + 0x14) & 0x40) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        var data: i64 = p_mem_read32(base + 0x10);
+        // STOP
+        p_mem_write32(base + 0x00, 0x0200);
+        return data & 0xFF;
+    }
+
+    return -1;
+}
+
+// ─── SPI Operations ─────────────────────────────────────────────────────────
+// SPI is a 4-wire serial bus: MOSI, MISO, SCLK, CS
+// Used for displays, SD cards, flash, etc.
+
+// STM32F4 SPI1 register offsets:
+//   CR1:  0x00 — control register 1
+//   CR2:  0x04 — control register 2
+//   SR:   0x08 — status register
+//   DR:   0x0C — data register
+//   CRCPR: 0x10
+//   RXCRCR: 0x14
+//   TXCRCR: 0x18
+
+// Transfer a byte over SPI (full-duplex)
+// Returns the byte received
+pub fn spi_transfer(data: i64) -> i64 {
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    if platform == PLAT_X86 { return -1; }
+
+    var base: i64 = p_mem_read32(SPI_BASE_ADDR);
+    if base == 0 { return -1; }
+
+    if platform == PLAT_STM32 {
+        // Wait for TXE (tx buffer empty)
+        var timeout: i64 = 0;
+        while (p_mem_read32(base + 0x08) & 0x02) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        // Write data
+        p_mem_write32(base + 0x0C, data & 0xFF);
+        // Wait for RXNE (rx buffer not empty)
+        timeout = 0;
+        while (p_mem_read32(base + 0x08) & 0x01) == 0 {
+            timeout = timeout + 1;
+            if timeout > 100000 { return -1; }
+        }
+        return p_mem_read32(base + 0x0C) & 0xFF;
+    }
+
+    return -1;
+}
+
+// ─── GPIO/I2C/SPI command ───────────────────────────────────────────────────
+
+pub fn cmd_gpio() {
+    con_putc(10);
+    var platform: i64 = p_mem_read32(PLATFORM_TYPE);
+    con_putc(71); con_putc(80); con_putc(73); con_putc(79); con_putc(58); con_putc(32); con_putc(112); con_putc(108); con_putc(97); con_putc(116); con_putc(102); con_putc(111); con_putc(114); con_putc(109); con_putc(61);
+    if platform == PLAT_X86 { con_putc(120); con_putc(56); con_putc(54); con_putc(32); con_putc(40); con_putc(110); con_putc(111); con_putc(32); con_putc(71); con_putc(80); con_putc(73); con_putc(79); con_putc(41); }
+    if platform == PLAT_STM32 { con_putc(83); con_putc(84); con_putc(77); con_putc(51); con_putc(50); }
+    if platform == PLAT_RPI { con_putc(82); con_putc(80); con_putc(105); }
+    if platform == PLAT_NRF52 { con_putc(110); con_putc(82); con_putc(70); con_putc(53); con_putc(50); }
+    con_putc(10);
+}

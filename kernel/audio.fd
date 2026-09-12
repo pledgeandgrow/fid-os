@@ -1,0 +1,214 @@
+// kernel/audio.fd — PC speaker audio (beeper) and SoundBlaster 16 stub
+//
+// The PC speaker is driven by PIT channel 2 (port 0x42).
+// The speaker is connected to the PIT channel 2 output via gate bit 0
+// of port 0x61 (System Control Port B).
+//
+// To play a tone:
+//   1. Configure PIT channel 2 for square wave mode (mode 3)
+//   2. Set the frequency divisor (1193182 / freq_hz)
+//   3. Enable the speaker gate (port 0x61, bit 0 = on, bit 1 = PIT input)
+//
+// To mute:
+//   1. Clear bit 0 of port 0x61 (speaker gate off)
+//
+// Memory layout:
+//   0x6F0 — current frequency (4 bytes)
+//   0x6F4 — speaker on/off flag (1 byte)
+
+module audio;
+
+use console;
+
+// PIT channel 2 ports
+const PIT_CH2_DATA: i64 = 0x42;
+const PIT_CMD_PORT: i64 = 0x43;
+const PIT_FREQ: i64 = 1193182;
+
+// System Control Port B — speaker gate
+const SPEAKER_PORT: i64 = 0x61;
+
+// Audio state
+pub const AUDIO_FREQ_ADDR: i64 = 0x6F0;
+pub const AUDIO_ON_ADDR: i64 = 0x6F4;
+
+// Musical note frequency table (Hz) for octaves 3-5
+// Index = note number (0=C3, 1=C#3, ... 12=C4, etc.)
+// Stored at 0x6F8 (48 entries × 4 bytes = 192 bytes)
+pub const NOTE_TABLE: i64 = 0x6F8;
+
+// Initialize audio subsystem
+pub fn audio_init() {
+    p_mem_write32(AUDIO_FREQ_ADDR, 0);
+    p_mem_write8(AUDIO_ON_ADDR, 0);
+    // Initialize note frequency table
+    // Octave 3
+    p_mem_write32(NOTE_TABLE + 0, 131);   // C3
+    p_mem_write32(NOTE_TABLE + 4, 139);   // C#3
+    p_mem_write32(NOTE_TABLE + 8, 147);   // D3
+    p_mem_write32(NOTE_TABLE + 12, 156);  // D#3
+    p_mem_write32(NOTE_TABLE + 16, 165);  // E3
+    p_mem_write32(NOTE_TABLE + 20, 175);  // F3
+    p_mem_write32(NOTE_TABLE + 24, 185);  // F#3
+    p_mem_write32(NOTE_TABLE + 28, 196);  // G3
+    p_mem_write32(NOTE_TABLE + 32, 208);  // G#3
+    p_mem_write32(NOTE_TABLE + 36, 220);  // A3
+    p_mem_write32(NOTE_TABLE + 40, 233);  // A#3
+    p_mem_write32(NOTE_TABLE + 44, 247);  // B3
+    // Octave 4
+    p_mem_write32(NOTE_TABLE + 48, 262);  // C4
+    p_mem_write32(NOTE_TABLE + 52, 277);  // C#4
+    p_mem_write32(NOTE_TABLE + 56, 294);  // D4
+    p_mem_write32(NOTE_TABLE + 60, 311);  // D#4
+    p_mem_write32(NOTE_TABLE + 64, 330);  // E4
+    p_mem_write32(NOTE_TABLE + 68, 349);  // F4
+    p_mem_write32(NOTE_TABLE + 72, 370);  // F#4
+    p_mem_write32(NOTE_TABLE + 76, 392);  // G4
+    p_mem_write32(NOTE_TABLE + 80, 415);  // G#4
+    p_mem_write32(NOTE_TABLE + 84, 440);  // A4
+    p_mem_write32(NOTE_TABLE + 88, 466);  // A#4
+    p_mem_write32(NOTE_TABLE + 92, 494);  // B4
+    // Octave 5
+    p_mem_write32(NOTE_TABLE + 96, 523);  // C5
+    p_mem_write32(NOTE_TABLE + 100, 554); // C#5
+    p_mem_write32(NOTE_TABLE + 104, 587); // D5
+    p_mem_write32(NOTE_TABLE + 108, 622); // D#5
+    p_mem_write32(NOTE_TABLE + 112, 659); // E5
+    p_mem_write32(NOTE_TABLE + 116, 698); // F5
+    p_mem_write32(NOTE_TABLE + 120, 740); // F#5
+    p_mem_write32(NOTE_TABLE + 124, 784); // G5
+    p_mem_write32(NOTE_TABLE + 128, 831); // G#5
+    p_mem_write32(NOTE_TABLE + 132, 880); // A5
+    p_mem_write32(NOTE_TABLE + 136, 932); // A#5
+    p_mem_write32(NOTE_TABLE + 140, 988); // B5
+}
+
+// Play a tone at the given frequency (Hz).
+// Configures PIT channel 2 for square wave mode and enables the speaker.
+pub fn play_tone(freq: i64) {
+    var ok: i64 = 1;
+    if freq < 20 { ok = 0; }
+    if freq > 20000 { ok = 0; }
+    if ok == 0 {
+        // nothing — invalid frequency
+    }
+    if ok == 1 {
+    // Compute divisor
+    var divisor: i64 = PIT_FREQ / freq;
+    if divisor < 1 { divisor = 1; }
+    if divisor > 65535 { divisor = 65535; }
+
+    // Configure PIT channel 2: mode 3 (square wave), lobyte/hibyte access
+    p_outb(PIT_CMD_PORT, 0xB6);
+    p_outb(PIT_CH2_DATA, divisor & 0xFF);
+    p_outb(PIT_CH2_DATA, (divisor >> 8) & 0xFF);
+
+    // Enable speaker: read port 0x61, set bits 0 and 1
+    var speaker_state: i64 = p_inb(SPEAKER_PORT);
+    speaker_state = speaker_state | 0x03;
+    p_outb(SPEAKER_PORT, speaker_state);
+
+    // Save state
+    p_mem_write32(AUDIO_FREQ_ADDR, freq);
+    p_mem_write8(AUDIO_ON_ADDR, 1);
+    }
+}
+
+// Mute the PC speaker (turn off gate)
+pub fn play_mute() {
+    var speaker_state: i64 = p_inb(SPEAKER_PORT);
+    speaker_state = speaker_state & 0xFC;  // clear bits 0 and 1
+    p_outb(SPEAKER_PORT, speaker_state);
+    p_mem_write32(AUDIO_FREQ_ADDR, 0);
+    p_mem_write8(AUDIO_ON_ADDR, 0);
+}
+
+// Play a tone for a given duration (in PIT ticks).
+// Uses a busy-wait loop since we don't have a sleep syscall.
+// duration: number of ~1ms iterations to wait
+pub fn play_tone_duration(freq: i64, duration: i64) {
+    play_tone(freq);
+    // Busy-wait for duration iterations
+    var i: i64 = 0;
+    while i < duration {
+        // Each iteration is roughly 1ms on a typical CPU
+        var j: i64 = 0;
+        while j < 100000 {
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    play_mute();
+}
+
+// Play a note by index (0-35 = C3..B5)
+pub fn play_note(note: i64, duration: i64) {
+    var ok: i64 = 1;
+    if note < 0 { ok = 0; }
+    if note >= 36 { ok = 0; }
+    if ok == 1 {
+        var freq: i64 = p_mem_read32(NOTE_TABLE + note * 4);
+        play_tone_duration(freq, duration);
+    }
+}
+
+// Play a simple melody (array of note indices at NOTE_MELODY_ADDR)
+// Each note is 4 bytes: note index (2 bytes) + duration in ms (2 bytes)
+// note = 0xFFFF means rest (silence for duration)
+pub const MELODY_BUF: i64 = 0x780;
+pub const MELODY_MAX: i64 = 64;
+
+pub fn play_melody(addr: i64, count: i64) {
+    var i: i64 = 0;
+    while i < count {
+        var note: i64 = p_mem_read16(addr + i * 4);
+        var duration: i64 = p_mem_read16(addr + i * 4 + 2);
+        if note == 0xFFFF {
+            // Rest — just wait
+            var w: i64 = 0;
+            while w < duration {
+                var j: i64 = 0;
+                while j < 100000 { j = j + 1; }
+                w = w + 1;
+            }
+        }
+        if note != 0xFFFF {
+            play_note(note, duration);
+        }
+        i = i + 1;
+    }
+    play_mute();
+}
+
+// Play the startup jingle (C-E-G-C arpeggio)
+pub fn play_startup_jingle() {
+    play_note(12, 100);  // C4
+    play_note(16, 100);  // E4
+    play_note(19, 100);  // G4
+    play_note(24, 200);  // C5
+}
+
+// Audio command — play a test tone
+pub fn cmd_audio() {
+    con_putc(10);
+    play_note(12, 200);  // C4
+    play_note(21, 200);  // A4
+    play_note(24, 200);  // C5
+    con_putc(10);
+}
+
+// Play a melody command
+pub fn cmd_music() {
+    con_putc(10);
+    play_note(12, 150);  // C4
+    play_note(16, 150);  // E4
+    play_note(19, 150);  // G4
+    play_note(24, 150);  // C5
+    play_note(28, 150);  // E5
+    play_note(31, 150);  // G5
+    play_note(24, 150);  // C5
+    play_note(19, 150);  // G4
+    play_note(16, 150);  // E4
+    play_note(12, 300);  // C4
+    con_putc(10);
+}

@@ -1,0 +1,412 @@
+// kernel/gameloop.fd — Kernel-side game loop with fixed timestep
+//
+// Provides a fixed-timestep game loop that:
+//   - Uses the PIT/HPET for timing
+//   - Calls update() and render() callbacks
+//   - Handles frame skipping for lagging frames
+//   - Integrates with the scheduler (cooperative yield)
+//
+// The loop runs at a fixed logic rate (default 60 Hz / 16.67ms per frame)
+// and renders as fast as possible. If the render falls behind, multiple
+// update ticks are processed before the next render.
+//
+// Memory layout:
+//   0x6D8 — frame count (4 bytes)
+//   0x6DC — last tick count (4 bytes)
+//   0x6E0 — accumulator (4 bytes)
+//   0x6E4 — running flag (1 byte)
+
+module gameloop;
+
+use console;
+use audio;
+use gamepad;
+use graphics;
+
+// Game loop state
+pub const GL_FRAME_COUNT: i64 = 0x6D8;
+pub const GL_LAST_TICK: i64 = 0x6DC;
+pub const GL_ACCUMULATOR: i64 = 0x6E0;
+pub const GL_RUNNING: i64 = 0x6E4;
+pub const GL_FPS: i64 = 0x6E5;  // frames per second (for display)
+
+// Default timing: 60 FPS = 16.67ms per frame
+// We use PIT ticks for timing. PIT at 100Hz = 10ms per tick.
+// So 1 frame = ~1.67 ticks ≈ 2 ticks at 100Hz.
+pub const GL_TARGET_FPS: i64 = 60;
+pub const GL_TICKS_PER_FRAME: i64 = 2;  // at 100Hz PIT
+
+// Initialize the game loop
+pub fn gameloop_init() {
+    p_mem_write32(GL_FRAME_COUNT, 0);
+    p_mem_write32(GL_LAST_TICK, 0);
+    p_mem_write32(GL_ACCUMULATOR, 0);
+    p_mem_write8(GL_RUNNING, 0);
+    p_mem_write8(GL_FPS, 0);
+}
+
+// Get the current tick count (from PIT or a simple counter)
+// Since we don't have a reliable PIT read in all configurations,
+// we use a busy-wait based approach.
+var gl_tick_counter: i64 = 0;
+
+fn get_ticks() -> i64 {
+    gl_tick_counter = gl_tick_counter + 1;
+    return gl_tick_counter;
+}
+
+// Sleep for approximately ms milliseconds (busy-wait)
+fn sleep_ms(ms: i64) {
+    var i: i64 = 0;
+    while i < ms {
+        var j: i64 = 0;
+        while j < 50000 {
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Run the game loop.
+// update_fn: address of the update function (called at fixed rate)
+// render_fn: address of the render function (called once per frame)
+// exit_fn: address of the exit check function (returns 1 to exit)
+//
+// NOTE: Due to PE backend limitations with function pointers,
+// we use a simple while loop with inline polling.
+// The game loop is designed to be called from a command handler
+// which contains the game logic inline.
+//
+// This function provides the timing infrastructure.
+// Returns when the game exits (GL_RUNNING set to 0).
+
+pub fn gameloop_start() {
+    p_mem_write8(GL_RUNNING, 1);
+    p_mem_write32(GL_FRAME_COUNT, 0);
+    p_mem_write32(GL_ACCUMULATOR, 0);
+    p_mem_write32(GL_LAST_TICK, get_ticks());
+}
+
+pub fn gameloop_stop() {
+    p_mem_write8(GL_RUNNING, 0);
+    // Mute audio when game exits
+    play_mute();
+}
+
+// Check if the game loop is running
+pub fn gameloop_running() -> i64 {
+    return p_mem_read8(GL_RUNNING);
+}
+
+// Process one frame of the game loop.
+// Returns 1 if the loop should continue, 0 if it should stop.
+// The caller should call this in a while loop:
+//   gameloop_start();
+//   while gameloop_frame() == 1 {
+//       // game logic here
+//   }
+//
+// This handles timing, input polling, and frame counting.
+pub fn gameloop_frame() -> i64 {
+    if p_mem_read8(GL_RUNNING) == 0 { return 0; }
+
+    // Poll gamepad input
+    gamepad_poll();
+
+    // Increment frame count
+    var frame: i64 = p_mem_read32(GL_FRAME_COUNT);
+    frame = frame + 1;
+    p_mem_write32(GL_FRAME_COUNT, frame);
+
+    // Sleep to maintain frame rate (~16ms for 60fps)
+    sleep_ms(16);
+
+    return 1;
+}
+
+// Get the current frame count
+pub fn gameloop_frame_count() -> i64 {
+    return p_mem_read32(GL_FRAME_COUNT);
+}
+
+// ─── Simple Game: Snake ────────────────────────────────────────────────────
+// A complete snake game demonstrating the game loop, graphics, and input.
+//
+// Snake state at 0x390000:
+//   0x390000 — snake X positions (256 bytes, max 256 segments)
+//   0x390100 — snake Y positions (256 bytes)
+//   0x390200 — snake length (4 bytes)
+//   0x390204 — direction (4 bytes: 0=up, 1=right, 2=down, 3=left)
+//   0x390208 — food X (4 bytes)
+//   0x39020C — food Y (4 bytes)
+//   0x390210 — score (4 bytes)
+//   0x390214 — game over flag (1 byte)
+
+pub const SNAKE_X: i64 = 0x390000;
+pub const SNAKE_Y: i64 = 0x390100;
+pub const SNAKE_LEN: i64 = 0x390200;
+pub const SNAKE_DIR: i64 = 0x390204;
+pub const SNAKE_FOOD_X: i64 = 0x390208;
+pub const SNAKE_FOOD_Y: i64 = 0x39020C;
+pub const SNAKE_SCORE: i64 = 0x390210;
+pub const SNAKE_GAME_OVER: i64 = 0x390214;
+
+// Grid size (each cell is 8x8 pixels)
+pub const SNAKE_GRID_W: i64 = 80;   // 640 / 8
+pub const SNAKE_GRID_H: i64 = 60;   // 480 / 8
+pub const SNAKE_CELL: i64 = 8;
+
+// Colors
+pub const SNAKE_COLOR: i64 = 0x0000FF00;  // green
+pub const SNAKE_HEAD_COLOR: i64 = 0x00FFFF00;  // yellow
+pub const SNAKE_FOOD_COLOR: i64 = 0x00FF0000;  // red
+pub const SNAKE_BG_COLOR: i64 = 0x00000000;  // black
+pub const SNAKE_GRID_COLOR: i64 = 0x00101010;  // dark gray
+
+// Simple pseudo-random number generator
+var rng_state: i64 = 12345;
+
+fn rand() -> i64 {
+    rng_state = (rng_state * 1103515245 + 12345) & 0x7FFFFFFF;
+    return rng_state;
+}
+
+fn rand_range(max: i64) -> i64 {
+    return rand() % max;
+}
+
+// Initialize the snake game
+pub fn snake_init() {
+    // Start with a 3-segment snake in the center
+    p_mem_write8(SNAKE_X, 40);
+    p_mem_write8(SNAKE_Y, 30);
+    p_mem_write8(SNAKE_X + 1, 39);
+    p_mem_write8(SNAKE_Y + 1, 30);
+    p_mem_write8(SNAKE_X + 2, 38);
+    p_mem_write8(SNAKE_Y + 2, 30);
+    p_mem_write32(SNAKE_LEN, 3);
+    p_mem_write32(SNAKE_DIR, 1);  // moving right
+    p_mem_write32(SNAKE_SCORE, 0);
+    p_mem_write8(SNAKE_GAME_OVER, 0);
+
+    // Place food
+    snake_place_food();
+
+    // Init graphics
+    gfx_init();
+    gamepad_init();
+    gameloop_start();
+}
+
+// Place food at a random position not on the snake
+pub fn snake_place_food() {
+    var valid: i64 = 0;
+    while valid == 0 {
+        var fx: i64 = rand_range(SNAKE_GRID_W);
+        var fy: i64 = rand_range(SNAKE_GRID_H);
+        p_mem_write32(SNAKE_FOOD_X, fx);
+        p_mem_write32(SNAKE_FOOD_Y, fy);
+        // Check if food is on the snake
+        valid = 1;
+        var i: i64 = 0;
+        var len: i64 = p_mem_read32(SNAKE_LEN);
+        while i < len {
+            var sx: i64 = p_mem_read8(SNAKE_X + i);
+            var sy: i64 = p_mem_read8(SNAKE_Y + i);
+            if sx == fx && sy == fy {
+                valid = 0;
+                i = len;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// Update snake game logic
+pub fn snake_update() {
+    if p_mem_read8(SNAKE_GAME_OVER) != 0 { return; }
+
+    // Read input
+    var buttons: i64 = gamepad_poll();
+    var dir: i64 = p_mem_read32(SNAKE_DIR);
+
+    // Change direction (prevent 180-degree turns)
+    if (buttons & GP_UP) != 0 && dir != 2 { dir = 0; }
+    if (buttons & GP_RIGHT) != 0 && dir != 3 { dir = 1; }
+    if (buttons & GP_DOWN) != 0 && dir != 0 { dir = 2; }
+    if (buttons & GP_LEFT) != 0 && dir != 1 { dir = 3; }
+    p_mem_write32(SNAKE_DIR, dir);
+
+    // Check exit (B button or Esc)
+    if (buttons & GP_B) != 0 {
+        gameloop_stop();
+        return;
+    }
+
+    // Move snake: shift body, update head
+    var len: i64 = p_mem_read32(SNAKE_LEN);
+
+    // Shift body segments
+    var i: i64 = len;
+    while i > 0 {
+        var px: i64 = p_mem_read8(SNAKE_X + i - 1);
+        var py: i64 = p_mem_read8(SNAKE_Y + i - 1);
+        p_mem_write8(SNAKE_X + i, px);
+        p_mem_write8(SNAKE_Y + i, py);
+        i = i - 1;
+    }
+
+    // Update head position
+    var hx: i64 = p_mem_read8(SNAKE_X);
+    var hy: i64 = p_mem_read8(SNAKE_Y);
+    if dir == 0 { hy = hy - 1; }  // up
+    if dir == 1 { hx = hx + 1; }  // right
+    if dir == 2 { hy = hy + 1; }  // down
+    if dir == 3 { hx = hx - 1; }  // left
+
+    // Wrap around screen edges
+    if hx < 0 { hx = SNAKE_GRID_W - 1; }
+    if hx >= SNAKE_GRID_W { hx = 0; }
+    if hy < 0 { hy = SNAKE_GRID_H - 1; }
+    if hy >= SNAKE_GRID_H { hy = 0; }
+
+    p_mem_write8(SNAKE_X, hx);
+    p_mem_write8(SNAKE_Y, hy);
+
+    // Check collision with self
+    i = 1;
+    while i < len {
+        var sx: i64 = p_mem_read8(SNAKE_X + i);
+        var sy: i64 = p_mem_read8(SNAKE_Y + i);
+        if sx == hx && sy == hy {
+            p_mem_write8(SNAKE_GAME_OVER, 1);
+            play_tone_duration(200, 300);  // game over sound
+            i = len;
+        }
+        i = i + 1;
+    }
+
+    // Check food collision
+    var fx: i64 = p_mem_read32(SNAKE_FOOD_X);
+    var fy: i64 = p_mem_read32(SNAKE_FOOD_Y);
+    if hx == fx && hy == fy {
+        // Grow snake
+        len = len + 1;
+        p_mem_write32(SNAKE_LEN, len);
+        // Increase score
+        var score: i64 = p_mem_read32(SNAKE_SCORE);
+        score = score + 10;
+        p_mem_write32(SNAKE_SCORE, score);
+        // Play eat sound
+        play_tone_duration(800, 50);
+        // Place new food
+        snake_place_food();
+    }
+}
+
+// Render the snake game
+pub fn snake_render() {
+    // Clear back buffer
+    gfx_clear(SNAKE_BG_COLOR);
+
+    // Draw grid (optional, subtle)
+    var x: i64 = 0;
+    while x < SNAKE_GRID_W {
+        gfx_fillrect(x * SNAKE_CELL, 0, 1, SNAKE_GRID_H * SNAKE_CELL, SNAKE_GRID_COLOR);
+        x = x + 8;
+    }
+    var y: i64 = 0;
+    while y < SNAKE_GRID_H {
+        gfx_fillrect(0, y * SNAKE_CELL, SNAKE_GRID_W * SNAKE_CELL, 1, SNAKE_GRID_COLOR);
+        y = y + 8;
+    }
+
+    // Draw food
+    var fx: i64 = p_mem_read32(SNAKE_FOOD_X);
+    var fy: i64 = p_mem_read32(SNAKE_FOOD_Y);
+    gfx_fillrect(fx * SNAKE_CELL, fy * SNAKE_CELL, SNAKE_CELL, SNAKE_CELL, SNAKE_FOOD_COLOR);
+
+    // Draw snake
+    var len: i64 = p_mem_read32(SNAKE_LEN);
+    var i: i64 = 0;
+    while i < len {
+        var sx: i64 = p_mem_read8(SNAKE_X + i);
+        var sy: i64 = p_mem_read8(SNAKE_Y + i);
+        var color: i64 = SNAKE_COLOR;
+        if i == 0 { color = SNAKE_HEAD_COLOR; }
+        gfx_fillrect(sx * SNAKE_CELL, sy * SNAKE_CELL, SNAKE_CELL, SNAKE_CELL, color);
+        i = i + 1;
+    }
+
+    // Draw score (text in top-left corner using fb_draw_char)
+    var score: i64 = p_mem_read32(SNAKE_SCORE);
+    // Draw "S:" at position (8, 0)
+    fb_draw_char(8, 0, 83, 0x00FFFFFF, 0);   // 'S'
+    fb_draw_char(16, 0, 58, 0x00FFFFFF, 0);  // ':'
+    // Draw score digits
+    var score_x: i64 = 24;
+    if score >= 100 { fb_draw_char(score_x, 0, 48 + (score / 100) % 10, 0x00FFFFFF, 0); score_x = score_x + 8; }
+    if score >= 10 { fb_draw_char(score_x, 0, 48 + (score / 10) % 10, 0x00FFFFFF, 0); score_x = score_x + 8; }
+    fb_draw_char(score_x, 0, 48 + score % 10, 0x00FFFFFF, 0);
+
+    // Draw game over message
+    if p_mem_read8(SNAKE_GAME_OVER) != 0 {
+        // "GAME OVER" centered
+        var msg_x: i64 = 280;
+        var msg_y: i64 = 220;
+        fb_draw_char(msg_x, msg_y, 71, 0x00FF0000, 0);     // G
+        fb_draw_char(msg_x + 8, msg_y, 65, 0x00FF0000, 0);  // A
+        fb_draw_char(msg_x + 16, msg_y, 77, 0x00FF0000, 0); // M
+        fb_draw_char(msg_x + 24, msg_y, 69, 0x00FF0000, 0); // E
+        fb_draw_char(msg_x + 40, msg_y, 79, 0x00FF0000, 0); // O
+        fb_draw_char(msg_x + 48, msg_y, 86, 0x00FF0000, 0); // V
+        fb_draw_char(msg_x + 56, msg_y, 69, 0x00FF0000, 0); // E
+        fb_draw_char(msg_x + 64, msg_y, 82, 0x00FF0000, 0); // R
+    }
+
+    // Flip back buffer to front
+    gfx_flip();
+}
+
+// Run the snake game
+pub fn cmd_snake() {
+    con_putc(10);
+    con_putc(83); con_putc(110); con_putc(97); con_putc(107); con_putc(101); con_putc(33); con_putc(32); con_putc(65); con_putc(114); con_putc(114); con_putc(111); con_putc(119); con_putc(115); con_putc(47); con_putc(87); con_putc(65); con_putc(83); con_putc(68); con_putc(32); con_putc(116); con_putc(111); con_putc(32); con_putc(109); con_putc(111); con_putc(118); con_putc(101); con_putc(44); con_putc(32); con_putc(66); con_putc(47); con_putc(69); con_putc(115); con_putc(99); con_putc(32); con_putc(116); con_putc(111); con_putc(32); con_putc(113); con_putc(117); con_putc(105); con_putc(116);
+    con_putc(10);
+
+    snake_init();
+    play_startup_jingle();
+
+    // Game loop
+    while gameloop_frame() == 1 {
+        snake_update();
+        snake_render();
+
+        // If game over, wait for a moment then exit
+        if p_mem_read8(SNAKE_GAME_OVER) != 0 {
+            var wait: i64 = 0;
+            while wait < 60 {
+                var buttons: i64 = gamepad_poll();
+                if (buttons & GP_B) != 0 { gameloop_stop(); }
+                if (buttons & GP_A) != 0 {
+                    // Restart
+                    snake_init();
+                    wait = 60;
+                }
+                sleep_ms(16);
+                wait = wait + 1;
+            }
+            if p_mem_read8(SNAKE_GAME_OVER) != 0 {
+                gameloop_stop();
+            }
+        }
+    }
+
+    // Clear screen on exit
+    gfx_clear(0);
+    gfx_flip();
+
+    con_putc(83); con_putc(99); con_putc(111); con_putc(114); con_putc(101); con_putc(58); con_putc(32);
+    print_dec(p_mem_read32(SNAKE_SCORE));
+    con_putc(10);
+}

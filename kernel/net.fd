@@ -898,17 +898,19 @@ pub fn cmd_ping(ip_addr: i64) -> void {
         if net_poll() == 0 {
             if arp_cache_find(ip_addr) != 0 {
                 arp_ok = 1;
-                break;
             }
         }
-        arp_timeout = arp_timeout - 1;
+        if arp_ok == 1 { arp_timeout = 0; }
+        if arp_ok == 0 { arp_timeout = arp_timeout - 1; }
     }
 
+    var skip_icmp: i64 = 0;
     if arp_ok == 0 {
         con_putc(110); con_putc(111); con_putc(32); con_putc(65); con_putc(82); con_putc(80); // "no ARP"
         con_putc(10);
-        return;
+        skip_icmp = 1;
     }
+    if skip_icmp == 0 {
     con_putc(79); con_putc(75); con_putc(10); // "OK"
 
     // Send ICMP echo request
@@ -921,12 +923,14 @@ pub fn cmd_ping(ip_addr: i64) -> void {
 
     // Wait for ICMP echo reply (poll for ~2 seconds)
     var icmp_timeout: i64 = 1000000;
+    var got_reply: i64 = 0;
     while icmp_timeout > 0 {
         net_poll();
         if p_mem_read8(PING_REPLY_FLAG) == 1 {
-            break;
+            got_reply = 1;
         }
-        icmp_timeout = icmp_timeout - 1;
+        if got_reply == 1 { icmp_timeout = 0; }
+        if got_reply == 0 { icmp_timeout = icmp_timeout - 1; }
     }
 
     if p_mem_read8(PING_REPLY_FLAG) == 1 {
@@ -948,6 +952,7 @@ pub fn cmd_ping(ip_addr: i64) -> void {
         con_putc(84); con_putc(105); con_putc(109); con_putc(101); con_putc(111); con_putc(117); con_putc(116); // "Timeout"
         con_putc(10);
     }
+    }
 }
 
 // ─── Network status command ──────────────────────────────────────────────
@@ -956,16 +961,18 @@ pub fn cmd_net() -> void {
     con_putc(10);
     // "NET: "
     con_putc(78); con_putc(69); con_putc(84); con_putc(58); con_putc(32);
+    var skip_net: i64 = 0;
     if e1000_initialized == 0 {
         // Try to initialize
         var result: i64 = e1000_init();
         if result != 0 {
             con_putc(78); con_putc(111); con_putc(110); con_putc(101); // "None"
             con_putc(10);
-            return;
+            skip_net = 1;
         }
     }
 
+    if skip_net == 0 {
     con_putc(69); con_putc(49); con_putc(48); con_putc(48); con_putc(48); // "E1000"
     con_putc(32);
     con_putc(109); con_putc(109); con_putc(105); con_putc(111); con_putc(58); // "mmio:"
@@ -998,6 +1005,7 @@ pub fn cmd_net() -> void {
     con_putc(46);
     print_dec(OUR_IP & 0xFF);
     con_putc(10);
+    }
 }
 
 // ─── ARP table management command ────────────────────────────────────────
