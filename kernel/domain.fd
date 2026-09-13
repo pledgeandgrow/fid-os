@@ -1,0 +1,355 @@
+// kernel/domain.fd — Recursive process domains (fractal kernel phase 4)
+//
+// A process domain is a self-similar unit that can host child processes.
+// Each domain has:
+//   - Its own capability subset (granted from parent)
+//   - Its own child process table (up to 8 children)
+//   - Its own scheduler state
+//   - Its own memory region
+//
+// This is the fractal pattern: a process can be a "kernel" for its
+// children. The same structure repeats at every level — a domain can
+// spawn child domains, which can spawn their own child domains, etc.
+//
+// Domain table: 16 domains × 64 bytes at 0x210000
+//   [0]  domain_id:    i64 — unique domain ID (0 = free)
+//   [8]  parent_domain: i64 — parent domain ID (0 = root)
+//   [16] cap_mask:     i64 — bitmask of capabilities this domain owns
+//   [24] child_count:  i64 — number of active children
+//   [32] sched_slot:   i64 — next child to schedule (round-robin)
+//   [40] mem_base:     i64 — base of memory region for this domain
+//   [48] mem_size:     i64 — size of memory region
+//   [56] flags:        i64 — domain flags
+
+module domain;
+
+use console;
+use capability;
+
+pub const DOMAIN_TABLE: i64 = 0x210000;
+pub const DOMAIN_MAX: i64 = 16;
+pub const DOMAIN_ENTRY_SIZE: i64 = 64;
+pub const DOMAIN_MAX_CHILDREN: i64 = 8;
+
+// Domain flags
+pub const DOMAIN_FLAG_ROOT: i64 = 1;     // root domain (kernel)
+pub const DOMAIN_FLAG_SUPERVISOR: i64 = 2;  // can create child domains
+
+// ─── Initialize the domain table ──────────────────────────────────────────
+
+pub fn domain_init() -> void {
+    var i: i64 = 0;
+    while i < DOMAIN_MAX * DOMAIN_ENTRY_SIZE {
+        p_mem_write8(DOMAIN_TABLE + i, 0);
+        i = i + 1;
+    }
+    // Create the root domain (domain 1 = kernel)
+    var root: i64 = DOMAIN_TABLE;
+    p_mem_write64(root, 1);              // domain_id = 1
+    p_mem_write64(root + 8, 0);          // parent = 0 (no parent)
+    p_mem_write64(root + 16, 0xFFFFFFFF); // cap_mask = all caps
+    p_mem_write64(root + 24, 0);         // child_count = 0
+    p_mem_write64(root + 32, 0);         // sched_slot = 0
+    p_mem_write64(root + 40, 0x300000);  // mem_base = kernel heap
+    p_mem_write64(root + 48, 0x100000);  // mem_size = 1MB
+    p_mem_write64(root + 56, DOMAIN_FLAG_ROOT | DOMAIN_FLAG_SUPERVISOR);
+}
+
+// ─── Create a child domain ──────────────────────────────────────────────
+// The parent must have DOMAIN_FLAG_SUPERVISOR. The child gets a subset
+// of the parent's capabilities (via capability_grant) and a memory region.
+// Returns the child domain ID, or 0 on failure.
+
+pub fn domain_create(parent_id: i64, cap_perms: i64, mem_base: i64, mem_size: i64) -> i64 {
+    // Find the parent
+    var parent_slot: i64 = -1;
+    var i: i64 = 0;
+    while i < DOMAIN_MAX {
+        if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == parent_id {
+            parent_slot = i;
+            i = DOMAIN_MAX;
+        }
+        i = i + 1;
+    }
+    if parent_slot < 0 { return 0; }
+
+    // Check parent has supervisor flag
+    var parent_flags: i64 = p_mem_read64(DOMAIN_TABLE + parent_slot * DOMAIN_ENTRY_SIZE + 56);
+    if (parent_flags & DOMAIN_FLAG_SUPERVISOR) == 0 { return 0; }
+
+    // Find a free domain slot
+    var slot: i64 = -1;
+    i = 0;
+    while i < DOMAIN_MAX {
+        if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == 0 {
+            slot = i;
+            i = DOMAIN_MAX;
+        }
+        i = i + 1;
+    }
+    if slot < 0 { return 0; }
+
+    // Assign a new domain ID (slot + 1, since slot 0 is domain 1)
+    var domain_id: i64 = slot + 1;
+    if parent_id >= domain_id { domain_id = parent_id + 1; }
+
+    var base: i64 = DOMAIN_TABLE + slot * DOMAIN_ENTRY_SIZE;
+    p_mem_write64(base, domain_id);
+    p_mem_write64(base + 8, parent_id);
+    p_mem_write64(base + 16, cap_perms);
+    p_mem_write64(base + 24, 0);         // child_count
+    p_mem_write64(base + 32, 0);         // sched_slot
+    p_mem_write64(base + 40, mem_base);
+    p_mem_write64(base + 48, mem_size);
+    p_mem_write64(base + 56, DOMAIN_FLAG_SUPERVISOR);  // children can be supervisors too
+
+    // Increment parent's child count
+    var pcount: i64 = p_mem_read64(DOMAIN_TABLE + parent_slot * DOMAIN_ENTRY_SIZE + 24);
+    p_mem_write64(DOMAIN_TABLE + parent_slot * DOMAIN_ENTRY_SIZE + 24, pcount + 1);
+
+    return domain_id;
+}
+
+// ─── Destroy a domain ───────────────────────────────────────────────────
+// Removes the domain and decrements parent's child count.
+
+pub fn domain_destroy(domain_id: i64) -> i64 {
+    var slot: i64 = -1;
+    var i: i64 = 0;
+    while i < DOMAIN_MAX {
+        if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == domain_id {
+            slot = i;
+            i = DOMAIN_MAX;
+        }
+        i = i + 1;
+    }
+    if slot < 0 { return -1; }
+
+    var parent_id: i64 = p_mem_read64(DOMAIN_TABLE + slot * DOMAIN_ENTRY_SIZE + 8);
+
+    // Clear the domain entry
+    var base: i64 = DOMAIN_TABLE + slot * DOMAIN_ENTRY_SIZE;
+    var j: i64 = 0;
+    while j < DOMAIN_ENTRY_SIZE {
+        p_mem_write8(base + j, 0);
+        j = j + 1;
+    }
+
+    // Decrement parent's child count
+    if parent_id != 0 {
+        var pslot: i64 = -1;
+        i = 0;
+        while i < DOMAIN_MAX {
+            if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == parent_id {
+                pslot = i;
+                i = DOMAIN_MAX;
+            }
+            i = i + 1;
+        }
+        if pslot >= 0 {
+            var pcount: i64 = p_mem_read64(DOMAIN_TABLE + pslot * DOMAIN_ENTRY_SIZE + 24);
+            if pcount > 0 {
+                p_mem_write64(DOMAIN_TABLE + pslot * DOMAIN_ENTRY_SIZE + 24, pcount - 1);
+            }
+        }
+    }
+
+    return 0;
+}
+
+// ─── Get domain info ──────────────────────────────────────────────────────
+
+pub fn domain_get_parent(domain_id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < DOMAIN_MAX {
+        if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == domain_id {
+            return p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE + 8);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn domain_get_child_count(domain_id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < DOMAIN_MAX {
+        if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == domain_id {
+            return p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE + 24);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn domain_get_mem_base(domain_id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < DOMAIN_MAX {
+        if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == domain_id {
+            return p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE + 40);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn domain_get_mem_size(domain_id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < DOMAIN_MAX {
+        if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == domain_id {
+            return p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE + 48);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ─── Schedule next child in a domain (round-robin) ───────────────────────
+// Returns the next child domain ID, or 0 if no children.
+
+pub fn domain_schedule(domain_id: i64) -> i64 {
+    var slot: i64 = -1;
+    var i: i64 = 0;
+    while i < DOMAIN_MAX {
+        if p_mem_read64(DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE) == domain_id {
+            slot = i;
+            i = DOMAIN_MAX;
+        }
+        i = i + 1;
+    }
+    if slot < 0 { return 0; }
+
+    var child_count: i64 = p_mem_read64(DOMAIN_TABLE + slot * DOMAIN_ENTRY_SIZE + 24);
+    if child_count == 0 { return 0; }
+
+    var sched_slot: i64 = p_mem_read64(DOMAIN_TABLE + slot * DOMAIN_ENTRY_SIZE + 32);
+    // Find children of this domain
+    var found: i64 = 0;
+    var target: i64 = sched_slot % child_count;
+    i = 0;
+    while i < DOMAIN_MAX {
+        var base: i64 = DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE;
+        var did: i64 = p_mem_read64(base);
+        var pid: i64 = p_mem_read64(base + 8);
+        if did != 0 && pid == domain_id {
+            if found == target {
+                // Advance sched_slot
+                p_mem_write64(DOMAIN_TABLE + slot * DOMAIN_ENTRY_SIZE + 32, sched_slot + 1);
+                return did;
+            }
+            found = found + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ─── Debug: list all domains ──────────────────────────────────────────────
+
+pub fn cmd_domains() -> void {
+    con_putc(10);
+    // "Domains:"
+    con_putc(68); con_putc(111); con_putc(109); con_putc(97); con_putc(105); con_putc(110); con_putc(115); con_putc(58);
+    con_putc(10);
+
+    var i: i64 = 0;
+    while i < DOMAIN_MAX {
+        var base: i64 = DOMAIN_TABLE + i * DOMAIN_ENTRY_SIZE;
+        var did: i64 = p_mem_read64(base);
+        if did != 0 {
+            var parent: i64 = p_mem_read64(base + 8);
+            var caps: i64 = p_mem_read64(base + 16);
+            var children: i64 = p_mem_read64(base + 24);
+            var mem_base: i64 = p_mem_read64(base + 40);
+            var mem_size: i64 = p_mem_read64(base + 48);
+            var flags: i64 = p_mem_read64(base + 56);
+
+            // "dom="
+            con_putc(100); con_putc(111); con_putc(109); con_putc(61);
+            print_dec(did);
+            con_putc(32);
+
+            // "parent="
+            con_putc(112); con_putc(97); con_putc(114); con_putc(61);
+            print_dec(parent);
+            con_putc(32);
+
+            // "children="
+            con_putc(99); con_putc(104); con_putc(108); con_putc(100); con_putc(61);
+            print_dec(children);
+            con_putc(32);
+
+            // "mem="
+            con_putc(109); con_putc(101); con_putc(109); con_putc(61);
+            print_hex(mem_base);
+            con_putc(43);
+            print_dec(mem_size);
+            con_putc(32);
+
+            // flags
+            if (flags & DOMAIN_FLAG_ROOT) != 0 {
+                con_putc(82);  // 'R' = root
+            }
+            if (flags & DOMAIN_FLAG_SUPERVISOR) != 0 {
+                con_putc(83);  // 'S' = supervisor
+            }
+            con_putc(10);
+        }
+        i = i + 1;
+    }
+}
+
+// ─── Test: recursive domain creation ──────────────────────────────────────
+
+pub fn cmd_domain_test() -> void {
+    con_putc(10);
+    // "Domain test:"
+    con_putc(68); con_putc(111); con_putc(109); con_putc(97); con_putc(105); con_putc(110);  // "Domain"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);  // "test:"
+    con_putc(10);
+
+    // Root domain is domain 1 (created at init)
+    // Create a child domain
+    var child1: i64 = domain_create(1, 0xFF, 0x400000, 0x40000);  // 256KB
+    // "child1="
+    con_putc(99); con_putc(104); con_putc(105); con_putc(108); con_putc(100); con_putc(49); con_putc(61);
+    print_dec(child1);
+    con_putc(10);
+
+    // Create a grandchild domain (child of child1)
+    var grandchild: i64 = domain_create(child1, 0x0F, 0x440000, 0x20000);  // 128KB
+    // "grand="
+    con_putc(103); con_putc(114); con_putc(97); con_putc(110); con_putc(100); con_putc(61);
+    print_dec(grandchild);
+    con_putc(10);
+
+    // Create another child of root
+    var child2: i64 = domain_create(1, 0xF0, 0x460000, 0x40000);
+    // "child2="
+    con_putc(99); con_putc(104); con_putc(105); con_putc(108); con_putc(100); con_putc(50); con_putc(61);
+    print_dec(child2);
+    con_putc(10);
+
+    // List all domains
+    cmd_domains();
+
+    // Schedule children of root
+    var next: i64 = domain_schedule(1);
+    // "next="
+    con_putc(110); con_putc(101); con_putc(120); con_putc(116); con_putc(61);
+    print_dec(next);
+    con_putc(10);
+
+    // Destroy grandchild
+    domain_destroy(grandchild);
+    // Destroy child1
+    domain_destroy(child1);
+    // Destroy child2
+    domain_destroy(child2);
+
+    // "after destroy:"
+    con_putc(10);
+    con_putc(97); con_putc(102); con_putc(116); con_putc(101); con_putc(114); con_putc(32); con_putc(100); con_putc(101); con_putc(115); con_putc(116); con_putc(114); con_putc(111); con_putc(121); con_putc(58);
+    con_putc(10);
+    cmd_domains();
+}

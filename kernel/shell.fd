@@ -30,6 +30,8 @@ use audio;
 use shell_script;
 use capability;
 use msg;
+use domain;
+use driver;
 
 // ─── Shell Commands ─────────────────────────────────────────────────────
 
@@ -804,6 +806,12 @@ pub fn main() -> void {
     capability_init();
     // Initialize message endpoints (fractal kernel phase 2)
     msg_init();
+    // Initialize per-process address spaces (fractal kernel phase 3)
+    vm_proc_init();
+    // Initialize process domains (fractal kernel phase 4)
+    domain_init();
+    // Initialize driver framework (fractal kernel phase 5)
+    driver_init();
 
     // Create root capabilities — replace hardcoded addresses with grants
     capability_create(5, 1 | 2 | 32, 0xB8000, 4000);      // Console (VGA)
@@ -1356,6 +1364,21 @@ fn shell_dispatch(input_len: i64) -> void {
     } else if input_matches8(109, 115, 103, 102, 115, 0, 0, 0, 5, input_len) == 1 {
         // "msgfs" — test message-based filesystem
         cmd_msgfs();
+    } else if input_matches8(118, 109, 112, 114, 111, 99, 0, 0, 6, input_len) == 1 {
+        // "vmproc" — test per-process address spaces (phase 3)
+        cmd_vm_proc();
+    } else if input_matches8(100, 111, 109, 97, 105, 110, 115, 0, 7, input_len) == 1 {
+        // "domains" — list all process domains (phase 4)
+        cmd_domains();
+    } else if input_matches8(100, 111, 109, 116, 101, 115, 116, 0, 7, input_len) == 1 {
+        // "domtest" — test recursive domain creation (phase 4)
+        cmd_domain_test();
+    } else if input_matches8(100, 114, 105, 118, 101, 114, 115, 0, 7, input_len) == 1 {
+        // "drivers" — list all drivers (phase 5)
+        cmd_drivers();
+    } else if input_matches8(100, 114, 118, 116, 101, 115, 116, 0, 7, input_len) == 1 {
+        // "drvtest" — test driver isolation (phase 5)
+        cmd_driver_test();
     } else {
         // Unknown
         con_putc(63); con_putc(10);

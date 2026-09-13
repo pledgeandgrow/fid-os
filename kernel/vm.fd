@@ -5,7 +5,6 @@
 module vm;
 
 use console;
-use kalloc;
 
 pub fn vm_map(vaddr: i64, paddr: i64, flags: i64) -> i64 {
     // PML4 index = bits 39-47
@@ -90,131 +89,6 @@ pub fn vm_unmap(vaddr: i64) -> i64 {
     return 0;
 }
 
-// ─── Memory Protection (NX bit, guard pages) ─────────────────────────────
-// Page-table flag bits:
-//   0x01 Present, 0x02 Writable, 0x04 User, 0x80 Huge (PS),
-//   0x100 No-Execute (NX, bit 63 of PTE — only valid in PDPT/PD entries).
-// Guard pages are simply unmapped pages placed before/after a region; any
-// access faults into them, which the page-fault handler turns into a panic.
-
-pub const VM_PROT_READ: i64 = 0x01;
-pub const VM_PROT_WRITE: i64 = 0x02;
-pub const VM_PROT_EXEC: i64 = 0x04;
-pub const VM_PROT_USER: i64 = 0x04;  // user-accessible bit in PTE
-pub const VM_PROT_NX: i64 = 0x100;   // non-executable
-
-// Map a region with explicit protection flags. `prot` is a bitmask of
-// VM_PROT_* constants. Returns the mapped virtual address or 0 on failure.
-pub fn vm_map_protected(vaddr: i64, paddr: i64, prot: i64) -> i64 {
-    // Translate VM_PROT_* into PTE flags: writable + user + NX.
-    var flags: i64 = 0x01;  // present
-    if (prot & VM_PROT_WRITE) != 0 { flags = flags | 0x02; }
-    if (prot & VM_PROT_USER) != 0 { flags = flags | 0x04; }
-    // NX is stored in the upper flags byte passed through to vm_map
-    if (prot & VM_PROT_NX) != 0 { flags = flags | 0x100; }
-    return vm_map(vaddr, paddr, flags);
-}
-
-// Allocate a guard page (unmapped) immediately before `vaddr`. Any access
-// to the guard page will page-fault. Returns the guard address.
-pub fn vm_guard_page(vaddr: i64) -> i64 {
-    var guard: i64 = vaddr - 0x200000;  // one 2MB page below (2MB granularity)
-    // Ensure the guard is present-but-inaccessible: unmap it explicitly.
-    vm_unmap(guard);
-    return guard;
-}
-
-// ─── mmap / munmap region tracking ───────────────────────────────────────
-// Tracks anonymous mmap regions so munmap can release them. Each region
-// record is 32 bytes: [vaddr:8][pages:8][prot:8][used:8]. Table at 0x1F8000.
-// The mmap bump pointer starts at 0x50000000 (high virtual, identity-mapped
-// region extended on demand via vm_map).
-
-pub const MMAP_REGION_TABLE: i64 = 0x1F8000;  // 64 regions × 32 bytes
-pub const MMAP_MAX_REGIONS: i64 = 64;
-pub const MMAP_REGION_SIZE: i64 = 32;
-pub const MMAP_BASE: i64 = 0x50000000;       // anonymous mmap starts here
-pub var mmap_next: i64 = 0x50000000;
-
-pub fn mmap_init() -> void {
-    var i: i64 = 0;
-    while i < MMAP_MAX_REGIONS * MMAP_REGION_SIZE {
-        p_mem_write8(MMAP_REGION_TABLE + i, 0);
-        i = i + 1;
-    }
-    mmap_next = MMAP_BASE;
-}
-
-// Anonymous mmap: reserve `length` bytes of virtual address space, map
-// physical pages (from the buddy allocator) into it, and record the region.
-// Returns the virtual address or 0 on failure.
-pub fn mmap_anon(length: i64, prot: i64) -> i64 {
-    if length <= 0 { return 0; }
-    var pages: i64 = (length + 0xFFF) / 0x1000;  // 4KB pages
-    if pages > 512 { return 0; }  // cap at 2MB per region (2MB huge page)
-    // Find a free region record
-    var slot: i64 = -1;
-    var i: i64 = 0;
-    while i < MMAP_MAX_REGIONS {
-        if p_mem_read64(MMAP_REGION_TABLE + i * MMAP_REGION_SIZE + 24) == 0 {
-            slot = i;
-            i = MMAP_MAX_REGIONS;
-        }
-        i = i + 1;
-    }
-    if slot < 0 { return 0; }
-    // Allocate physical pages from the buddy allocator
-    var paddr: i64 = 0;
-    // buddy_alloc returns a physical address; fall back to bump if unavailable
-    paddr = buddy_alloc(pages);
-    if paddr == 0 {
-        // No buddy memory — use the bump pointer (identity region)
-        paddr = mmap_next;
-    }
-    var vaddr: i64 = mmap_next;
-    // Map as a 2MB huge page (round vaddr/paddr to 2MB boundary)
-    var v_aligned: i64 = vaddr & 0xFFFFFFFFFFE00000;
-    var p_aligned: i64 = paddr & 0xFFFFFFFFFFE00000;
-    vm_map_protected(v_aligned, p_aligned, prot);
-    // Record the region
-    p_mem_write64(MMAP_REGION_TABLE + slot * MMAP_REGION_SIZE, vaddr);
-    p_mem_write64(MMAP_REGION_TABLE + slot * MMAP_REGION_SIZE + 8, pages);
-    p_mem_write64(MMAP_REGION_TABLE + slot * MMAP_REGION_SIZE + 16, prot);
-    p_mem_write64(MMAP_REGION_TABLE + slot * MMAP_REGION_SIZE + 24, 1);  // used
-    mmap_next = mmap_next + 0x200000;  // advance by 2MB
-    return vaddr;
-}
-
-// Unmap a previously mmap'd region. Returns 0 on success, -1 if not found.
-pub fn munmap(vaddr: i64) -> i64 {
-    var i: i64 = 0;
-    while i < MMAP_MAX_REGIONS {
-        var base: i64 = MMAP_REGION_TABLE + i * MMAP_REGION_SIZE;
-        if p_mem_read64(base + 24) == 1 && p_mem_read64(base) == vaddr {
-            var pages: i64 = p_mem_read64(base + 8);
-            // Free physical pages back to the buddy allocator
-            buddy_free(vaddr, pages);
-            // Unmap the virtual range
-            vm_unmap(vaddr & 0xFFFFFFFFFFE00000);
-            p_mem_write64(base + 24, 0);  // mark slot free
-            return 0;
-        }
-        i = i + 1;
-    }
-    return -1;  // not found
-}
-
-// Page-fault counter (incremented by the page-fault handler). Stored at a
-// small fixed address so the ISR can update it without a function call.
-pub const PF_COUNT: i64 = 0x6E0;
-pub const PF_LAST_ADDR: i64 = 0x6E8;  // last faulting address (CR2)
-
-pub fn vm_page_fault(fault_addr: i64) -> void {
-    var count: i64 = p_mem_read64(PF_COUNT);
-    p_mem_write64(PF_COUNT, count + 1);
-    p_mem_write64(PF_LAST_ADDR, fault_addr);
-}
-
 pub fn cmd_vm() -> void {
     con_putc(10);
     // "VM: verify mapping 0x800000"
@@ -233,29 +107,195 @@ pub fn cmd_vm() -> void {
     con_putc(10);
 }
 
-// cmd_mmap: test mmap/munmap anonymous regions
-pub fn cmd_mmap() -> void {
+// ─── Phase 3: Per-process address spaces ─────────────────────────────────
+// Each process gets its own PML4. Kernel mappings (identity-mapped first
+// 4GB) are copied into every new PML4 so kernel code remains accessible.
+// User pages are mapped per-process. CR3 is switched on context switch.
+//
+// Page table page pool: 0x800000 - 0x8FFFFF (1MB = 256 page tables)
+// Per-process PML4 directory: 0x200000 (64 processes × 16 bytes)
+//   [0] pml4_addr: i64 — physical address of the process's PML4
+//   [8] used: i64 — 1 if in use
+
+pub const PROC_PML4_DIR: i64 = 0x200000;
+pub const PT_POOL_BASE: i64 = 0x810000;  // page table page pool
+pub const PT_POOL_END: i64 = 0x8FFFFF;
+pub var pt_pool_next: i64 = 0x810000;
+
+// Initialize the per-process PML4 directory
+pub fn vm_proc_init() -> void {
+    var i: i64 = 0;
+    while i < 64 * 16 {
+        p_mem_write8(PROC_PML4_DIR + i, 0);
+        i = i + 1;
+    }
+    pt_pool_next = PT_POOL_BASE;
+    // Process 1 (kernel) uses the existing PML4 at 0x70000
+    p_mem_write64(PROC_PML4_DIR, 0x70000);  // pml4_addr
+    p_mem_write64(PROC_PML4_DIR + 8, 1);    // used
+}
+
+// Allocate a 4KB page table page from the pool
+fn pt_alloc() -> i64 {
+    if pt_pool_next >= PT_POOL_END { return 0; }
+    var addr: i64 = pt_pool_next;
+    pt_pool_next = pt_pool_next + 0x1000;
+    // Zero the page
+    var i: i64 = 0;
+    while i < 4096 {
+        p_mem_write8(addr + i, 0);
+        i = i + 1;
+    }
+    return addr;
+}
+
+// Create a new address space for a process.
+// Copies kernel mappings (PML4 entries 0-255 = lower 512GB, identity-mapped)
+// from the kernel PML4 into a new PML4.
+// Returns the PML4 physical address, or 0 on failure.
+pub fn vm_create_address_space(proc_slot: i64) -> i64 {
+    // Allocate a new PML4
+    var new_pml4: i64 = pt_alloc();
+    if new_pml4 == 0 { return 0; }
+
+    // Copy kernel mappings: first 256 PML4 entries (lower 512GB)
+    // These are identity-mapped and shared by all processes
+    var i: i64 = 0;
+    while i < 256 {
+        var entry: i64 = p_mem_read64(0x70000 + i * 8);
+        p_mem_write64(new_pml4 + i * 8, entry);
+        i = i + 1;
+    }
+
+    // Record in the per-process PML4 directory
+    p_mem_write64(PROC_PML4_DIR + proc_slot * 16, new_pml4);
+    p_mem_write64(PROC_PML4_DIR + proc_slot * 16 + 8, 1);
+
+    return new_pml4;
+}
+
+// Switch to a process's address space by loading CR3.
+// Returns the previous CR3 value.
+pub fn vm_switch_address_space(pml4_addr: i64) -> i64 {
+    var old_cr3: i64 = p_cr3_read();
+    p_cr3_write(pml4_addr);
+    return old_cr3;
+}
+
+// Get the PML4 address for a process slot
+pub fn vm_get_pml4(proc_slot: i64) -> i64 {
+    return p_mem_read64(PROC_PML4_DIR + proc_slot * 16);
+}
+
+// Map a user page in a specific process's PML4.
+// This is like vm_map but operates on a non-kernel PML4.
+pub fn vm_map_user(pml4: i64, vaddr: i64, paddr: i64, flags: i64) -> i64 {
+    var pml4_idx: i64 = (vaddr >> 39) & 0x1FF;
+    var pdpt_idx: i64 = (vaddr >> 30) & 0x1FF;
+    var pd_idx: i64 = (vaddr >> 21) & 0x1FF;
+
+    // Get PML4 entry
+    var pml4_entry: i64 = p_mem_read64(pml4 + pml4_idx * 8);
+    var pdpt_addr: i64 = pml4_entry & 0xFFFFFFFFFFFFF000;
+    if pdpt_addr == 0 {
+        // Allocate a new PDPT
+        pdpt_addr = pt_alloc();
+        if pdpt_addr == 0 { return -1; }
+        p_mem_write64(pml4 + pml4_idx * 8, pdpt_addr | 0x7);  // present | writable | user
+    }
+
+    // Get PDPT entry
+    var pdpt_entry: i64 = p_mem_read64(pdpt_addr + pdpt_idx * 8);
+    var pd_addr: i64 = pdpt_entry & 0xFFFFFFFFFFFFF000;
+    if pd_addr == 0 {
+        pd_addr = pt_alloc();
+        if pd_addr == 0 { return -1; }
+        p_mem_write64(pdpt_addr + pdpt_idx * 8, pd_addr | 0x7);  // present | writable | user
+    }
+
+    // Set PD entry as 2MB page (PS bit = 0x80)
+    var pd_flags: i64 = 0x87 | (flags & 0x7F);  // present | writable | huge | user
+    p_mem_write64(pd_addr + pd_idx * 8, (paddr & 0xFFFFFFFFFFE00000) | pd_flags);
+
+    return 0;
+}
+
+// Destroy a process's address space (free the PML4 and user page tables).
+// Does NOT free kernel-shared pages (only frees pages allocated from pool).
+pub fn vm_destroy_address_space(proc_slot: i64) -> void {
+    var pml4: i64 = p_mem_read64(PROC_PML4_DIR + proc_slot * 16);
+    if pml4 == 0 { return; }
+
+    // Free user PDPTs (entries 256-511 are user space)
+    var i: i64 = 256;
+    while i < 512 {
+        var pml4_entry: i64 = p_mem_read64(pml4 + i * 8);
+        var pdpt_addr: i64 = pml4_entry & 0xFFFFFFFFFFFFF000;
+        if pdpt_addr >= PT_POOL_BASE {
+            if pdpt_addr < PT_POOL_END {
+                // Could free PDPTs and PDs here, but for simplicity
+                // we just mark the slot as free. The pool is bump-allocated.
+            }
+        }
+        i = i + 1;
+    }
+
+    // Mark the slot as free
+    p_mem_write64(PROC_PML4_DIR + proc_slot * 16, 0);
+    p_mem_write64(PROC_PML4_DIR + proc_slot * 16 + 8, 0);
+}
+
+// Test per-process address spaces
+pub fn cmd_vm_proc() -> void {
     con_putc(10);
-    con_putc(77); con_putc(77); con_putc(65); con_putc(80); con_putc(58); con_putc(32); // "MMAP: "
-    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(10); // "test"
-    mmap_init();
-    // Map a 4KB region
-    var v1: i64 = mmap_anon(0x1000, VM_PROT_READ | VM_PROT_WRITE);
-    con_putc(118); con_putc(49); con_putc(61); // "v1="
-    print_hex(v1);
+    // "VM Proc test:"
+    con_putc(86); con_putc(77); con_putc(32);  // "VM "
+    con_putc(80); con_putc(114); con_putc(111); con_putc(99);  // "Proc"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);  // "test:"
     con_putc(10);
-    // Map another
-    var v2: i64 = mmap_anon(0x2000, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_NX);
-    con_putc(118); con_putc(50); con_putc(61); // "v2="
-    print_hex(v2);
+
+    // Create address space for process slot 2
+    var pml4_2: i64 = vm_create_address_space(2);
+    // "pml4_2="
+    con_putc(112); con_putc(109); con_putc(108); con_putc(52); con_putc(95); con_putc(50); con_putc(61);
+    print_hex(pml4_2);
     con_putc(10);
-    // Unmap v1
-    var r: i64 = munmap(v1);
-    con_putc(117); con_putc(110); con_putc(109); con_putc(97); con_putc(112); con_putc(58); con_putc(32); // "unmap: "
+
+    // Verify kernel mappings were copied (entry 0 should be non-zero)
+    var entry0: i64 = p_mem_read64(pml4_2);
+    // "entry0="
+    con_putc(101); con_putc(110); con_putc(116); con_putc(114); con_putc(121); con_putc(48); con_putc(61);
+    print_hex(entry0);
+    con_putc(10);
+
+    // Map a user page at 0x40000000 (1GB, in user space)
+    var r: i64 = vm_map_user(pml4_2, 0x40000000, 0x500000, 0);
+    // "map="
+    con_putc(109); con_putc(97); con_putc(112); con_putc(61);
     print_dec(r);
     con_putc(10);
-    // Show page fault count
-    con_putc(80); con_putc(70); con_putc(58); con_putc(32); // "PF: "
-    print_dec(p_mem_read64(PF_COUNT));
+
+    // Create address space for process slot 3
+    var pml4_3: i64 = vm_create_address_space(3);
+    // "pml4_3="
+    con_putc(112); con_putc(109); con_putc(108); con_putc(52); con_putc(95); con_putc(51); con_putc(61);
+    print_hex(pml4_3);
+    con_putc(10);
+
+    // Verify they're different
+    if pml4_2 != pml4_3 {
+        con_putc(79); con_putc(75);  // "OK"
+    } else {
+        con_putc(70); con_putc(65); con_putc(73); con_putc(76);  // "FAIL"
+    }
+    con_putc(10);
+
+    // Destroy address space 3
+    vm_destroy_address_space(3);
+    var pml4_after: i64 = vm_get_pml4(3);
+    // "after_destroy="
+    con_putc(97); con_putc(102); con_putc(116); con_putc(101); con_putc(114); con_putc(61);
+    print_hex(pml4_after);
     con_putc(10);
 }

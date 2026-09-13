@@ -1,0 +1,338 @@
+// kernel/driver.fd — Driver isolation framework (fractal kernel phase 5)
+//
+// Drivers run in their own capability domains and communicate with the
+// rest of the system exclusively via messages. No direct function calls
+// to driver internals — only message exchange through endpoints.
+//
+// This is the final fractal principle: drivers are self-contained units
+// with their own capabilities, message endpoints, and state. The kernel
+// talks to drivers the same way processes talk to each other.
+//
+// Driver table: 8 drivers × 48 bytes at 0x220000
+//   [0]  driver_id:     i64 — unique ID (0 = free)
+//   [8]  domain_id:     i64 — domain this driver belongs to
+//   [16] msg_cap:       i64 — message endpoint capability handle
+//   [24] cap_handle:    i64 — resource capability this driver owns
+//   [32] state:         i64 — 0=stopped, 1=running, 2=error
+//   [40] packet_count:  i64 — packets/messages processed
+
+module driver;
+
+use console;
+use capability;
+use msg;
+use domain;
+
+pub const DRIVER_TABLE: i64 = 0x220000;
+pub const DRIVER_MAX: i64 = 8;
+pub const DRIVER_ENTRY_SIZE: i64 = 48;
+
+pub const DRIVER_STATE_STOPPED: i64 = 0;
+pub const DRIVER_STATE_RUNNING: i64 = 1;
+pub const DRIVER_STATE_ERROR: i64 = 2;
+
+// Driver type IDs (for identification)
+pub const DRIVER_TYPE_NET: i64 = 1;     // E1000 network
+pub const DRIVER_TYPE_DISK: i64 = 2;    // ATA disk
+pub const DRIVER_TYPE_CONSOLE: i64 = 3;  // VGA console
+pub const DRIVER_TYPE_INPUT: i64 = 4;   // keyboard/mouse
+
+// ─── Initialize the driver table ──────────────────────────────────────────
+
+pub fn driver_init() -> void {
+    var i: i64 = 0;
+    while i < DRIVER_MAX * DRIVER_ENTRY_SIZE {
+        p_mem_write8(DRIVER_TABLE + i, 0);
+        i = i + 1;
+    }
+}
+
+// ─── Register a driver ───────────────────────────────────────────────────
+// Creates a driver domain, a message endpoint, and registers the driver.
+// The driver owns the given resource capability and communicates via
+// its message endpoint.
+// Returns the driver ID, or 0 on failure.
+
+pub fn driver_register(driver_type: i64, resource_cap: i64, domain_id: i64) -> i64 {
+    // Find a free driver slot
+    var slot: i64 = -1;
+    var i: i64 = 0;
+    while i < DRIVER_MAX {
+        if p_mem_read64(DRIVER_TABLE + i * DRIVER_ENTRY_SIZE) == 0 {
+            slot = i;
+            i = DRIVER_MAX;
+        }
+        i = i + 1;
+    }
+    if slot < 0 { return 0; }
+
+    // Create a message endpoint for this driver (SEND + RECV + GRANT)
+    var msg_cap: i64 = msg_create_endpoint(8 | 16 | 32);
+    if msg_cap == 0 { return 0; }
+
+    var driver_id: i64 = slot + 1;
+    var base: i64 = DRIVER_TABLE + slot * DRIVER_ENTRY_SIZE;
+    p_mem_write64(base, driver_id);
+    p_mem_write64(base + 8, domain_id);
+    p_mem_write64(base + 16, msg_cap);
+    p_mem_write64(base + 24, resource_cap);
+    p_mem_write64(base + 32, DRIVER_STATE_RUNNING);
+    p_mem_write64(base + 40, 0);  // packet_count
+
+    return driver_id;
+}
+
+// ─── Send a message to a driver ──────────────────────────────────────────
+// Returns 0 on success, -1 if driver not found or denied.
+
+pub fn driver_send(driver_id: i64, op: i64, payload_addr: i64, payload_len: i64) -> i64 {
+    var slot: i64 = driver_id - 1;
+    if slot < 0 { return -1; }
+    if slot >= DRIVER_MAX { return -1; }
+
+    var base: i64 = DRIVER_TABLE + slot * DRIVER_ENTRY_SIZE;
+    if p_mem_read64(base) == 0 { return -1; }  // not registered
+    if p_mem_read64(base + 32) != DRIVER_STATE_RUNNING { return -1; }
+
+    var msg_cap: i64 = p_mem_read64(base + 16);
+    var result: i64 = msg_send(msg_cap, op, payload_addr, payload_len);
+
+    // Increment packet count
+    var count: i64 = p_mem_read64(base + 40);
+    p_mem_write64(base + 40, count + 1);
+
+    return result;
+}
+
+// ─── Receive a message from a driver ─────────────────────────────────────
+// Returns the operation code, or -1 if no message.
+
+pub fn driver_recv(driver_id: i64, buf: i64, len_out: i64) -> i64 {
+    var slot: i64 = driver_id - 1;
+    if slot < 0 { return -1; }
+    if slot >= DRIVER_MAX { return -1; }
+
+    var base: i64 = DRIVER_TABLE + slot * DRIVER_ENTRY_SIZE;
+    if p_mem_read64(base) == 0 { return -1; }
+
+    var msg_cap: i64 = p_mem_read64(base + 16);
+    return msg_recv(msg_cap, buf, len_out);
+}
+
+// ─── Get driver state ──────────────────────────────────────────────────────
+
+pub fn driver_get_state(driver_id: i64) -> i64 {
+    var slot: i64 = driver_id - 1;
+    if slot < 0 { return -1; }
+    if slot >= DRIVER_MAX { return -1; }
+    return p_mem_read64(DRIVER_TABLE + slot * DRIVER_ENTRY_SIZE + 32);
+}
+
+pub fn driver_get_packet_count(driver_id: i64) -> i64 {
+    var slot: i64 = driver_id - 1;
+    if slot < 0 { return -1; }
+    if slot >= DRIVER_MAX { return -1; }
+    return p_mem_read64(DRIVER_TABLE + slot * DRIVER_ENTRY_SIZE + 40);
+}
+
+// ─── Stop a driver ────────────────────────────────────────────────────────
+
+pub fn driver_stop(driver_id: i64) -> i64 {
+    var slot: i64 = driver_id - 1;
+    if slot < 0 { return -1; }
+    if slot >= DRIVER_MAX { return -1; }
+    p_mem_write64(DRIVER_TABLE + slot * DRIVER_ENTRY_SIZE + 32, DRIVER_STATE_STOPPED);
+    return 0;
+}
+
+// ─── Start a driver ───────────────────────────────────────────────────────
+
+pub fn driver_start(driver_id: i64) -> i64 {
+    var slot: i64 = driver_id - 1;
+    if slot < 0 { return -1; }
+    if slot >= DRIVER_MAX { return -1; }
+    p_mem_write64(DRIVER_TABLE + slot * DRIVER_ENTRY_SIZE + 32, DRIVER_STATE_RUNNING);
+    return 0;
+}
+
+// ─── Unregister a driver ─────────────────────────────────────────────────
+
+pub fn driver_unregister(driver_id: i64) -> i64 {
+    var slot: i64 = driver_id - 1;
+    if slot < 0 { return -1; }
+    if slot >= DRIVER_MAX { return -1; }
+    var base: i64 = DRIVER_TABLE + slot * DRIVER_ENTRY_SIZE;
+    // Revoke the message endpoint capability
+    var msg_cap: i64 = p_mem_read64(base + 16);
+    capability_revoke(msg_cap);
+    // Clear the entry
+    var i: i64 = 0;
+    while i < DRIVER_ENTRY_SIZE {
+        p_mem_write8(base + i, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ─── Debug: list all drivers ──────────────────────────────────────────────
+
+pub fn cmd_drivers() -> void {
+    con_putc(10);
+    // "Drivers:"
+    con_putc(68); con_putc(114); con_putc(105); con_putc(118); con_putc(101); con_putc(114); con_putc(115); con_putc(58);
+    con_putc(10);
+
+    var i: i64 = 0;
+    while i < DRIVER_MAX {
+        var base: i64 = DRIVER_TABLE + i * DRIVER_ENTRY_SIZE;
+        var did: i64 = p_mem_read64(base);
+        if did != 0 {
+            var dom: i64 = p_mem_read64(base + 8);
+            var msg_cap: i64 = p_mem_read64(base + 16);
+            var res_cap: i64 = p_mem_read64(base + 24);
+            var state: i64 = p_mem_read64(base + 32);
+            var pkts: i64 = p_mem_read64(base + 40);
+
+            // "drv#"
+            con_putc(100); con_putc(114); con_putc(118); con_putc(35);
+            print_dec(did);
+            con_putc(32);
+
+            // "dom="
+            con_putc(100); con_putc(111); con_putc(109); con_putc(61);
+            print_dec(dom);
+            con_putc(32);
+
+            // "msg="
+            con_putc(109); con_putc(115); con_putc(103); con_putc(61);
+            print_dec(msg_cap);
+            con_putc(32);
+
+            // "res="
+            con_putc(114); con_putc(101); con_putc(115); con_putc(61);
+            print_dec(res_cap);
+            con_putc(32);
+
+            // state
+            if state == DRIVER_STATE_RUNNING {
+                con_putc(82); con_putc(117); con_putc(110);  // "Run"
+            } else if state == DRIVER_STATE_STOPPED {
+                con_putc(83); con_putc(116); con_putc(111); con_putc(112);  // "Stop"
+            } else if state == DRIVER_STATE_ERROR {
+                con_putc(69); con_putc(114); con_putc(114);  // "Err"
+            }
+            con_putc(32);
+
+            // "pkts="
+            con_putc(112); con_putc(107); con_putc(116); con_putc(115); con_putc(61);
+            print_dec(pkts);
+            con_putc(10);
+        }
+        i = i + 1;
+    }
+}
+
+// ─── Test: driver isolation ───────────────────────────────────────────────
+// Registers the network driver as an isolated driver domain, sends a
+// message to it, and receives the reply. Demonstrates that drivers
+// communicate only via messages.
+
+pub fn cmd_driver_test() -> void {
+    con_putc(10);
+    // "Driver test:"
+    con_putc(68); con_putc(114); con_putc(105); con_putc(118); con_putc(101); con_putc(114);  // "Driver"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);  // "test:"
+    con_putc(10);
+
+    // Create a driver domain for the network driver
+    var net_domain: i64 = domain_create(1, 0xFF, 0x480000, 0x10000);  // 64KB
+    // "domain="
+    con_putc(100); con_putc(111); con_putc(109); con_putc(97); con_putc(105); con_putc(110); con_putc(61);
+    print_dec(net_domain);
+    con_putc(10);
+
+    // Register the network driver with root network cap (handle 3)
+    var net_driver: i64 = driver_register(DRIVER_TYPE_NET, 3, net_domain);
+    // "net_drv="
+    con_putc(110); con_putc(101); con_putc(116); con_putc(95); con_putc(100); con_putc(114); con_putc(118); con_putc(61);
+    print_dec(net_driver);
+    con_putc(10);
+
+    // Register the console driver with root console cap (handle 1)
+    var con_driver: i64 = driver_register(DRIVER_TYPE_CONSOLE, 1, 1);
+    // "con_drv="
+    con_putc(99); con_putc(111); con_putc(110); con_putc(95); con_putc(100); con_putc(114); con_putc(118); con_putc(61);
+    print_dec(con_driver);
+    con_putc(10);
+
+    // Register the disk driver with root disk cap (handle 2)
+    var disk_driver: i64 = driver_register(DRIVER_TYPE_DISK, 2, 1);
+    // "disk_drv="
+    con_putc(100); con_putc(105); con_putc(115); con_putc(107); con_putc(95); con_putc(100); con_putc(114); con_putc(118); con_putc(61);
+    print_dec(disk_driver);
+    con_putc(10);
+
+    // List all drivers
+    cmd_drivers();
+
+    // Send a PING message to the network driver
+    var r1: i64 = driver_send(net_driver, 9, 0, 0);  // MSG_OP_PING
+    // "ping_net="
+    con_putc(112); con_putc(105); con_putc(110); con_putc(103); con_putc(95); con_putc(110); con_putc(101); con_putc(116); con_putc(61);
+    print_dec(r1);
+    con_putc(10);
+
+    // Receive the ping back from the network driver
+    var recv_buf: i64 = 0x1E2300;
+    var recv_op: i64 = driver_recv(net_driver, recv_buf, 0);
+    // "recv_net="
+    con_putc(114); con_putc(101); con_putc(99); con_putc(118); con_putc(95); con_putc(110); con_putc(101); con_putc(116); con_putc(61);
+    print_dec(recv_op);
+    con_putc(10);
+
+    // Send a PING to the console driver
+    var r2: i64 = driver_send(con_driver, 9, 0, 0);
+    // "ping_con="
+    con_putc(112); con_putc(105); con_putc(110); con_putc(103); con_putc(95); con_putc(99); con_putc(111); con_putc(110); con_putc(61);
+    print_dec(r2);
+    con_putc(10);
+
+    // Check packet counts
+    var net_pkts: i64 = driver_get_packet_count(net_driver);
+    // "net_pkts="
+    con_putc(110); con_putc(101); con_putc(116); con_putc(95); con_putc(112); con_putc(107); con_putc(116); con_putc(115); con_putc(61);
+    print_dec(net_pkts);
+    con_putc(10);
+
+    // Stop the disk driver
+    driver_stop(disk_driver);
+    // "disk stopped"
+    con_putc(100); con_putc(105); con_putc(115); con_putc(107); con_putc(32); con_putc(115); con_putc(116); con_putc(111); con_putc(112); con_putc(112); con_putc(101); con_putc(100);
+    con_putc(10);
+
+    // Try to send to stopped driver — should fail
+    var r3: i64 = driver_send(disk_driver, 9, 0, 0);
+    // "send_stopped="
+    con_putc(115); con_putc(101); con_putc(110); con_putc(100); con_putc(95); con_putc(115); con_putc(116); con_putc(111); con_putc(112); con_putc(61);
+    print_dec(r3);
+    con_putc(32);
+    con_putc(40); con_putc(115); con_putc(104); con_putc(111); con_putc(117); con_putc(108); con_putc(100);  // "(should"
+    con_putc(32); con_putc(98); con_putc(101); con_putc(32); con_putc(45); con_putc(49); con_putc(41);
+    con_putc(10);
+
+    // List drivers again
+    cmd_drivers();
+
+    // Cleanup: unregister all test drivers
+    driver_unregister(net_driver);
+    driver_unregister(con_driver);
+    driver_unregister(disk_driver);
+    domain_destroy(net_domain);
+
+    // "after cleanup:"
+    con_putc(10);
+    con_putc(97); con_putc(102); con_putc(116); con_putc(101); con_putc(114); con_putc(32); con_putc(99); con_putc(108); con_putc(101); con_putc(97); con_putc(110); con_putc(117); con_putc(112); con_putc(58);
+    con_putc(10);
+    cmd_drivers();
+}

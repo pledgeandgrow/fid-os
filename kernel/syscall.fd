@@ -7,6 +7,7 @@ use console;
 use keyboard;
 use initrd;
 use ata;
+use vm;
 
 // Syscall numbers
 pub const SYS_EXIT: i64 = 0;
@@ -58,65 +59,6 @@ pub fn sys_close(fd: i64) -> i64 {
     if fd < 0 || fd >= FD_MAX { return -1; }
     p_mem_write32(FD_TABLE + fd * FD_ENTRY_SIZE, 0);
     return 0;
-}
-
-// Duplicate a file descriptor, returning the lowest free fd >= start.
-pub fn sys_dup2(fd: i64, start: i64) -> i64 {
-    if fd < 0 || fd >= FD_MAX { return -1; }
-    var in_use: i64 = p_mem_read32(FD_TABLE + fd * FD_ENTRY_SIZE);
-    if in_use == 0 { return -1; }
-    var i: i64 = start;
-    while i < FD_MAX {
-        if p_mem_read32(FD_TABLE + i * FD_ENTRY_SIZE) == 0 {
-            // Copy the entry
-            var src: i64 = FD_TABLE + fd * FD_ENTRY_SIZE;
-            var dst: i64 = FD_TABLE + i * FD_ENTRY_SIZE;
-            var k: i64 = 0;
-            while k < FD_ENTRY_SIZE {
-                p_mem_write8(dst + k, p_mem_read8(src + k));
-                k = k + 1;
-            }
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-// Read from a pipe into buf. Returns bytes read or -1.
-pub fn sys_pipe_read(pipe_id: i64, buf: i64, len: i64) -> i64 {
-    if pipe_id < 0 || pipe_id >= MAX_PIPES { return -1; }
-    var base: i64 = PIPE_TABLE + pipe_id * (PIPE_SIZE + 16);
-    if p_mem_read8(base) == 0 { return -1; }  // not in use
-    var roff: i64 = p_mem_read64(base + 8);
-    var woff: i64 = p_mem_read64(base + 16);
-    if roff >= woff { return 0; }  // empty
-    var avail: i64 = woff - roff;
-    var n: i64 = len;
-    if n > avail { n = avail; }
-    var j: i64 = 0;
-    while j < n {
-        p_mem_write8(buf + j, p_mem_read8(base + 24 + roff + j));
-        j = j + 1;
-    }
-    p_mem_write64(base + 8, roff + n);
-    return n;
-}
-
-// Write to a pipe from buf. Returns bytes written or -1.
-pub fn sys_pipe_write(pipe_id: i64, buf: i64, len: i64) -> i64 {
-    if pipe_id < 0 || pipe_id >= MAX_PIPES { return -1; }
-    var base: i64 = PIPE_TABLE + pipe_id * (PIPE_SIZE + 16);
-    if p_mem_read8(base) == 0 { return -1; }
-    var woff: i64 = p_mem_read64(base + 16);
-    if woff + len > PIPE_SIZE { return -1; }  // full
-    var j: i64 = 0;
-    while j < len {
-        p_mem_write8(base + 24 + woff + j, p_mem_read8(buf + j));
-        j = j + 1;
-    }
-    p_mem_write64(base + 16, woff + len);
-    return len;
 }
 
 pub fn sys_read_fd(fd: i64, buf: i64, len: i64) -> i64 {
@@ -275,36 +217,21 @@ pub fn syscall_dispatch(syscall_num: i64, arg1: i64, arg2: i64, arg3: i64) -> i6
 pub const USER_BRK: i64 = 0x6B0;
 pub const USER_HEAP_START: i64 = 0x13000;  // user heap starts above user stack
 
-// Process table at 0x160000 (up to 64 processes × 64 bytes)
-// Layout: pid(8), state(8), entry(8), pml4(8), parent_pid(8), priority(8),
-//         child_count(8), exit_code(8), pending_signals(8), reserved(8)
+// Process table at 0x160000 (up to 64 processes × 32 bytes)
+// Entry layout: [pid:8][state:8][entry:8][pml4:8]
 pub const PROC_TABLE: i64 = 0x160000;
 pub const MAX_PROCS: i64 = 64;
-pub const PROC_ENTRY_SIZE: i64 = 64;
+pub const PROC_ENTRY_SIZE: i64 = 32;
+pub const PROC_STATE_FREE: i64 = 0;
+pub const PROC_STATE_RUNNING: i64 = 1;
+pub const PROC_STATE_READY: i64 = 2;
+pub const PROC_STATE_BLOCKED: i64 = 3;
+pub const PROC_STATE_ZOMBIE: i64 = 4;
 pub var current_pid: i64 = 1;
 pub var next_pid: i64 = 2;
 
-// Process states
-pub const PROC_FREE: i64 = 0;
-pub const PROC_READY: i64 = 1;
-pub const PROC_RUNNING: i64 = 2;
-pub const PROC_BLOCKED: i64 = 3;
-pub const PROC_ZOMBIE: i64 = 4;
-pub const PROC_STOPPED: i64 = 5;
-
-// Signal numbers
-pub const SIGHUP: i64 = 1;
-pub const SIGINT: i64 = 2;
-pub const SIGQUIT: i64 = 3;
-pub const SIGKILL: i64 = 9;
-pub const SIGTERM: i64 = 15;
-pub const SIGCHLD: i64 = 17;
-pub const SIGSTOP: i64 = 19;
-pub const SIG_MAX: i64 = 32;
-
 // Signal handler table at 0x170000 (64 signals × 8 bytes per process)
 pub const SIGNAL_TABLE: i64 = 0x170000;
-// Per-process pending signal bitmask is stored in the process descriptor.
 
 // Pipe buffer at 0x180000 (up to 16 pipes × 4096 bytes)
 pub const PIPE_TABLE: i64 = 0x180000;
@@ -314,109 +241,13 @@ pub const PIPE_SIZE: i64 = 4096;
 pub fn proc_init() {
     current_pid = 1;
     next_pid = 2;
-    // Clear the whole process table
-    var i: i64 = 0;
-    while i < MAX_PROCS * PROC_ENTRY_SIZE {
-        p_mem_write8(PROC_TABLE + i, 0);
-        i = i + 1;
-    }
     // Initialize process 1 (kernel shell)
-    var p1: i64 = PROC_TABLE;
-    p_mem_write64(p1, 1);            // pid
-    p_mem_write64(p1 + 8, PROC_RUNNING); // state
-    p_mem_write64(p1 + 16, 0x10000); // entry
-    p_mem_write64(p1 + 24, 0x72000); // pml4
-    p_mem_write64(p1 + 32, 0);       // parent_pid (init has no parent)
-    p_mem_write64(p1 + 40, 0);       // priority (nice 0)
-    p_mem_write64(p1 + 48, 0);       // child_count
-    p_mem_write64(p1 + 56, 0);       // exit_code
-    p_mem_write64(p1 + 64, 0);       // pending_signals
+    p_mem_write64(PROC_TABLE, 1);        // pid
+    p_mem_write64(PROC_TABLE + 8, 1);    // state = running
+    p_mem_write64(PROC_TABLE + 16, 0x10000); // entry
+    p_mem_write64(PROC_TABLE + 24, 0x72000); // pml4
     // Initialize user brk
     p_mem_write64(USER_BRK, USER_HEAP_START);
-}
-
-// Find the table index for a given PID, or -1.
-pub fn proc_find(pid: i64) -> i64 {
-    var i: i64 = 0;
-    while i < MAX_PROCS {
-        if p_mem_read64(PROC_TABLE + i * PROC_ENTRY_SIZE) == pid {
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-// Create a new process descriptor. Returns the new PID or -1 if the table is full.
-pub fn proc_create(entry: i64, parent_pid: i64) -> i64 {
-    var i: i64 = 0;
-    while i < MAX_PROCS {
-        var base: i64 = PROC_TABLE + i * PROC_ENTRY_SIZE;
-        if p_mem_read64(base) == 0 {
-            var pid: i64 = next_pid;
-            next_pid = next_pid + 1;
-            p_mem_write64(base, pid);
-            p_mem_write64(base + 8, PROC_READY);
-            p_mem_write64(base + 16, entry);
-            p_mem_write64(base + 24, 0x72000);  // kernel pml4 for now
-            p_mem_write64(base + 32, parent_pid);
-            p_mem_write64(base + 40, 0);         // default priority
-            p_mem_write64(base + 48, 0);         // child_count
-            p_mem_write64(base + 56, 0);         // exit_code
-            p_mem_write64(base + 64, 0);         // pending_signals
-            // Increment parent's child_count
-            var pidx: i64 = proc_find(parent_pid);
-            if pidx >= 0 {
-                var cc: i64 = p_mem_read64(PROC_TABLE + pidx * PROC_ENTRY_SIZE + 48);
-                p_mem_write64(PROC_TABLE + pidx * PROC_ENTRY_SIZE + 48, cc + 1);
-            }
-            return pid;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
-// Set the nice level (priority) of a process. `nice` ranges -20..19.
-pub fn proc_set_priority(pid: i64, nice: i64) -> i64 {
-    var idx: i64 = proc_find(pid);
-    if idx < 0 { return -1; }
-    p_mem_write64(PROC_TABLE + idx * PROC_ENTRY_SIZE + 40, nice);
-    return 0;
-}
-
-// Get the parent PID of a process.
-pub fn proc_get_parent(pid: i64) -> i64 {
-    var idx: i64 = proc_find(pid);
-    if idx < 0 { return -1; }
-    return p_mem_read64(PROC_TABLE + idx * PROC_ENTRY_SIZE + 32);
-}
-
-// Mark a process as exited (zombie) and record its exit code. Sends SIGCHLD
-// to the parent so wait() can reap it.
-pub fn proc_exit(pid: i64, exit_code: i64) -> void {
-    var idx: i64 = proc_find(pid);
-    if idx < 0 { return; }
-    var base: i64 = PROC_TABLE + idx * PROC_ENTRY_SIZE;
-    p_mem_write64(base + 8, PROC_ZOMBIE);
-    p_mem_write64(base + 56, exit_code);
-    // Signal the parent with SIGCHLD
-    var parent: i64 = p_mem_read64(base + 32);
-    if parent != 0 {
-        sys_kill(parent, SIGCHLD);
-    }
-}
-
-// Count active (non-free, non-zombie) processes.
-pub fn proc_count() -> i64 {
-    var count: i64 = 0;
-    var i: i64 = 0;
-    while i < MAX_PROCS {
-        var st: i64 = p_mem_read64(PROC_TABLE + i * PROC_ENTRY_SIZE + 8);
-        if st != PROC_FREE && st != PROC_ZOMBIE { count = count + 1; }
-        i = i + 1;
-    }
-    return count;
 }
 
 pub fn sys_brk(new_brk: i64) -> i64 {
@@ -446,24 +277,37 @@ pub fn sys_mmap(addr: i64, length: i64, prot: i64, flags: i64, fd: i64, offset: 
 }
 
 pub fn sys_fork() -> i64 {
-    // G2: Fork — create a child process that is a copy of the current one.
-    // A full copy would duplicate page tables (COW); here we create a new
-    // descriptor sharing the parent's entry point and pml4, with the child
-    // distinguishable by its PID (parent gets child PID, child gets 0).
-    var parent_idx: i64 = proc_find(current_pid);
-    if parent_idx < 0 { return -1; }
-    var pbase: i64 = PROC_TABLE + parent_idx * PROC_ENTRY_SIZE;
-    var entry: i64 = p_mem_read64(pbase + 16);
-    var pml4: i64 = p_mem_read64(pbase + 24);
-    var child_pid: i64 = proc_create(entry, current_pid);
-    if child_pid < 0 { return -1; }
-    // Copy pml4 so the child sees the same memory layout
-    var cidx: i64 = proc_find(child_pid);
-    if cidx >= 0 {
-        p_mem_write64(PROC_TABLE + cidx * PROC_ENTRY_SIZE + 24, pml4);
-        // Inherit priority
-        p_mem_write64(PROC_TABLE + cidx * PROC_ENTRY_SIZE + 40, p_mem_read64(pbase + 40));
+    // Phase 3: Fork — create a child process with its own address space.
+    // Finds a free slot, creates a new PML4, copies kernel mappings,
+    // and records the child in the process table.
+    var slot: i64 = -1;
+    var i: i64 = 0;
+    while i < MAX_PROCS {
+        if p_mem_read64(PROC_TABLE + i * PROC_ENTRY_SIZE) == 0 {
+            slot = i;
+            i = MAX_PROCS;
+        }
+        i = i + 1;
     }
+    if slot < 0 { return -1; }  // no free slots
+
+    // Create a new address space for the child
+    var child_pml4: i64 = vm_create_address_space(slot);
+    if child_pml4 == 0 { return -1; }
+
+    // Assign a new PID
+    var child_pid: i64 = next_pid;
+    next_pid = next_pid + 1;
+
+    // Record the child process
+    var base: i64 = PROC_TABLE + slot * PROC_ENTRY_SIZE;
+    p_mem_write64(base, child_pid);              // pid
+    p_mem_write64(base + 8, PROC_STATE_READY);   // state = ready
+    // Copy entry point from parent (process 1)
+    var parent_entry: i64 = p_mem_read64(PROC_TABLE + 16);
+    p_mem_write64(base + 16, parent_entry);      // entry
+    p_mem_write64(base + 24, child_pml4);        // pml4
+
     return child_pid;
 }
 
@@ -486,95 +330,42 @@ pub fn sys_exec(path: i64, path_len: i64) -> i64 {
 }
 
 pub fn sys_wait(pid: i64) -> i64 {
-    // G2: Wait — block until the named child becomes a zombie, then reap it
-    // and return its exit code. If pid == -1, wait for any child.
-    // Returns the reaped PID (encoded with exit code) or -1 on error.
-    // (Cooperative model: we poll the child state rather than truly blocking.)
+    // Phase 3: Wait — check if a child process has exited (zombie state).
+    // In a real OS, this would block. For now, check immediately.
     var i: i64 = 0;
     while i < MAX_PROCS {
         var base: i64 = PROC_TABLE + i * PROC_ENTRY_SIZE;
-        var cpid: i64 = p_mem_read64(base);
-        var state: i64 = p_mem_read64(base + 8);
-        var parent: i64 = p_mem_read64(base + 32);
-        if cpid != 0 && state == PROC_ZOMBIE && parent == current_pid {
-            if pid == -1 || pid == cpid {
-                var code: i64 = p_mem_read64(base + 56);
-                // Reap: mark slot free, decrement parent's child_count
-                p_mem_write64(base, 0);
-                p_mem_write64(base + 8, PROC_FREE);
-                var pidx: i64 = proc_find(current_pid);
-                if pidx >= 0 {
-                    var cc: i64 = p_mem_read64(PROC_TABLE + pidx * PROC_ENTRY_SIZE + 48);
-                    if cc > 0 {
-                        p_mem_write64(PROC_TABLE + pidx * PROC_ENTRY_SIZE + 48, cc - 1);
-                    }
-                }
-                // Encode result: low 16 bits = exit code, high bits = pid
-                return (cpid << 16) | (code & 0xFFFF);
+        if p_mem_read64(base) == pid {
+            var state: i64 = p_mem_read64(base + 8);
+            if state == PROC_STATE_ZOMBIE {
+                // Reap the zombie
+                p_mem_write64(base, 0);  // clear pid
+                p_mem_write64(base + 8, 0);  // clear state
+                return pid;  // child exited
             }
+            return 0;  // child still running
         }
         i = i + 1;
     }
-    return -1;  // no zombie child found
+    return -1;  // no such process
 }
 
 pub fn sys_kill(pid: i64, sig: i64) -> i64 {
-    // G8: Send a signal to a process. Sets the pending-signal bit in the
-    // target's descriptor; delivery happens when the process is scheduled.
-    if sig < 0 || sig >= SIG_MAX { return -1; }
-    var idx: i64 = proc_find(pid);
-    if idx < 0 { return -1; }
-    var base: i64 = PROC_TABLE + idx * PROC_ENTRY_SIZE;
-    var state: i64 = p_mem_read64(base + 8);
-    if state == PROC_FREE || state == PROC_ZOMBIE { return -1; }
-    // SIGKILL and SIGSTOP cannot be caught/ignored — force the effect now.
-    if sig == SIGKILL {
-        p_mem_write64(base + 8, PROC_ZOMBIE);
-        p_mem_write64(base + 56, 0x9F);  // killed
-        var parent: i64 = p_mem_read64(base + 32);
-        if parent != 0 { sys_kill(parent, SIGCHLD); }
-        return 0;
-    }
-    if sig == SIGSTOP {
-        p_mem_write64(base + 8, PROC_STOPPED);
-        return 0;
-    }
-    // Otherwise record the pending signal bit
-    var pending: i64 = p_mem_read64(base + 64);
-    p_mem_write64(base + 64, pending | (1 << sig));
-    return 0;
-}
-
-// Deliver any pending signals to the current process. Called from the
-// scheduler before returning to a process. Returns the signal number that
-// was delivered (and should be dispatched to its handler), or 0 if none.
-pub fn sig_deliver_pending() -> i64 {
-    var idx: i64 = proc_find(current_pid);
-    if idx < 0 { return 0; }
-    var base: i64 = PROC_TABLE + idx * PROC_ENTRY_SIZE;
-    var pending: i64 = p_mem_read64(base + 64);
-    if pending == 0 { return 0; }
-    // Find the lowest-numbered pending signal
-    var sig: i64 = 0;
-    while sig < SIG_MAX {
-        if (pending & (1 << sig)) != 0 {
-            // Clear the pending bit
-            p_mem_write64(base + 64, pending & ~(1 << sig));
-            // Check for a handler; if none, apply default action.
-            var handler: i64 = p_mem_read64(SIGNAL_TABLE + sig * 8);
-            if handler != 0 {
-                return sig;  // caller will jump to handler
-            }
-            // Default actions
-            if sig == SIGTERM || sig == SIGHUP || sig == SIGINT || sig == SIGQUIT {
-                p_mem_write64(base + 8, PROC_ZOMBIE);
-                p_mem_write64(base + 56, 0x7F + sig);
-            }
-            return sig;
+    // Phase 3: Kill — mark a process as zombie and destroy its address space.
+    // Signal 9 (SIGKILL) terminates the process.
+    if sig != 9 { return 0; }  // only SIGKILL for now
+    var i: i64 = 0;
+    while i < MAX_PROCS {
+        var base: i64 = PROC_TABLE + i * PROC_ENTRY_SIZE;
+        if p_mem_read64(base) == pid {
+            p_mem_write64(base + 8, PROC_STATE_ZOMBIE);
+            // Destroy the address space
+            vm_destroy_address_space(i);
+            return 0;
         }
-        sig = sig + 1;
+        i = i + 1;
     }
-    return 0;
+    return -1;  // process not found
 }
 
 pub fn sys_sigaction(sig: i64, handler: i64) -> i64 {

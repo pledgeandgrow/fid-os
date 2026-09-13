@@ -96,6 +96,11 @@
   0x1E0000 - 0x1E0FFF  ── Capability table (128 entries × 32 bytes)
   0x1E1000 - 0x1E2FFF  ── Message endpoints (8 × 1KB ring buffers)
   0x1E2000 - 0x1E20FF  ── Message test buffer (temp, cmd_msg)
+  0x1E3000 - 0x1E3FFF  ── Message FS buffer (msg_fs_server)
+  0x200000 - 0x2007FF  ── Per-process PML4 directory (64 × 16 bytes)
+  0x210000 - 0x210FFF  ── Process domain table (16 × 64 bytes)
+  0x220000 - 0x220FFF  ── Driver table (8 × 48 bytes)
+  0x810000 - 0x8FFFFF  ── Per-process page table pool (bump-allocated)
   0x50000              ── Multiboot2 info pointer (saved by boot trampoline)
   0x70000 - 0x71FFF    ── Boot page tables (PML4 + PDPT, identity-mapped)
   0xFEE00000           ── LAPIC MMIO base
@@ -326,6 +331,53 @@
   request, processes it server-side, receives the reply; then sends
   a WRITE request and processes that too. Full round-trip via messages.
 
+### 3.23 Per-Process Address Spaces (Fractal Kernel Phase 3)
+- **File:** `kernel/vm.fd` (appended functions)
+- **Per-process PML4 directory:** 64 processes × 16 bytes at `0x200000`
+- **Page table pool:** `0x810000` - `0x8FFFFF` (1MB, bump-allocated)
+- **API:** `vm_proc_init`, `vm_create_address_space`, `vm_switch_address_space`,
+  `vm_map_user`, `vm_destroy_address_space`, `vm_get_pml4`
+- **Pattern:** each process gets its own PML4 with kernel mappings copied
+  in (lower 512GB identity-mapped). User pages mapped per-process. CR3
+  switched on context switch.
+- **sys_fork** now creates a real child process with its own address space
+- **sys_kill** marks processes as zombie and destroys their address space
+- **sys_wait** reaps zombie processes
+- **Shell command:** `vmproc` — creates two address spaces, maps user
+  pages, verifies they're different, destroys one
+- **Limitation:** page fault handling via interrupts still blocked by PE
+  backend bug; address space creation and CR3 switch work cooperatively
+
+### 3.24 Recursive Process Domains (Fractal Kernel Phase 4)
+- **File:** `kernel/domain.fd`
+- **Domain table:** 16 domains × 64 bytes at `0x210000`
+- **Entry:** domain_id, parent_domain, cap_mask, child_count, sched_slot,
+  mem_base, mem_size, flags
+- **Flags:** ROOT (kernel domain), SUPERVISOR (can create child domains)
+- **API:** `domain_init`, `domain_create`, `domain_destroy`,
+  `domain_get_parent`, `domain_get_child_count`, `domain_get_mem_base/size`,
+  `domain_schedule`
+- **Pattern:** a domain is a self-similar unit with its own capabilities,
+  memory region, and child process table. Domains can nest recursively —
+  a child domain can create its own child domains.
+- **Shell commands:** `domains` (list all), `domtest` (create child +
+  grandchild + sibling, schedule, destroy)
+
+### 3.25 Driver Isolation (Fractal Kernel Phase 5)
+- **File:** `kernel/driver.fd`
+- **Driver table:** 8 drivers × 48 bytes at `0x220000`
+- **Entry:** driver_id, domain_id, msg_cap, cap_handle, state, packet_count
+- **States:** STOPPED, RUNNING, ERROR
+- **API:** `driver_init`, `driver_register`, `driver_send`, `driver_recv`,
+  `driver_get_state`, `driver_get_packet_count`, `driver_stop`,
+  `driver_start`, `driver_unregister`
+- **Pattern:** drivers run in their own capability domains and communicate
+  exclusively via messages. No direct function calls to driver internals.
+  The kernel talks to drivers the same way processes talk to each other.
+- **Shell commands:** `drivers` (list all), `drvtest` (register network +
+  console + disk drivers, send ping messages, stop/verify denial,
+  unregister)
+
 ## 4. Build System
 
 ### 4.1 Compile
@@ -426,6 +478,8 @@ with bare-metal primitives (i64, port I/O, memory access).
 | `arm_boot.fd` | **ACTIVE** | ARM Cortex-M target info |
 | `capability.fd` | **ACTIVE** | Capability table (fractal kernel phase 1) |
 | `msg.fd` | **ACTIVE** | Message passing endpoints (fractal kernel phase 2) |
+| `domain.fd` | **ACTIVE** | Recursive process domains (fractal kernel phase 4) |
+| `driver.fd` | **ACTIVE** | Driver isolation framework (fractal kernel phase 5) |
 
 ## 7. Repository Boundaries
 
