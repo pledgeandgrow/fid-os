@@ -25,10 +25,10 @@ pub const FB_FG_COLOR: i64 = 0x00FFFFFF;  // white
 pub const FB_BG_COLOR: i64 = 0x00000000;  // black
 
 // 64-bit memory helpers using 32-bit ops (avoids PE backend codegen issues)
-fn fb_read64(addr: i64) -> i64 {
+pub fn fb_read64(addr: i64) -> i64 {
     return p_mem_read32(addr) | (p_mem_read32(addr + 4) << 32);
 }
-fn fb_write64(addr: i64, val: i64) {
+pub fn fb_write64(addr: i64, val: i64) {
     p_mem_write32(addr, val & 0xFFFFFFFF);
     p_mem_write32(addr + 4, (val >> 32) & 0xFFFFFFFF);
 }

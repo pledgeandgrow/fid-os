@@ -30,6 +30,15 @@ pub fn con_putc(c: i64) -> void {
     serial_putc(c);
 }
 
+// Print a fixed-length string from memory (no null terminator needed)
+pub fn con_putn(addr: i64, len: i64) -> void {
+    var i: i64 = 0;
+    while i < len {
+        con_putc(p_mem_read8(addr + i));
+        i = i + 1;
+    }
+}
+
 // Start capturing output (for pipes/redirects)
 pub fn capture_start() -> void {
     p_mem_write8(CAPTURE_FLAG, 1);

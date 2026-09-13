@@ -90,3 +90,337 @@ pub fn heap_free(ptr: i64) {
     p_mem_write64(block_start + 8, heap_free_list);
     heap_free_list = block_start;
 }
+
+// ─── Buddy Page-Frame Allocator ──────────────────────────────────────────
+// Manages a contiguous physical region with power-of-two block sizes.
+// Free lists per order: order 0 = 1 page (4KB), order 1 = 2 pages, ... order 10 = 1024 pages.
+// Bitmap at 0x1F0000 tracks allocated state; free-list heads at 0x1F2000.
+// Managed region: 0x400000 .. 0x800000 (4MB = 1024 pages), max order 10.
+//
+// This is distinct from the simple bitmap page_alloc above: the buddy
+// allocator splits/coalesces blocks to reduce external fragmentation and
+// tracks free pages by order for O(1) allocation of large regions.
+
+pub const BUDDY_BITMAP: i64 = 0x1F0000;       // 1024 bits = 128 bytes
+pub const BUDDY_FREE_LISTS: i64 = 0x1F2000;   // 11 orders × 8 bytes (head index, -1 = empty)
+pub const BUDDY_NEXT: i64 = 0x1F2100;        // 1024 × 4 bytes: next index in free list
+pub const BUDDY_BASE: i64 = 0x400000;        // managed physical base
+pub const BUDDY_PAGES: i64 = 1024;           // 1024 pages = 4MB
+pub const BUDDY_MAX_ORDER: i64 = 10;         // 2^10 = 1024 pages
+pub var buddy_initialized: i64 = 0;
+
+// Initialize the buddy allocator: mark all pages free, put the whole region
+// as one max-order block in the top free list.
+pub fn buddy_init() -> void {
+    var i: i64 = 0;
+    while i < 128 {
+        p_mem_write8(BUDDY_BITMAP + i, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while i <= BUDDY_MAX_ORDER {
+        p_mem_write64(BUDDY_FREE_LISTS + i * 8, -1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < BUDDY_PAGES {
+        p_mem_write32(BUDDY_NEXT + i * 4, -1);
+        i = i + 1;
+    }
+    // Whole region is one free block of order MAX_ORDER at index 0
+    p_mem_write64(BUDDY_FREE_LISTS + BUDDY_MAX_ORDER * 8, 0);
+    p_mem_write32(BUDDY_NEXT, -1);
+    buddy_initialized = 1;
+}
+
+// Mark a page index as allocated in the bitmap
+fn buddy_set_alloc(index: i64) -> void {
+    var byte: i64 = index / 8;
+    var bit: i64 = index % 8;
+    var v: i64 = p_mem_read8(BUDDY_BITMAP + byte);
+    p_mem_write8(BUDDY_BITMAP + byte, v | (1 << bit));
+}
+
+// Mark a page index as free in the bitmap
+fn buddy_set_free(index: i64) -> void {
+    var byte: i64 = index / 8;
+    var bit: i64 = index % 8;
+    var v: i64 = p_mem_read8(BUDDY_BITMAP + byte);
+    p_mem_write8(BUDDY_BITMAP + byte, v & (~(1 << bit)));
+}
+
+fn buddy_is_alloc(index: i64) -> i64 {
+    var byte: i64 = index / 8;
+    var bit: i64 = index % 8;
+    var v: i64 = p_mem_read8(BUDDY_BITMAP + byte);
+    return (v >> bit) & 1;
+}
+
+// Remove a block index from a given order's free list
+fn buddy_list_remove(order: i64, index: i64) -> void {
+    var head: i64 = p_mem_read64(BUDDY_FREE_LISTS + order * 8);
+    if head == index {
+        p_mem_write64(BUDDY_FREE_LISTS + order * 8, p_mem_read32(BUDDY_NEXT + index * 4));
+        return;
+    }
+    var cur: i64 = head;
+    while cur != -1 {
+        var nxt: i64 = p_mem_read32(BUDDY_NEXT + cur * 4);
+        if nxt == index {
+            p_mem_write32(BUDDY_NEXT + cur * 4, p_mem_read32(BUDDY_NEXT + index * 4));
+            return;
+        }
+        cur = nxt;
+    }
+}
+
+// Push a block index onto a given order's free list
+fn buddy_list_push(order: i64, index: i64) -> void {
+    var head: i64 = p_mem_read64(BUDDY_FREE_LISTS + order * 8);
+    p_mem_write32(BUDDY_NEXT + index * 4, head);
+    p_mem_write64(BUDDY_FREE_LISTS + order * 8, index);
+}
+
+// Find the smallest order that fits `pages` pages
+fn buddy_order_for(pages: i64) -> i64 {
+    var order: i64 = 0;
+    var sz: i64 = 1;
+    while sz < pages && order < BUDDY_MAX_ORDER {
+        sz = sz * 2;
+        order = order + 1;
+    }
+    return order;
+}
+
+// Allocate `pages` contiguous pages. Returns physical address or 0 on failure.
+pub fn buddy_alloc(pages: i64) -> i64 {
+    if buddy_initialized == 0 { buddy_init(); }
+    if pages <= 0 || pages > BUDDY_PAGES { return 0; }
+    var order: i64 = buddy_order_for(pages);
+    // Find first non-empty free list at >= order
+    var o: i64 = order;
+    while o <= BUDDY_MAX_ORDER {
+        if p_mem_read64(BUDDY_FREE_LISTS + o * 8) != -1 { break; }
+        o = o + 1;
+    }
+    if o > BUDDY_MAX_ORDER { return 0; }  // no block large enough
+    // Pop the head block from order o
+    var index: i64 = p_mem_read64(BUDDY_FREE_LISTS + o * 8);
+    buddy_list_remove(o, index);
+    // Split down to the requested order
+    while o > order {
+        o = o - 1;
+        var buddy_index: i64 = index + (1 << o);
+        buddy_list_push(o, buddy_index);
+    }
+    // Mark all pages in the allocated block
+    var count: i64 = 1 << order;
+    var k: i64 = 0;
+    while k < count {
+        buddy_set_alloc(index + k);
+        k = k + 1;
+    }
+    return BUDDY_BASE + index * PAGE_SIZE;
+}
+
+// Free a block previously allocated with buddy_alloc, given the starting
+// physical address and the number of pages it spans.
+pub fn buddy_free(addr: i64, pages: i64) -> void {
+    if buddy_initialized == 0 { return; }
+    if addr < BUDDY_BASE { return; }
+    var index: i64 = (addr - BUDDY_BASE) / PAGE_SIZE;
+    if index < 0 || index >= BUDDY_PAGES { return; }
+    var order: i64 = buddy_order_for(pages);
+    var count: i64 = 1 << order;
+    var k: i64 = 0;
+    while k < count {
+        buddy_set_free(index + k);
+        k = k + 1;
+    }
+    // Coalesce with buddies while possible
+    var o: i64 = order;
+    while o < BUDDY_MAX_ORDER {
+        var buddy: i64 = index ^ (1 << o);
+        // Check buddy is within range, free, and same order (not already merged)
+        if buddy < 0 || buddy >= BUDDY_PAGES { break; }
+        var buddy_free: i64 = 1;
+        var b: i64 = 0;
+        while b < (1 << o) {
+            if buddy_is_alloc(buddy + b) != 0 { buddy_free = 0; b = 1 << o; }
+            b = b + 1;
+        }
+        if buddy_free == 0 { break; }
+        // Remove buddy from its free list, merge
+        buddy_list_remove(o, buddy);
+        if buddy < index { index = buddy; }
+        o = o + 1;
+    }
+    buddy_list_push(o, index);
+}
+
+// Count free pages across all orders
+pub fn buddy_free_pages() -> i64 {
+    var total: i64 = 0;
+    var o: i64 = 0;
+    while o <= BUDDY_MAX_ORDER {
+        var cur: i64 = p_mem_read64(BUDDY_FREE_LISTS + o * 8);
+        while cur != -1 {
+            total = total + (1 << o);
+            cur = p_mem_read32(BUDDY_NEXT + cur * 4);
+        }
+        o = o + 1;
+    }
+    return total;
+}
+
+// ─── Slab Allocator ─────────────────────────────────────────────────────
+// For small kernel objects (16/32/64/128 bytes). Each size class has a free
+// list of pre-allocated slots. Metadata at 0x1E0000, slots carved from the
+// buddy-managed region on demand.
+//
+// Slab cache layout (per size class, 16 bytes of metadata):
+//   [slot_size:8][free_head:8]
+// Free slots form a singly-linked list; the first 8 bytes of a free slot hold
+// the next free slot's address (0 = end).
+
+pub const SLAB_META: i64 = 0x1E0000;       // 4 classes × 16 bytes
+pub const SLAB_ARENA: i64 = 0x1E0100;      // 64KB arena for slab slots
+pub const SLAB_ARENA_END: i64 = 0x1EFFFF;
+pub const SLAB_CLASSES: i64 = 4;
+pub var slab_arena_next: i64 = 0x1E0100;
+
+pub fn slab_init() -> void {
+    var i: i64 = 0;
+    var sz: i64 = 16;
+    while i < SLAB_CLASSES {
+        p_mem_write64(SLAB_META + i * 16, sz);
+        p_mem_write64(SLAB_META + i * 16 + 8, 0);  // free head = 0
+        sz = sz * 2;
+        i = i + 1;
+    }
+    slab_arena_next = SLAB_ARENA;
+}
+
+// Pick the smallest slab class >= size. Returns class index or -1.
+fn slab_class_for(size: i64) -> i64 {
+    var i: i64 = 0;
+    while i < SLAB_CLASSES {
+        if p_mem_read64(SLAB_META + i * 16) >= size { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Allocate a small object of `size` bytes. Returns address or 0.
+pub fn slab_alloc(size: i64) -> i64 {
+    if size <= 0 { return 0; }
+    var cls: i64 = slab_class_for(size);
+    if cls < 0 { return 0; }  // too large for slab
+    var slot_size: i64 = p_mem_read64(SLAB_META + cls * 16);
+    var head: i64 = p_mem_read64(SLAB_META + cls * 16 + 8);
+    if head != 0 {
+        // Pop from free list
+        var next: i64 = p_mem_read64(head);
+        p_mem_write64(SLAB_META + cls * 16 + 8, next);
+        return head;
+    }
+    // Carve a new slot from the arena
+    if slab_arena_next + slot_size > SLAB_ARENA_END { return 0; }
+    var slot: i64 = slab_arena_next;
+    slab_arena_next = slab_arena_next + slot_size;
+    return slot;
+}
+
+// Free a slab-allocated object. `size` is the original requested size.
+pub fn slab_free(ptr: i64, size: i64) -> void {
+    if ptr == 0 { return; }
+    var cls: i64 = slab_class_for(size);
+    if cls < 0 { return; }
+    // Push onto the free list for this class
+    var head: i64 = p_mem_read64(SLAB_META + cls * 16 + 8);
+    p_mem_write64(ptr, head);
+    p_mem_write64(SLAB_META + cls * 16 + 8, ptr);
+}
+
+// Count free slots in a given slab class
+pub fn slab_free_count(cls: i64) -> i64 {
+    if cls < 0 || cls >= SLAB_CLASSES { return 0; }
+    var count: i64 = 0;
+    var cur: i64 = p_mem_read64(SLAB_META + cls * 16 + 8);
+    while cur != 0 {
+        count = count + 1;
+        cur = p_mem_read64(cur);
+    }
+    return count;
+}
+
+// ─── Test Commands ───────────────────────────────────────────────────────
+// cmd_buddy: test buddy allocator split/coalesce/free-page accounting
+pub fn cmd_buddy() -> void {
+    con_putc(10);
+    // "Buddy: init"
+    con_putc(66); con_putc(117); con_putc(100); con_putc(100); con_putc(121); con_putc(58); con_putc(32);
+    con_putc(105); con_putc(110); con_putc(105); con_putc(116);
+    con_putc(10);
+    buddy_init();
+    // Show initial free pages (should be 1024)
+    con_putc(70); con_putc(114); con_putc(101); con_putc(101); con_putc(32); con_putc(112); con_putc(97); con_putc(103); con_putc(101); con_putc(115); con_putc(58); con_putc(32); // "Free pages: "
+    print_dec(buddy_free_pages());
+    con_putc(10);
+    // Alloc 1 page, 2 pages, 4 pages
+    var a1: i64 = buddy_alloc(1);
+    var a2: i64 = buddy_alloc(2);
+    var a4: i64 = buddy_alloc(4);
+    con_putc(65); con_putc(108); con_putc(108); con_putc(111); con_putc(99); con_putc(58); con_putc(32); // "Alloc: "
+    print_hex(a1); con_putc(32); print_hex(a2); con_putc(32); print_hex(a4);
+    con_putc(10);
+    // Free pages after alloc (should be 1024 - 1 - 2 - 4 = 1017)
+    con_putc(70); con_putc(114); con_putc(101); con_putc(101); con_putc(58); con_putc(32); // "Free: "
+    print_dec(buddy_free_pages());
+    con_putc(10);
+    // Free them
+    buddy_free(a1, 1);
+    buddy_free(a2, 2);
+    buddy_free(a4, 4);
+    con_putc(70); con_putc(114); con_putc(101); con_putc(101); con_putc(58); con_putc(32); // "Free: "
+    print_dec(buddy_free_pages());
+    con_putc(10);
+    // Test exhaustion: alloc all pages
+    var total_alloc: i64 = 0;
+    var p: i64 = buddy_alloc(1);
+    while p != 0 {
+        total_alloc = total_alloc + 1;
+        p = buddy_alloc(1);
+    }
+    con_putc(69); con_putc(120); con_putc(104); con_putc(97); con_putc(117); con_putc(115); con_putc(116); con_putc(58); con_putc(32); // "Exhaust: "
+    print_dec(total_alloc);
+    con_putc(32); con_putc(102); con_putc(114); con_putc(101); con_putc(101); con_putc(61); // " free="
+    print_dec(buddy_free_pages());
+    con_putc(10);
+}
+
+// cmd_slab: test slab allocator alloc/free/count
+pub fn cmd_slab() -> void {
+    con_putc(10);
+    con_putc(83); con_putc(108); con_putc(97); con_putc(98); con_putc(58); con_putc(32); // "Slab: "
+    con_putc(105); con_putc(110); con_putc(105); con_putc(116); con_putc(10);
+    slab_init();
+    // Alloc 3 objects of size 16
+    var s1: i64 = slab_alloc(16);
+    var s2: i64 = slab_alloc(16);
+    var s3: i64 = slab_alloc(32);
+    con_putc(65); con_putc(108); con_putc(108); con_putc(111); con_putc(99); con_putc(58); con_putc(32); // "Alloc: "
+    print_hex(s1); con_putc(32); print_hex(s2); con_putc(32); print_hex(s3);
+    con_putc(10);
+    // Free s1 and s2, show free count
+    slab_free(s1, 16);
+    slab_free(s2, 16);
+    con_putc(70); con_putc(114); con_putc(101); con_putc(101); con_putc(32); con_putc(99); con_putc(108); con_putc(115); con_putc(48); con_putc(58); con_putc(32); // "Free cls0: "
+    print_dec(slab_free_count(0));
+    con_putc(10);
+    // Realloc from free list
+    var s4: i64 = slab_alloc(16);
+    con_putc(82); con_putc(101); con_putc(117); con_putc(115); con_putc(101); con_putc(58); con_putc(32); // "Reuse: "
+    print_hex(s4);
+    con_putc(10);
+}

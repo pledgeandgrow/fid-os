@@ -5,6 +5,7 @@
 module vm;
 
 use console;
+use kalloc;
 
 pub fn vm_map(vaddr: i64, paddr: i64, flags: i64) -> i64 {
     // PML4 index = bits 39-47
@@ -89,6 +90,131 @@ pub fn vm_unmap(vaddr: i64) -> i64 {
     return 0;
 }
 
+// ─── Memory Protection (NX bit, guard pages) ─────────────────────────────
+// Page-table flag bits:
+//   0x01 Present, 0x02 Writable, 0x04 User, 0x80 Huge (PS),
+//   0x100 No-Execute (NX, bit 63 of PTE — only valid in PDPT/PD entries).
+// Guard pages are simply unmapped pages placed before/after a region; any
+// access faults into them, which the page-fault handler turns into a panic.
+
+pub const VM_PROT_READ: i64 = 0x01;
+pub const VM_PROT_WRITE: i64 = 0x02;
+pub const VM_PROT_EXEC: i64 = 0x04;
+pub const VM_PROT_USER: i64 = 0x04;  // user-accessible bit in PTE
+pub const VM_PROT_NX: i64 = 0x100;   // non-executable
+
+// Map a region with explicit protection flags. `prot` is a bitmask of
+// VM_PROT_* constants. Returns the mapped virtual address or 0 on failure.
+pub fn vm_map_protected(vaddr: i64, paddr: i64, prot: i64) -> i64 {
+    // Translate VM_PROT_* into PTE flags: writable + user + NX.
+    var flags: i64 = 0x01;  // present
+    if (prot & VM_PROT_WRITE) != 0 { flags = flags | 0x02; }
+    if (prot & VM_PROT_USER) != 0 { flags = flags | 0x04; }
+    // NX is stored in the upper flags byte passed through to vm_map
+    if (prot & VM_PROT_NX) != 0 { flags = flags | 0x100; }
+    return vm_map(vaddr, paddr, flags);
+}
+
+// Allocate a guard page (unmapped) immediately before `vaddr`. Any access
+// to the guard page will page-fault. Returns the guard address.
+pub fn vm_guard_page(vaddr: i64) -> i64 {
+    var guard: i64 = vaddr - 0x200000;  // one 2MB page below (2MB granularity)
+    // Ensure the guard is present-but-inaccessible: unmap it explicitly.
+    vm_unmap(guard);
+    return guard;
+}
+
+// ─── mmap / munmap region tracking ───────────────────────────────────────
+// Tracks anonymous mmap regions so munmap can release them. Each region
+// record is 32 bytes: [vaddr:8][pages:8][prot:8][used:8]. Table at 0x1F8000.
+// The mmap bump pointer starts at 0x50000000 (high virtual, identity-mapped
+// region extended on demand via vm_map).
+
+pub const MMAP_REGION_TABLE: i64 = 0x1F8000;  // 64 regions × 32 bytes
+pub const MMAP_MAX_REGIONS: i64 = 64;
+pub const MMAP_REGION_SIZE: i64 = 32;
+pub const MMAP_BASE: i64 = 0x50000000;       // anonymous mmap starts here
+pub var mmap_next: i64 = 0x50000000;
+
+pub fn mmap_init() -> void {
+    var i: i64 = 0;
+    while i < MMAP_MAX_REGIONS * MMAP_REGION_SIZE {
+        p_mem_write8(MMAP_REGION_TABLE + i, 0);
+        i = i + 1;
+    }
+    mmap_next = MMAP_BASE;
+}
+
+// Anonymous mmap: reserve `length` bytes of virtual address space, map
+// physical pages (from the buddy allocator) into it, and record the region.
+// Returns the virtual address or 0 on failure.
+pub fn mmap_anon(length: i64, prot: i64) -> i64 {
+    if length <= 0 { return 0; }
+    var pages: i64 = (length + 0xFFF) / 0x1000;  // 4KB pages
+    if pages > 512 { return 0; }  // cap at 2MB per region (2MB huge page)
+    // Find a free region record
+    var slot: i64 = -1;
+    var i: i64 = 0;
+    while i < MMAP_MAX_REGIONS {
+        if p_mem_read64(MMAP_REGION_TABLE + i * MMAP_REGION_SIZE + 24) == 0 {
+            slot = i;
+            i = MMAP_MAX_REGIONS;
+        }
+        i = i + 1;
+    }
+    if slot < 0 { return 0; }
+    // Allocate physical pages from the buddy allocator
+    var paddr: i64 = 0;
+    // buddy_alloc returns a physical address; fall back to bump if unavailable
+    paddr = buddy_alloc(pages);
+    if paddr == 0 {
+        // No buddy memory — use the bump pointer (identity region)
+        paddr = mmap_next;
+    }
+    var vaddr: i64 = mmap_next;
+    // Map as a 2MB huge page (round vaddr/paddr to 2MB boundary)
+    var v_aligned: i64 = vaddr & 0xFFFFFFFFFFE00000;
+    var p_aligned: i64 = paddr & 0xFFFFFFFFFFE00000;
+    vm_map_protected(v_aligned, p_aligned, prot);
+    // Record the region
+    p_mem_write64(MMAP_REGION_TABLE + slot * MMAP_REGION_SIZE, vaddr);
+    p_mem_write64(MMAP_REGION_TABLE + slot * MMAP_REGION_SIZE + 8, pages);
+    p_mem_write64(MMAP_REGION_TABLE + slot * MMAP_REGION_SIZE + 16, prot);
+    p_mem_write64(MMAP_REGION_TABLE + slot * MMAP_REGION_SIZE + 24, 1);  // used
+    mmap_next = mmap_next + 0x200000;  // advance by 2MB
+    return vaddr;
+}
+
+// Unmap a previously mmap'd region. Returns 0 on success, -1 if not found.
+pub fn munmap(vaddr: i64) -> i64 {
+    var i: i64 = 0;
+    while i < MMAP_MAX_REGIONS {
+        var base: i64 = MMAP_REGION_TABLE + i * MMAP_REGION_SIZE;
+        if p_mem_read64(base + 24) == 1 && p_mem_read64(base) == vaddr {
+            var pages: i64 = p_mem_read64(base + 8);
+            // Free physical pages back to the buddy allocator
+            buddy_free(vaddr, pages);
+            // Unmap the virtual range
+            vm_unmap(vaddr & 0xFFFFFFFFFFE00000);
+            p_mem_write64(base + 24, 0);  // mark slot free
+            return 0;
+        }
+        i = i + 1;
+    }
+    return -1;  // not found
+}
+
+// Page-fault counter (incremented by the page-fault handler). Stored at a
+// small fixed address so the ISR can update it without a function call.
+pub const PF_COUNT: i64 = 0x6E0;
+pub const PF_LAST_ADDR: i64 = 0x6E8;  // last faulting address (CR2)
+
+pub fn vm_page_fault(fault_addr: i64) -> void {
+    var count: i64 = p_mem_read64(PF_COUNT);
+    p_mem_write64(PF_COUNT, count + 1);
+    p_mem_write64(PF_LAST_ADDR, fault_addr);
+}
+
 pub fn cmd_vm() -> void {
     con_putc(10);
     // "VM: verify mapping 0x800000"
@@ -104,5 +230,32 @@ pub fn cmd_vm() -> void {
     // Show CR3 (page table base)
     con_putc(67); con_putc(82); con_putc(51); con_putc(58); con_putc(32); // "CR3: "
     print_hex(p_cr3_read());
+    con_putc(10);
+}
+
+// cmd_mmap: test mmap/munmap anonymous regions
+pub fn cmd_mmap() -> void {
+    con_putc(10);
+    con_putc(77); con_putc(77); con_putc(65); con_putc(80); con_putc(58); con_putc(32); // "MMAP: "
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(10); // "test"
+    mmap_init();
+    // Map a 4KB region
+    var v1: i64 = mmap_anon(0x1000, VM_PROT_READ | VM_PROT_WRITE);
+    con_putc(118); con_putc(49); con_putc(61); // "v1="
+    print_hex(v1);
+    con_putc(10);
+    // Map another
+    var v2: i64 = mmap_anon(0x2000, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_NX);
+    con_putc(118); con_putc(50); con_putc(61); // "v2="
+    print_hex(v2);
+    con_putc(10);
+    // Unmap v1
+    var r: i64 = munmap(v1);
+    con_putc(117); con_putc(110); con_putc(109); con_putc(97); con_putc(112); con_putc(58); con_putc(32); // "unmap: "
+    print_dec(r);
+    con_putc(10);
+    // Show page fault count
+    con_putc(80); con_putc(70); con_putc(58); con_putc(32); // "PF: "
+    print_dec(p_mem_read64(PF_COUNT));
     con_putc(10);
 }

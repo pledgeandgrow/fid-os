@@ -1,0 +1,32 @@
+// run-qemu.js — Run QEMU and capture serial output
+const { spawn } = require('child_process');
+const fs = require('fs');
+
+const iso = process.argv[2] || 'build/fides-os-patched.iso';
+const timeout = parseInt(process.argv[3] || '12000');
+const extraArgs = process.argv.slice(4);
+
+const qemu = spawn('C:/Program Files/qemu/qemu-system-x86_64.exe', [
+  '-cdrom', iso,
+  '-m', '256',
+  '-serial', 'file:build/serial-qemu.log',
+  '-no-reboot', '-display', 'none',
+  ...extraArgs
+], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+qemu.stderr.on('data', d => process.stderr.write('[QEMU] ' + d));
+qemu.stdout.on('data', d => process.stdout.write(d));
+
+setTimeout(() => {
+  qemu.kill();
+  setTimeout(() => {
+    try {
+      const log = fs.readFileSync('build/serial-qemu.log', 'utf8');
+      console.log('---SERIAL OUTPUT---');
+      console.log(log.substring(0, 3000));
+    } catch(e) {
+      console.log('No serial log:', e.message);
+    }
+    process.exit(0);
+  }, 1000);
+}, timeout);

@@ -1,0 +1,201 @@
+// kernel/console.fd — Console output + input buffer + print utilities
+// Bridges VGA and serial output, provides input buffer and formatting.
+// Supports output capture for shell pipes and redirects.
+
+module console;
+
+use vga;
+use serial;
+
+// ─── Output Capture (for pipes/redirects) ───────────────────────────────
+// When CAPTURE_FLAG is 1, con_putc writes to CAPTURE_BUF instead of VGA/serial.
+pub const CAPTURE_FLAG: i64 = 0x1D5000;    // 1 byte: 0=inactive, 1=active
+pub const CAPTURE_BUF: i64 = 0x1D1000;     // 8KB capture buffer
+pub const CAPTURE_LEN: i64 = 0x1D5008;      // 8 bytes: current capture length
+pub const CAPTURE_MAX: i64 = 8192;
+
+// ─── Console Output ─────────────────────────────────────────────────────
+
+pub fn con_putc(c: i64) -> void {
+    // Check if capture is active
+    if p_mem_read8(CAPTURE_FLAG) == 1 {
+        var len: i64 = p_mem_read8(CAPTURE_LEN);
+        if len < CAPTURE_MAX {
+            p_mem_write8(CAPTURE_BUF + len, c);
+            p_mem_write8(CAPTURE_LEN, len + 1);
+        }
+        return;
+    }
+    vga_putc(c);
+    serial_putc(c);
+}
+
+// Print a fixed-length string from memory (no null terminator needed)
+pub fn con_putn(addr: i64, len: i64) -> void {
+    var i: i64 = 0;
+    while i < len {
+        con_putc(p_mem_read8(addr + i));
+        i = i + 1;
+    }
+}
+
+// Start capturing output (for pipes/redirects)
+pub fn capture_start() -> void {
+    p_mem_write8(CAPTURE_FLAG, 1);
+    p_mem_write64(CAPTURE_LEN, 0);
+}
+
+// Stop capturing output
+pub fn capture_stop() -> void {
+    p_mem_write8(CAPTURE_FLAG, 0);
+}
+
+// Get captured output length
+pub fn capture_get_len() -> i64 {
+    return p_mem_read64(CAPTURE_LEN);
+}
+
+// Get capture buffer address
+pub fn capture_get_buf() -> i64 {
+    return CAPTURE_BUF;
+}
+
+// ─── Input Buffer ────────────────────────────────────────────────────────
+// Use a fixed memory region for the input buffer (below VGA at 0x80000)
+pub const INPUT_BUF_ADDR: i64 = 0x80000;
+pub const INPUT_MAX: i64 = 256;
+
+pub fn input_clear() -> void {
+    var i: i64 = 0;
+    while i < INPUT_MAX {
+        p_mem_write8(INPUT_BUF_ADDR + i, 0);
+        i = i + 1;
+    }
+}
+
+pub fn input_write(idx: i64, c: i64) -> void {
+    p_mem_write8(INPUT_BUF_ADDR + idx, c);
+}
+
+pub fn input_get(idx: i64) -> i64 {
+    return p_mem_read8(INPUT_BUF_ADDR + idx);
+}
+
+// Check if input matches a string (char codes passed as args)
+pub fn input_matches(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, len: i64, actual_len: i64) -> i64 {
+    if actual_len != len { return 0; }
+    if len > 0 { if input_get(0) != s0 { return 0; } }
+    if len > 1 { if input_get(1) != s1 { return 0; } }
+    if len > 2 { if input_get(2) != s2 { return 0; } }
+    if len > 3 { if input_get(3) != s3 { return 0; } }
+    if len > 4 { if input_get(4) != s4 { return 0; } }
+    return 1;
+}
+
+// Check if input matches a string up to 8 chars
+pub fn input_matches8(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64, len: i64, actual_len: i64) -> i64 {
+    if actual_len != len { return 0; }
+    if len > 0 { if input_get(0) != s0 { return 0; } }
+    if len > 1 { if input_get(1) != s1 { return 0; } }
+    if len > 2 { if input_get(2) != s2 { return 0; } }
+    if len > 3 { if input_get(3) != s3 { return 0; } }
+    if len > 4 { if input_get(4) != s4 { return 0; } }
+    if len > 5 { if input_get(5) != s5 { return 0; } }
+    if len > 6 { if input_get(6) != s6 { return 0; } }
+    if len > 7 { if input_get(7) != s7 { return 0; } }
+    return 1;
+}
+
+// Check if input starts with a prefix (up to 4 chars), with optional space after.
+// Returns 1 if input is exactly the prefix OR prefix followed by space+args.
+pub fn input_prefix4(s0: i64, s1: i64, s2: i64, s3: i64, len: i64, actual_len: i64) -> i64 {
+    if actual_len < len { return 0; }
+    if len > 0 { if input_get(0) != s0 { return 0; } }
+    if len > 1 { if input_get(1) != s1 { return 0; } }
+    if len > 2 { if input_get(2) != s2 { return 0; } }
+    if len > 3 { if input_get(3) != s3 { return 0; } }
+    // If actual_len > len, next char must be space
+    if actual_len > len { if input_get(len) != 32 { return 0; } }
+    return 1;
+}
+
+// Check if input starts with a prefix (up to 8 chars), with optional space after.
+pub fn input_prefix8(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64, len: i64, actual_len: i64) -> i64 {
+    if actual_len < len { return 0; }
+    if len > 0 { if input_get(0) != s0 { return 0; } }
+    if len > 1 { if input_get(1) != s1 { return 0; } }
+    if len > 2 { if input_get(2) != s2 { return 0; } }
+    if len > 3 { if input_get(3) != s3 { return 0; } }
+    if len > 4 { if input_get(4) != s4 { return 0; } }
+    if len > 5 { if input_get(5) != s5 { return 0; } }
+    if len > 6 { if input_get(6) != s6 { return 0; } }
+    if len > 7 { if input_get(7) != s7 { return 0; } }
+    if actual_len > len { if input_get(len) != 32 { return 0; } }
+    return 1;
+}
+
+// ─── Print Utilities ────────────────────────────────────────────────────
+
+// Print a decimal integer
+pub fn print_dec(n: i64) -> void {
+    var m: i64 = n;
+    if m == 0 { con_putc(48); return; }
+    // Handle negative
+    if m < 0 {
+        con_putc(45);
+        m = 0 - m;
+    }
+    // Extract digits into a buffer at 0x50000
+    var buf: i64 = 0x50000;
+    var i: i64 = 0;
+    while m > 0 {
+        p_mem_write8(buf + i, 48 + (m % 10));
+        m = m / 10;
+        i = i + 1;
+    }
+    // Print in reverse
+    while i > 0 {
+        i = i - 1;
+        con_putc(p_mem_read8(buf + i));
+    }
+}
+
+// Print a hex integer (64-bit, with 0x prefix)
+pub fn print_hex(n: i64) -> void {
+    con_putc(48); con_putc(120);
+    var buf: i64 = 0x50000;
+    var i: i64 = 0;
+    var tmp: i64 = n;
+    while i < 16 {
+        var nibble: i64 = tmp & 0xF;
+        if nibble < 10 {
+            p_mem_write8(buf + i, 48 + nibble);
+        } else {
+            p_mem_write8(buf + i, 97 + nibble - 10);
+        }
+        tmp = tmp >> 4;
+        i = i + 1;
+    }
+    // Skip leading zeros
+    i = 15;
+    while i > 0 {
+        if p_mem_read8(buf + i) != 48 { break; }
+        i = i - 1;
+    }
+    while i >= 0 {
+        con_putc(p_mem_read8(buf + i));
+        i = i - 1;
+    }
+}
+
+// Print a fixed string from char codes (up to 16)
+pub fn print_str(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64, len: i64) -> void {
+    if len > 0 { con_putc(s0); }
+    if len > 1 { con_putc(s1); }
+    if len > 2 { con_putc(s2); }
+    if len > 3 { con_putc(s3); }
+    if len > 4 { con_putc(s4); }
+    if len > 5 { con_putc(s5); }
+    if len > 6 { con_putc(s6); }
+    if len > 7 { con_putc(s7); }
+}

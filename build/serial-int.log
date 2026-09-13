@@ -1,0 +1,29 @@
+Fides OS v0.1
+
+
+Commands:
+  help    - show this help
+  clear    - clear screen
+  echo    - print text
+  mem     - show memory
+  info    - system info
+  time    - show RTC time
+  date    - show RTC date
+  reboot  - restart system
+  poweroff - turn off
+  malloc  - test heap alloc
+  disk    - read disk sector 0
+  run     - load & run user program
+  elf     - load ELF from sector 2
+  ps      - show processes
+  ticks  - show timer ticks
+  halt    - stop CPU
+  ls      - list files
+  cat     - read file
+
+
+FS not init
+
+Loading user program from sector 1...
+Failed to load user program
+> 

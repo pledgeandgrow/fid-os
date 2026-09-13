@@ -4,6 +4,7 @@
 module sched;
 
 use console;
+use syscall;
 
 pub const SCHED_TABLE: i64 = 0x320000;
 pub const SCHED_MAX_PROCS: i64 = 8;
@@ -358,4 +359,155 @@ pub fn cmd_threads() -> void {
         }
         i = i + 1;
     }
+}
+
+// ─── Priority Scheduling ─────────────────────────────────────────────────
+// Selects the next runnable process by priority (lowest nice value wins;
+// ties broken by round-robin order). Operates on the process descriptors in
+// syscall.fd's PROC_TABLE so the scheduler and the process table stay in
+// sync. `nice` ranges -20 (highest priority) .. 19 (lowest).
+
+// Pick the next READY process after `current` by priority. Returns its
+// table index, or -1 if none is runnable.
+pub fn proc_next_by_priority(current: i64) -> i64 {
+    var best: i64 = -1;
+    var best_prio: i64 = 0;
+    var i: i64 = 0;
+    while i < MAX_PROCS {
+        var base: i64 = PROC_TABLE + i * PROC_ENTRY_SIZE;
+        var pid: i64 = p_mem_read64(base);
+        var state: i64 = p_mem_read64(base + 8);
+        if pid != 0 && state == PROC_READY {
+            var prio: i64 = p_mem_read64(base + 40);
+            if best < 0 || prio < best_prio {
+                best = i;
+                best_prio = prio;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// Set the current process's nice level. Wraps proc_set_priority for the
+// currently-running process.
+pub fn proc_nice(nice: i64) -> i64 {
+    return proc_set_priority(current_pid, nice);
+}
+
+// Show all processes with their priorities (full process table view).
+pub fn cmd_procs() -> void {
+    con_putc(10);
+    // "PID STATE PRIO PPID ENTRY"
+    con_putc(80); con_putc(73); con_putc(68); con_putc(32); // "PID "
+    con_putc(83); con_putc(84); con_putc(32); con_putc(32); // "ST  "
+    con_putc(80); con_putc(82); // "PR"
+    con_putc(32); con_putc(32); // "  "
+    con_putc(80); con_putc(80); con_putc(73); con_putc(68); // "PPID"
+    con_putc(32);
+    con_putc(69); con_putc(78); con_putc(84); // "ENT"
+    con_putc(10);
+    var i: i64 = 0;
+    while i < MAX_PROCS {
+        var base: i64 = PROC_TABLE + i * PROC_ENTRY_SIZE;
+        var pid: i64 = p_mem_read64(base);
+        if pid != 0 {
+            var state: i64 = p_mem_read64(base + 8);
+            var prio: i64 = p_mem_read64(base + 40);
+            var ppid: i64 = p_mem_read64(base + 32);
+            var entry: i64 = p_mem_read64(base + 16);
+            print_dec(pid);
+            con_putc(32);
+            // State label
+            if state == PROC_READY { con_putc(82); con_putc(100); } // "Rd"
+            else if state == PROC_RUNNING { con_putc(82); con_putc(110); } // "Rn"
+            else if state == PROC_BLOCKED { con_putc(66); con_putc(108); } // "Bl"
+            else if state == PROC_ZOMBIE { con_putc(90); con_putc(109); } // "Zm"
+            else if state == PROC_STOPPED { con_putc(83); con_putc(112); } // "Sp"
+            con_putc(32);
+            print_dec(prio);
+            con_putc(32);
+            print_dec(ppid);
+            con_putc(32);
+            print_hex(entry);
+            con_putc(10);
+        }
+        i = i + 1;
+    }
+}
+
+// cmd_nice: set current process priority (nice level)
+// Usage: nice <value>  (e.g. "nice 5" or "nice -10")
+pub fn cmd_nice(input_len: i64) -> void {
+    var val: i64 = 0;
+    var neg: i64 = 0;
+    var i: i64 = 5;  // skip "nice "
+    while i < input_len {
+        var c: i64 = input_get(i);
+        var is_neg: i64 = 0;
+        var is_digit: i64 = 0;
+        if c == 45 { is_neg = 1; }
+        if c >= 48 { if c <= 57 { is_digit = 1; } }
+        if is_neg == 1 { neg = 1; }
+        if is_digit == 1 { val = val * 10 + (c - 48); }
+        i = i + 1;
+    }
+    if neg == 1 { val = 0 - val; }
+    // Clamp to -20..19
+    var min_val: i64 = 0 - 20;
+    if val < min_val { val = min_val; }
+    if val > 19 { val = 19; }
+    var r: i64 = proc_nice(val);
+    con_putc(10);
+    if r == 0 {
+        con_putc(110); con_putc(105); con_putc(99); con_putc(101); con_putc(61); // "nice="
+        print_dec(val);
+    } else {
+        con_putc(69); con_putc(114); con_putc(114); con_putc(111); con_putc(114); // "Error"
+    }
+    con_putc(10);
+}
+
+// cmd_kill: kill a process by PID
+// Usage: kill <pid>
+pub fn cmd_kill(input_len: i64) -> void {
+    var pid: i64 = 0;
+    var i: i64 = 5;  // skip "kill "
+    while i < input_len {
+        var c: i64 = input_get(i);
+        var is_digit: i64 = 0;
+        if c >= 48 { if c <= 57 { is_digit = 1; } }
+        if is_digit == 1 { pid = pid * 10 + (c - 48); }
+        i = i + 1;
+    }
+    if pid <= 0 {
+        con_putc(10);
+        con_putc(63); con_putc(10);  // "?"
+        return;
+    }
+    var r: i64 = sys_kill(pid, SIGKILL);
+    con_putc(10);
+    if r == 0 {
+        con_putc(107); con_putc(105); con_putc(108); con_putc(108); con_putc(101); con_putc(100); // "killed"
+        con_putc(32);
+        print_dec(pid);
+    } else {
+        con_putc(69); con_putc(114); con_putc(114); // "Err"
+    }
+    con_putc(10);
+}
+
+// cmd_fork: test fork by creating a child process
+pub fn cmd_fork() -> void {
+    con_putc(10);
+    var pid: i64 = sys_fork();
+    if pid > 0 {
+        con_putc(99); con_putc(104); con_putc(105); con_putc(108); con_putc(100); con_putc(61); // "child="
+        print_dec(pid);
+    } else if pid == 0 {
+        con_putc(112); con_putc(97); con_putc(114); con_putc(101); con_putc(110); con_putc(116); // "parent"
+    } else {
+        con_putc(69); con_putc(114); con_putc(114); // "Err"
+    }
+    con_putc(10);
 }

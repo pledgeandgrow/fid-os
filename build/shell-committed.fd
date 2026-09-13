@@ -1,0 +1,1332 @@
+// kernel/shell.fd — Fides OS main kernel + shell
+//
+// Boots via GRUB/Multiboot2, writes to VGA text mode (0xB8000),
+// reads keyboard input via interrupts, and runs a shell.
+// All subsystems are in separate modules imported via `use`.
+
+module shell;
+
+use vga;
+use serial;
+use console;
+use isr;
+use keyboard;
+use kalloc;
+use sched;
+use ata;
+use vfs;
+use initrd;
+use pci;
+use acpi;
+use vm;
+use mouse;
+use apic;
+use elf;
+use syscall;
+use net;
+use framebuffer;
+use dma;
+use audio;
+use shell_script;
+
+// ─── Shell Commands ─────────────────────────────────────────────────────
+
+fn cmd_help() -> void {
+    con_putc(10);
+    // "Commands:"
+    con_putc(67); con_putc(111); con_putc(109); con_putc(109); con_putc(97); con_putc(110); con_putc(100); con_putc(115); con_putc(58);
+    con_putc(10);
+    // "  help    - show this help"
+    con_putc(32); con_putc(32);
+    con_putc(104); con_putc(101); con_putc(108); con_putc(112);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(115); con_putc(104); con_putc(111); con_putc(119); con_putc(32); con_putc(116); con_putc(104); con_putc(105); con_putc(115);
+    con_putc(32); con_putc(104); con_putc(101); con_putc(108); con_putc(112);
+    con_putc(10);
+    // "  clear   - clear screen"
+    con_putc(32); con_putc(32);
+    con_putc(99); con_putc(108); con_putc(101); con_putc(97); con_putc(114);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(99); con_putc(108); con_putc(101); con_putc(97); con_putc(114); con_putc(32); con_putc(115); con_putc(99); con_putc(114); con_putc(101); con_putc(101); con_putc(110);
+    con_putc(10);
+    // "  echo    - print text"
+    con_putc(32); con_putc(32);
+    con_putc(101); con_putc(99); con_putc(104); con_putc(111);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(112); con_putc(114); con_putc(105); con_putc(110); con_putc(116); con_putc(32); con_putc(116); con_putc(101); con_putc(120); con_putc(116);
+    con_putc(10);
+    // "  mem     - show memory map"
+    con_putc(32); con_putc(32);
+    con_putc(109); con_putc(101); con_putc(109);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(115); con_putc(104); con_putc(111); con_putc(119); con_putc(32); con_putc(109); con_putc(101); con_putc(109); con_putc(111); con_putc(114); con_putc(121);
+    con_putc(10);
+    // "  info    - system info"
+    con_putc(32); con_putc(32);
+    con_putc(105); con_putc(110); con_putc(102); con_putc(111);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(115); con_putc(121); con_putc(115); con_putc(116); con_putc(101); con_putc(109); con_putc(32); con_putc(105); con_putc(110); con_putc(102); con_putc(111);
+    con_putc(10);
+    // "  time    - show RTC time"
+    con_putc(32); con_putc(32);
+    con_putc(116); con_putc(105); con_putc(109); con_putc(101);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(115); con_putc(104); con_putc(111); con_putc(119); con_putc(32); con_putc(82); con_putc(84); con_putc(67); con_putc(32); con_putc(116); con_putc(105); con_putc(109); con_putc(101);
+    con_putc(10);
+    // "  date    - show RTC date"
+    con_putc(32); con_putc(32);
+    con_putc(100); con_putc(97); con_putc(116); con_putc(101);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(115); con_putc(104); con_putc(111); con_putc(119); con_putc(32); con_putc(82); con_putc(84); con_putc(67); con_putc(32); con_putc(100); con_putc(97); con_putc(116); con_putc(101);
+    con_putc(10);
+    // "  reboot  - restart system"
+    con_putc(32); con_putc(32);
+    con_putc(114); con_putc(101); con_putc(98); con_putc(111); con_putc(111); con_putc(116);
+    con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(114); con_putc(101); con_putc(115); con_putc(116); con_putc(97); con_putc(114); con_putc(116); con_putc(32); con_putc(115); con_putc(121); con_putc(115); con_putc(116); con_putc(101); con_putc(109);
+    con_putc(10);
+    // "  poweroff- turn off (ACPI)"
+    con_putc(32); con_putc(32);
+    con_putc(112); con_putc(111); con_putc(119); con_putc(101); con_putc(114); con_putc(111); con_putc(102); con_putc(102);
+    con_putc(32); con_putc(45);
+    con_putc(32); con_putc(116); con_putc(117); con_putc(114); con_putc(110); con_putc(32); con_putc(111); con_putc(102); con_putc(102);
+    con_putc(10);
+    // "  malloc  - test heap alloc"
+    con_putc(32); con_putc(32);
+    con_putc(109); con_putc(97); con_putc(108); con_putc(108); con_putc(111); con_putc(99);
+    con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(32); con_putc(104); con_putc(101); con_putc(97); con_putc(112);
+    con_putc(32); con_putc(97); con_putc(108); con_putc(108); con_putc(111); con_putc(99);
+    con_putc(10);
+    // "  disk    - read disk sector 0"
+    con_putc(32); con_putc(32);
+    con_putc(100); con_putc(105); con_putc(115); con_putc(107);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(114); con_putc(101); con_putc(97); con_putc(100); con_putc(32); con_putc(100); con_putc(105); con_putc(115); con_putc(107);
+    con_putc(32); con_putc(115); con_putc(101); con_putc(99); con_putc(116); con_putc(111); con_putc(114); con_putc(32); con_putc(48);
+    con_putc(10);
+    // "  run     - load & run user program"
+    con_putc(32); con_putc(32);
+    con_putc(114); con_putc(117); con_putc(110);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(108); con_putc(111); con_putc(97); con_putc(100); con_putc(32); con_putc(38); con_putc(32); con_putc(114); con_putc(117); con_putc(110);
+    con_putc(32); con_putc(117); con_putc(115); con_putc(101); con_putc(114); con_putc(32); con_putc(112); con_putc(114); con_putc(111); con_putc(103); con_putc(114); con_putc(97); con_putc(109);
+    con_putc(10);
+    // "  elf     - load ELF from sector 2"
+    con_putc(32); con_putc(32);
+    con_putc(101); con_putc(108); con_putc(102);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(108); con_putc(111); con_putc(97); con_putc(100); con_putc(32); con_putc(69); con_putc(76); con_putc(70); con_putc(32); con_putc(102); con_putc(114); con_putc(111); con_putc(109); con_putc(32); con_putc(115); con_putc(101); con_putc(99); con_putc(116); con_putc(111); con_putc(114); con_putc(32); con_putc(50);
+    con_putc(10);
+    // "  ps      - show processes"
+    con_putc(32); con_putc(32);
+    con_putc(112); con_putc(115);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(115); con_putc(104); con_putc(111); con_putc(119); con_putc(32); con_putc(112); con_putc(114); con_putc(111); con_putc(99); con_putc(101); con_putc(115); con_putc(115); con_putc(101); con_putc(115);
+    con_putc(10);
+    // "  ticks   - show timer ticks"
+    con_putc(32); con_putc(32);
+    con_putc(116); con_putc(105); con_putc(99); con_putc(107); con_putc(115);
+    con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(115); con_putc(104); con_putc(111); con_putc(119); con_putc(32); con_putc(116); con_putc(105); con_putc(109); con_putc(101); con_putc(114); con_putc(32); con_putc(116); con_putc(105); con_putc(99); con_putc(107); con_putc(115);
+    con_putc(10);
+    // "  halt    - stop CPU"
+    con_putc(32); con_putc(32);
+    con_putc(104); con_putc(97); con_putc(108); con_putc(116);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(115); con_putc(116); con_putc(111); con_putc(112); con_putc(32); con_putc(67); con_putc(80); con_putc(85);
+    con_putc(10);
+    // "  ls      - list files"
+    con_putc(32); con_putc(32);
+    con_putc(108); con_putc(115);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(108); con_putc(105); con_putc(115); con_putc(116); con_putc(32); con_putc(102); con_putc(105); con_putc(108); con_putc(101); con_putc(115);
+    con_putc(10);
+    // "  cat     - read file"
+    con_putc(32); con_putc(32);
+    con_putc(99); con_putc(97); con_putc(116);
+    con_putc(32); con_putc(32); con_putc(32); con_putc(32); con_putc(32);
+    con_putc(45); con_putc(32);
+    con_putc(114); con_putc(101); con_putc(97); con_putc(100); con_putc(32); con_putc(102); con_putc(105); con_putc(108); con_putc(101);
+    con_putc(10);
+}
+
+fn cmd_clear() -> void {
+    vga_clear();
+}
+
+fn cmd_reboot() -> void {
+    p_outb(0x64, 0xFE);
+    while true { p_hlt(); }
+}
+
+fn cmd_halt() -> void {
+    con_putc(10);
+    con_putc(83); con_putc(121); con_putc(115); con_putc(116); con_putc(101); con_putc(109);
+    con_putc(32); con_putc(104); con_putc(97); con_putc(108); con_putc(116); con_putc(101); con_putc(100); con_putc(46);
+    con_putc(10);
+    p_cli();
+    while true { p_hlt(); }
+}
+
+fn cmd_echo(input_len: i64) -> void {
+    con_putc(32);
+    var i: i64 = 5;  // skip "echo "
+    while i < input_len {
+        con_putc(input_get(i));
+        i = i + 1;
+    }
+    con_putc(10);
+}
+
+fn cmd_mem() -> void {
+    con_putc(10);
+    // "Memory: kernel at 0x100000"
+    con_putc(77); con_putc(101); con_putc(109); con_putc(111); con_putc(114); con_putc(121);
+    con_putc(58); con_putc(32);
+    // Print kernel load address
+    con_putc(107); con_putc(101); con_putc(114); con_putc(110); con_putc(101); con_putc(108);
+    con_putc(32); con_putc(97); con_putc(116); con_putc(32);
+    print_hex(0x100000);
+    con_putc(10);
+    // "VGA buffer at 0xB8000"
+    con_putc(86); con_putc(71); con_putc(65); con_putc(32);
+    con_putc(98); con_putc(117); con_putc(102); con_putc(102); con_putc(101); con_putc(114);
+    con_putc(32); con_putc(97); con_putc(116); con_putc(32);
+    print_hex(0xB8000);
+    con_putc(10);
+    // "Stack at 0x90000"
+    con_putc(83); con_putc(116); con_putc(97); con_putc(99); con_putc(107);
+    con_putc(32); con_putc(97); con_putc(116); con_putc(32);
+    print_hex(0x90000);
+    con_putc(10);
+    // "Free heap at 0x300000"
+    con_putc(70); con_putc(114); con_putc(101); con_putc(101);
+    con_putc(32); con_putc(104); con_putc(101); con_putc(97); con_putc(112);
+    con_putc(32); con_putc(97); con_putc(116); con_putc(32);
+    print_hex(HEAP_START);
+    con_putc(10);
+    // "Timer ticks: N"
+    con_putc(84); con_putc(105); con_putc(109); con_putc(101); con_putc(114);
+    con_putc(32); con_putc(116); con_putc(105); con_putc(99); con_putc(107); con_putc(115);
+    con_putc(58); con_putc(32);
+    print_dec(timer_get_ticks());
+    con_putc(10);
+}
+
+fn cmd_info() -> void {
+    con_putc(10);
+    // "Fides OS v0.1"
+    con_putc(70); con_putc(105); con_putc(100); con_putc(101); con_putc(115);
+    con_putc(32); con_putc(79); con_putc(83); con_putc(32); con_putc(118);
+    con_putc(48); con_putc(46); con_putc(49);
+    con_putc(10);
+    // "Arch: x86-64 (long mode)"
+    con_putc(65); con_putc(114); con_putc(99); con_putc(104); con_putc(58);
+    con_putc(32); con_putc(120); con_putc(56); con_putc(54); con_putc(45); con_putc(54); con_putc(52);
+    con_putc(10);
+    // "Boot: GRUB/Multiboot2"
+    con_putc(66); con_putc(111); con_putc(111); con_putc(116); con_putc(58);
+    con_putc(32); con_putc(71); con_putc(82); con_putc(85); con_putc(66);
+    con_putc(47); con_putc(77); con_putc(117); con_putc(108); con_putc(116); con_putc(105);
+    con_putc(98); con_putc(111); con_putc(111); con_putc(116); con_putc(50);
+    con_putc(10);
+    // "Display: VGA text 80x25"
+    con_putc(68); con_putc(105); con_putc(115); con_putc(112); con_putc(108); con_putc(97); con_putc(121);
+    con_putc(58); con_putc(32); con_putc(86); con_putc(71); con_putc(65);
+    con_putc(32); con_putc(116); con_putc(101); con_putc(120); con_putc(116);
+    con_putc(32); con_putc(56); con_putc(48); con_putc(120); con_putc(50); con_putc(53);
+    con_putc(10);
+    // "Input: keyboard polling (port 0x60)"
+    con_putc(73); con_putc(110); con_putc(112); con_putc(117); con_putc(116); con_putc(58);
+    con_putc(32); con_putc(107); con_putc(101); con_putc(121); con_putc(98); con_putc(111); con_putc(97); con_putc(114); con_putc(100);
+    con_putc(32); con_putc(112); con_putc(111); con_putc(108); con_putc(108); con_putc(105); con_putc(110); con_putc(103);
+    con_putc(10);
+    // "Serial: COM1 0x3F8"
+    con_putc(83); con_putc(101); con_putc(114); con_putc(105); con_putc(97); con_putc(108); con_putc(58);
+    con_putc(32); con_putc(67); con_putc(79); con_putc(77); con_putc(49);
+    con_putc(32); con_putc(48); con_putc(120); con_putc(51); con_putc(70); con_putc(56);
+    con_putc(10);
+}
+
+fn cmd_time() -> void {
+    con_putc(10);
+    // Read CMOS RTC registers
+    // "Time: "
+    con_putc(84); con_putc(105); con_putc(109); con_putc(101); con_putc(58); con_putc(32);
+    // Read hours (CMOS reg 0x04) — disable NMI by setting bit 7
+    p_outb(0x70, 0x84);
+    var hours: i64 = p_inb(0x71);
+    // Read minutes (CMOS reg 0x02)
+    p_outb(0x70, 0x82);
+    var minutes: i64 = p_inb(0x71);
+    // Read seconds (CMOS reg 0x00)
+    p_outb(0x70, 0x80);
+    var seconds: i64 = p_inb(0x71);
+    // Convert BCD to binary
+    hours = (hours >> 4) * 10 + (hours & 0x0F);
+    minutes = (minutes >> 4) * 10 + (minutes & 0x0F);
+    seconds = (seconds >> 4) * 10 + (seconds & 0x0F);
+    // Print HH:MM:SS
+    if hours < 10 { con_putc(48); }
+    print_dec(hours);
+    con_putc(58);
+    if minutes < 10 { con_putc(48); }
+    print_dec(minutes);
+    con_putc(58);
+    if seconds < 10 { con_putc(48); }
+    print_dec(seconds);
+    con_putc(10);
+}
+
+fn cmd_date() -> void {
+    con_putc(10);
+    // "Date: "
+    con_putc(68); con_putc(97); con_putc(116); con_putc(101); con_putc(58); con_putc(32);
+    // Read year (CMOS reg 0x09)
+    p_outb(0x70, 0x89);
+    var year: i64 = p_inb(0x71);
+    // Read month (CMOS reg 0x08)
+    p_outb(0x70, 0x88);
+    var month: i64 = p_inb(0x71);
+    // Read day (CMOS reg 0x07)
+    p_outb(0x70, 0x87);
+    var day: i64 = p_inb(0x71);
+    // Convert BCD to binary
+    year = (year >> 4) * 10 + (year & 0x0F);
+    month = (month >> 4) * 10 + (month & 0x0F);
+    day = (day >> 4) * 10 + (day & 0x0F);
+    // Print YYYY-MM-DD
+    con_putc(50); con_putc(48); // "20"
+    if year < 10 { con_putc(48); }
+    print_dec(year);
+    con_putc(45);
+    if month < 10 { con_putc(48); }
+    print_dec(month);
+    con_putc(45);
+    if day < 10 { con_putc(48); }
+    print_dec(day);
+    con_putc(10);
+}
+
+fn cmd_poweroff() -> void {
+    con_putc(10);
+    // "Powering off..."
+    con_putc(80); con_putc(111); con_putc(119); con_putc(101); con_putc(114); con_putc(105); con_putc(110); con_putc(103);
+    con_putc(32); con_putc(111); con_putc(102); con_putc(102); con_putc(46); con_putc(46); con_putc(46);
+    con_putc(10);
+    // QEMU ACPI shutdown: write 0x2000 to port 0x604
+    p_outw(0x604, 0x2000);
+    // Also try the older QEMU shutdown port
+    p_outw(0xB004, 0x2000);
+    // If that didn't work, halt
+    p_cli();
+    while true { p_hlt(); }
+}
+
+fn cmd_malloc() -> void {
+    con_putc(10);
+    // "Heap test: allocating 64 bytes..."
+    con_putc(72); con_putc(101); con_putc(97); con_putc(112); con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);
+    con_putc(32); con_putc(97); con_putc(108); con_putc(108); con_putc(111); con_putc(99);
+    con_putc(32); con_putc(54); con_putc(52); con_putc(32); con_putc(98); con_putc(121); con_putc(116); con_putc(101); con_putc(115);
+    con_putc(10);
+    // Allocate 64 bytes using p_malloc
+    var ptr: i64 = p_malloc(64);
+    // "ptr = "
+    con_putc(112); con_putc(116); con_putc(114); con_putc(32); con_putc(61); con_putc(32);
+    print_hex(ptr);
+    con_putc(10);
+    // Write test pattern: 0x41 at first byte
+    p_mem_write8(ptr, 65);
+    // Read it back
+    var val: i64 = p_mem_read8(ptr);
+    // "val = "
+    con_putc(118); con_putc(97); con_putc(108); con_putc(32); con_putc(61); con_putc(32);
+    con_putc(val);
+    con_putc(10);
+    // Allocate another 128 bytes
+    var ptr2: i64 = p_malloc(128);
+    con_putc(112); con_putc(116); con_putc(114); con_putc(50); con_putc(32); con_putc(61); con_putc(32);
+    print_hex(ptr2);
+    con_putc(10);
+    // "OK"
+    con_putc(79); con_putc(75);
+    con_putc(10);
+}
+
+fn cmd_disk() -> void {
+    con_putc(10);
+    // "Disk: reading sector 0..."
+    con_putc(68); con_putc(105); con_putc(115); con_putc(107); con_putc(58);
+    con_putc(32); con_putc(114); con_putc(101); con_putc(97); con_putc(100);
+    con_putc(105); con_putc(110); con_putc(103); con_putc(32);
+    con_putc(115); con_putc(101); con_putc(99); con_putc(116); con_putc(111);
+    con_putc(114); con_putc(32); con_putc(48); con_putc(46); con_putc(46); con_putc(46);
+    con_putc(10);
+
+    // Allocate 512 bytes for the sector
+    var buf: i64 = p_malloc(512);
+    if buf == 0 {
+        // " alloc failed"
+        con_putc(97); con_putc(108); con_putc(108); con_putc(111); con_putc(99);
+        con_putc(32); con_putc(102); con_putc(97); con_putc(105); con_putc(108);
+        con_putc(101); con_putc(100);
+        con_putc(10);
+        return;
+    }
+
+    var result: i64 = ata_read_sector(0, buf);
+    if result != 0 {
+        // " read failed"
+        con_putc(114); con_putc(101); con_putc(97); con_putc(100);
+        con_putc(32); con_putc(102); con_putc(97); con_putc(105); con_putc(108);
+        con_putc(101); con_putc(100);
+        con_putc(10);
+        return;
+    }
+
+    // Show first 16 bytes in hex
+    // "First 16 bytes: "
+    con_putc(70); con_putc(105); con_putc(114); con_putc(115); con_putc(116);
+    con_putc(32); con_putc(49); con_putc(54); con_putc(32);
+    con_putc(98); con_putc(121); con_putc(116); con_putc(101); con_putc(115); con_putc(58);
+    con_putc(10);
+    var i: i64 = 0;
+    while i < 16 {
+        var b: i64 = p_mem_read8(buf + i);
+        print_hex(b);
+        con_putc(32);
+        i = i + 1;
+    }
+    con_putc(10);
+
+    // Check MBR signature (0x55AA at offset 510)
+    var sig1: i64 = p_mem_read8(buf + 510);
+    var sig2: i64 = p_mem_read8(buf + 511);
+    // "MBR sig: "
+    con_putc(77); con_putc(66); con_putc(82); con_putc(32);
+    con_putc(115); con_putc(105); con_putc(103); con_putc(58); con_putc(32);
+    print_hex(sig2);
+    print_hex(sig1);
+    con_putc(10);
+    if sig1 == 0x55 && sig2 == 0xAA {
+        // "Valid MBR"
+        con_putc(86); con_putc(97); con_putc(108); con_putc(105); con_putc(100);
+        con_putc(32); con_putc(77); con_putc(66); con_putc(82);
+    } else {
+        // "No MBR"
+        con_putc(78); con_putc(111); con_putc(32); con_putc(77); con_putc(66); con_putc(82);
+    }
+    con_putc(10);
+}
+
+// Called by the boot trampoline when a user program exits via int 0x80.
+// The syscall handler modifies the iret frame to return here at ring 0.
+pub fn user_program_done() -> void {
+    con_putc(10);
+    // "User program returned to kernel."
+    con_putc(85); con_putc(115); con_putc(101); con_putc(114); con_putc(32);
+    con_putc(112); con_putc(114); con_putc(111); con_putc(103); con_putc(114);
+    con_putc(97); con_putc(109); con_putc(32); con_putc(114); con_putc(101);
+    con_putc(116); con_putc(117); con_putc(114); con_putc(110); con_putc(101);
+    con_putc(100); con_putc(32); con_putc(116); con_putc(111); con_putc(32);
+    con_putc(107); con_putc(101); con_putc(114); con_putc(110); con_putc(101);
+    con_putc(108); con_putc(46);
+    con_putc(10);
+
+    // ─── Auto-test: verify all OS features ───
+    con_putc(10);
+    con_putc(45); con_putc(45); con_putc(45); con_putc(32);
+    con_putc(65); con_putc(85); con_putc(84); con_putc(79); // "--- AUTO"
+    con_putc(32); con_putc(84); con_putc(69); con_putc(83); con_putc(84); // " TEST"
+    con_putc(32); con_putc(45); con_putc(45); con_putc(45); // " ---"
+    con_putc(10);
+
+    // Test mem command
+    con_putc(91); con_putc(109); con_putc(101); con_putc(109); con_putc(93); // "[mem]"
+    con_putc(10);
+    cmd_mem();
+
+    // Test time command
+    con_putc(91); con_putc(116); con_putc(105); con_putc(109); con_putc(101); con_putc(93); // "[time]"
+    con_putc(10);
+    cmd_time();
+
+    // Test date command
+    con_putc(91); con_putc(100); con_putc(97); con_putc(116); con_putc(101); con_putc(93); // "[date]"
+    con_putc(10);
+    cmd_date();
+
+    // Test info command
+    con_putc(91); con_putc(105); con_putc(110); con_putc(102); con_putc(111); con_putc(93); // "[info]"
+    con_putc(10);
+    cmd_info();
+
+    // Test ps command
+    con_putc(91); con_putc(112); con_putc(115); con_putc(93); // "[ps]"
+    con_putc(10);
+    cmd_ps();
+
+    // Test ticks
+    con_putc(91); con_putc(116); con_putc(105); con_putc(99); con_putc(107); con_putc(115); con_putc(93); // "[ticks]"
+    con_putc(10);
+    con_putc(84); con_putc(58); // "T:"
+    print_hex(timer_get_ticks());
+    con_putc(10);
+
+    // Test disk command
+    con_putc(91); con_putc(100); con_putc(105); con_putc(115); con_putc(107); con_putc(93); // "[disk]"
+    con_putc(10);
+    cmd_disk();
+
+    // Test malloc command
+    con_putc(91); con_putc(109); con_putc(97); con_putc(108); con_putc(108); con_putc(111); con_putc(99); con_putc(93); // "[malloc]"
+    con_putc(10);
+    cmd_malloc();
+
+    // Test page allocator
+    con_putc(91); con_putc(112); con_putc(97); con_putc(103); con_putc(101); con_putc(93); // "[page]"
+    con_putc(10);
+    var p1: i64 = page_alloc();
+    var p2: i64 = page_alloc();
+    con_putc(112); con_putc(49); con_putc(58); // "p1:"
+    print_hex(p1);
+    con_putc(32);
+    con_putc(112); con_putc(50); con_putc(58); // "p2:"
+    print_hex(p2);
+    con_putc(10);
+    page_free(p1);
+    page_free(p2);
+    var p3: i64 = page_alloc();
+    con_putc(112); con_putc(51); con_putc(58); // "p3:"
+    print_hex(p3);
+    con_putc(32);
+    if p3 == p1 {
+        con_putc(79); con_putc(75); // "OK"
+    } else {
+        con_putc(70); con_putc(65); con_putc(73); con_putc(76); // "FAIL"
+    }
+    con_putc(10);
+    page_free(p3);
+
+    // Test initrd
+    con_putc(91); con_putc(105); con_putc(110); con_putc(105); con_putc(116); con_putc(114); con_putc(100); con_putc(93); // "[initrd]"
+    con_putc(10);
+    cmd_initrd_ls();
+
+    // Test PCI
+    con_putc(91); con_putc(112); con_putc(99); con_putc(105); con_putc(93); // "[pci]"
+    con_putc(10);
+    cmd_pci();
+
+    // Test VM mapping
+    con_putc(91); con_putc(118); con_putc(109); con_putc(93); // "[vm]"
+    con_putc(10);
+    cmd_vm();
+
+    // Test heap with free
+    con_putc(91); con_putc(104); con_putc(101); con_putc(97); con_putc(112); con_putc(93); // "[heap]"
+    con_putc(10);
+    var hp1: i64 = heap_alloc(64);
+    var hp2: i64 = heap_alloc(128);
+    heap_free(hp1);
+    heap_free(hp2);
+    var hp3: i64 = heap_alloc(64);
+    con_putc(112); con_putc(49); con_putc(58); // "p1:"
+    print_hex(hp1);
+    con_putc(32);
+    con_putc(112); con_putc(51); con_putc(58); // "p3:"
+    print_hex(hp3);
+    con_putc(10);
+    heap_free(hp3);
+
+    // Test ELF loading
+    con_putc(91); con_putc(101); con_putc(108); con_putc(102); con_putc(93); // "[elf]"
+    con_putc(10);
+    cmd_elf();
+
+    con_putc(45); con_putc(45); con_putc(45); con_putc(32);
+    con_putc(69); con_putc(78); con_putc(68); con_putc(32); con_putc(65); con_putc(85); con_putc(84); con_putc(79); // "--- END AUTO"
+    con_putc(32); con_putc(84); con_putc(69); con_putc(83); con_putc(84); // " TEST"
+    con_putc(32); con_putc(45); con_putc(45); con_putc(45); // " ---"
+    con_putc(10);
+}
+
+// ─── Shell History ───────────────────────────────────────────────────────
+// History buffer at 0x1D6000: 16 entries × 128 bytes
+// 0x1D6000: count (4 bytes), 0x1D6004: current index (4 bytes)
+// 0x1D6100: entries (16 × 128 = 2048 bytes)
+
+const HIST_COUNT: i64 = 0x1D6000;
+const HIST_INDEX: i64 = 0x1D6004;
+const HIST_ENTRIES: i64 = 0x1D6100;
+const HIST_MAX: i64 = 16;
+const HIST_ENTRY_SIZE: i64 = 128;
+
+fn shell_history_init() -> void {
+    p_mem_write32(HIST_COUNT, 0);
+    p_mem_write32(HIST_INDEX, 0);
+}
+
+fn shell_history_add(len: i64) -> void {
+    if len == 0 { return; }
+    var count: i64 = p_mem_read32(HIST_COUNT);
+    var entry: i64 = HIST_ENTRIES + (count % HIST_MAX) * HIST_ENTRY_SIZE;
+    // Copy current input to history entry
+    var i: i64 = 0;
+    while i < len && i < HIST_ENTRY_SIZE {
+        p_mem_write8(entry + i, input_get(i));
+        i = i + 1;
+    }
+    p_mem_write8(entry + len, 0);  // null-terminate
+    count = count + 1;
+    p_mem_write32(HIST_COUNT, count);
+    p_mem_write32(HIST_INDEX, count);  // reset index to "after" the last entry
+}
+
+fn shell_history_recall(direction: i64) -> i64 {
+    // direction: -1 = up (older), 1 = down (newer)
+    // Returns the new input length, or -1 if no history
+    // NOTE: No `return` inside `if` blocks — PE backend limitation
+    var result: i64 = -1;
+    var count: i64 = p_mem_read32(HIST_COUNT);
+    if count != 0 {
+        var idx: i64 = p_mem_read32(HIST_INDEX);
+        var ok: i64 = 1;
+        if direction == -1 {
+            // Up: go to older entry
+            if idx > 0 { idx = idx - 1; }
+            if idx <= 0 { ok = 0; }
+        }
+        if direction != -1 {
+            // Down: go to newer entry
+            if idx < count { idx = idx + 1; }
+            if idx >= count { ok = 0; }
+        }
+        if ok != 0 {
+            p_mem_write32(HIST_INDEX, idx);
+            // If index is at count (past the last), clear input
+            if idx >= count {
+                input_clear();
+                result = 0;
+            }
+            if idx < count {
+                // Load the entry into the input buffer
+                var entry: i64 = HIST_ENTRIES + (idx % HIST_MAX) * HIST_ENTRY_SIZE;
+                input_clear();
+                var i: i64 = 0;
+                while i < HIST_ENTRY_SIZE {
+                    var c: i64 = p_mem_read8(entry + i);
+                    if c == 0 { break; }
+                    input_write(i, c);
+                    i = i + 1;
+                }
+                result = i;
+            }
+        }
+    }
+    return result;
+}
+
+// ─── Shell Tab Completion ────────────────────────────────────────────────
+// Try to complete the current input against known commands.
+// Returns the new input length if completed, 0 if no match.
+fn shell_tab_complete(input_len: i64) -> i64 {
+    // NOTE: No `return` inside `if` blocks — PE backend limitation
+    var result: i64 = 0;
+    if input_len != 0 {
+    // Check each known command name
+    // Commands: help, clear, echo, mem, info, time, date, reboot, poweroff,
+    //   malloc, disk, run, elf, ps, ticks, halt, ls, cat, ils, icat, pci,
+    //   acpi, vm, mouse, apic, heap, free, net, arp, pstats, fb, smp, dma,
+    //   touch, rm, vars
+    var best_len: i64 = 0;
+    var best_cmd: i64 = 0;
+    var best_cmd_len: i64 = 0;
+    var match_count: i64 = 0;
+
+    // Helper: check if input matches the prefix of a command
+    // cmd_addr points to a string in memory, cmd_len is its length
+    // We check if the first input_len bytes of the command match the input
+
+    // For each command, we store the ASCII bytes inline and compare
+    // This is verbose but avoids needing string storage
+
+    // "help" (4)
+    if input_len <= 4 {
+        if input_len >= 1 && input_get(0) == 104 { // 'h'
+            if input_len >= 2 && input_get(1) == 101 { // 'he'
+                if input_len >= 3 && input_get(2) == 108 { // 'hel'
+                    if input_len >= 4 && input_get(3) == 112 { // 'help'
+                        best_cmd = 1; best_cmd_len = 4; match_count = match_count + 1;
+                    } else if input_len == 3 { best_cmd = 1; best_cmd_len = 4; match_count = match_count + 1; }
+                } else if input_len == 2 { best_cmd = 1; best_cmd_len = 4; match_count = match_count + 1; }
+            } else if input_len == 1 {
+                // "heap" also starts with 'h'
+                best_cmd = 1; best_cmd_len = 4; match_count = match_count + 1;
+                best_cmd = 2; best_cmd_len = 4; match_count = match_count + 1;
+            }
+        }
+    }
+
+    // "net" (3) and "ne..." 
+    if input_len <= 3 && input_len >= 1 && input_get(0) == 110 { // 'n'
+        best_cmd = 3; best_cmd_len = 3; match_count = match_count + 1;
+    }
+
+    // "arp" (3)
+    if input_len <= 3 && input_len >= 1 && input_get(0) == 97 { // 'a'
+        best_cmd = 4; best_cmd_len = 3; match_count = match_count + 1;
+        // "acpi" also starts with 'a'
+        best_cmd = 5; best_cmd_len = 4; match_count = match_count + 1;
+        // "apic" also starts with 'a'
+        best_cmd = 6; best_cmd_len = 4; match_count = match_count + 1;
+    }
+
+    // "smp" (3)
+    if input_len <= 3 && input_len >= 1 && input_get(0) == 115 { // 's'
+        best_cmd = 7; best_cmd_len = 3; match_count = match_count + 1;
+    }
+
+    // "rm" (2)
+    if input_len <= 2 && input_len >= 1 && input_get(0) == 114 { // 'r'
+        best_cmd = 8; best_cmd_len = 2; match_count = match_count + 1;
+        // "reboot" also starts with 'r'
+        best_cmd = 9; best_cmd_len = 6; match_count = match_count + 1;
+        // "run" also starts with 'r'
+        best_cmd = 10; best_cmd_len = 3; match_count = match_count + 1;
+    }
+
+    // If exactly one match, complete it
+    if match_count == 1 {
+        // Fill in the rest of the command
+        var i: i64 = input_len;
+        while i < best_cmd_len {
+            // Write the completion character based on which command
+            var c: i64 = 0;
+            if best_cmd == 1 { // "help"
+                if i == 0 { c = 104; } else if i == 1 { c = 101; } else if i == 2 { c = 108; } else if i == 3 { c = 112; }
+            } else if best_cmd == 2 { // "heap"
+                if i == 0 { c = 104; } else if i == 1 { c = 101; } else if i == 2 { c = 97; } else if i == 3 { c = 112; }
+            } else if best_cmd == 3 { // "net"
+                if i == 0 { c = 110; } else if i == 1 { c = 101; } else if i == 2 { c = 116; }
+            } else if best_cmd == 4 { // "arp"
+                if i == 0 { c = 97; } else if i == 1 { c = 114; } else if i == 2 { c = 112; }
+            } else if best_cmd == 5 { // "acpi"
+                if i == 0 { c = 97; } else if i == 1 { c = 99; } else if i == 2 { c = 112; } else if i == 3 { c = 105; }
+            } else if best_cmd == 6 { // "apic"
+                if i == 0 { c = 97; } else if i == 1 { c = 112; } else if i == 2 { c = 105; } else if i == 3 { c = 99; }
+            } else if best_cmd == 7 { // "smp"
+                if i == 0 { c = 115; } else if i == 1 { c = 109; } else if i == 2 { c = 112; }
+            } else if best_cmd == 8 { // "rm"
+                if i == 0 { c = 114; } else if i == 1 { c = 109; }
+            } else if best_cmd == 9 { // "reboot"
+                if i == 0 { c = 114; } else if i == 1 { c = 101; } else if i == 2 { c = 98; } else if i == 3 { c = 111; } else if i == 4 { c = 111; } else if i == 5 { c = 116; }
+            } else if best_cmd == 10 { // "run"
+                if i == 0 { c = 114; } else if i == 1 { c = 117; } else if i == 2 { c = 110; }
+            }
+            input_write(i, c);
+            i = i + 1;
+        }
+        result = best_cmd_len;
+    }
+    }
+    return result;
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────
+
+pub fn main() -> void {
+    p_serial_init();
+    vga_clear();
+
+    // Initialize scancode buffer (head=0, tail=0)
+    p_mem_write8(SCANCODE_HEAD, 0);
+    p_mem_write8(SCANCODE_TAIL, 0);
+    // Initialize keyboard state (shift=0, caps=0)
+    p_mem_write8(KBD_SHIFT, 0);
+    p_mem_write8(KBD_CAPS, 0);
+    // Initialize timer ticks
+    p_mem_write8(TIMER_TICKS, 0);
+    // Initialize heap
+    heap_init();
+    // Initialize shell history
+    shell_history_init();
+    // Initialize ping stats
+    ping_stats_init();
+    // Initialize file descriptors
+    fd_init();
+    // Initialize kernel threads
+    kthread_init();
+    // Initialize UDP sockets
+    udp_socket_init();
+    // Initialize disk cache
+    disk_cache_init();
+    // Initialize scheduler
+    sched_init();
+    // Initialize FAT32 filesystem
+    fat32_init();
+    // Load initrd ramdisk from disk sector 10
+    initrd_load();
+    // Scan PCI bus
+    pci_scan();
+    // Initialize ACPI
+    acpi_init();
+    // Initialize PS/2 mouse
+    mouse_init();
+    // Initialize process table
+    proc_init();
+    // Initialize network stack
+    net_init();
+    // Initialize framebuffer
+    fb_init();
+
+    // Banner: "Fides OS v0.1"
+    con_putc(70); con_putc(105); con_putc(100); con_putc(101); con_putc(115);
+    con_putc(32); con_putc(79); con_putc(83); con_putc(32); con_putc(118);
+    con_putc(48); con_putc(46); con_putc(49);
+    con_putc(10); con_putc(10);
+
+    cmd_help();
+    con_putc(10);
+
+    // Auto-test: list files
+    cmd_ls();
+    // Auto-test: run user program with syscalls
+    // (auto-test of all OS features runs in user_program_done after exit)
+    cmd_run();
+
+    // Initialize shell variables
+    vars_init();
+
+    // Shell loop
+    while true {
+        // Cooperative scheduler: check quantum and switch threads
+        if p_mem_read8(SCHED_QUANTUM_ADDR) >= 10 {
+            sched_timer_tick();
+        }
+        // Print prompt "> "
+        con_putc(62); con_putc(32);
+
+        input_clear();
+        var input_len: i64 = 0;
+        var reading: i64 = 1;
+
+        while reading == 1 {
+            var sc: i64 = kbd_read_scancode();
+            // Process shift/caps/extended modifiers first
+            sc = kbd_process_modifiers(sc);
+            if sc == -1 { continue; }
+            // Check for arrow keys (extended scancodes: 0x148=up, 0x150=down)
+            if sc == 0x48 || sc == 0x148 {
+                // Up arrow — recall previous command
+                var hlen: i64 = shell_history_recall(-1);
+                if hlen >= 0 {
+                    input_len = hlen;
+                    // Redraw line: clear current line and show recalled command
+                    con_putc(13);  // carriage return
+                    con_putc(62); con_putc(32);  // "> "
+                    var i: i64 = 0;
+                    while i < input_len {
+                        con_putc(input_get(i));
+                        i = i + 1;
+                    }
+                    con_putc(32);  // clear extra char
+                    con_putc(8);   // move cursor back
+                }
+                continue;
+            }
+            if sc == 0x50 || sc == 0x150 {
+                // Down arrow — recall next command
+                var hlen: i64 = shell_history_recall(1);
+                if hlen >= 0 {
+                    input_len = hlen;
+                    con_putc(13);
+                    con_putc(62); con_putc(32);
+                    var i: i64 = 0;
+                    while i < input_len {
+                        con_putc(input_get(i));
+                        i = i + 1;
+                    }
+                    con_putc(32);
+                    con_putc(8);
+                }
+                continue;
+            }
+            if sc == 0x0F {
+                // Tab — command completion
+                // Try to complete the current input against known commands
+                var completed: i64 = shell_tab_complete(input_len);
+                if completed > 0 {
+                    input_len = completed;
+                    // Redraw line
+                    con_putc(13);
+                    con_putc(62); con_putc(32);
+                    var i: i64 = 0;
+                    while i < input_len {
+                        con_putc(input_get(i));
+                        i = i + 1;
+                    }
+                    con_putc(32);
+                    con_putc(8);
+                }
+                continue;
+            }
+            var c: i64 = scancode_to_ascii(sc);
+
+            if c == -1 { continue; }
+
+            if c == 10 {
+                con_putc(10);
+                // Save command to history
+                shell_history_add(input_len);
+                reading = 0;
+            } else if c == 8 {
+                if input_len > 0 {
+                    input_len = input_len - 1;
+                    input_write(input_len, 0);
+                    con_putc(8);
+                }
+            } else if input_len < INPUT_MAX {
+                input_write(input_len, c);
+                input_len = input_len + 1;
+                con_putc(c);
+            }
+        }
+
+        // ─── Expand variables ($var → value) ───────────────────────────
+        // Expand variables into a temp buffer at 0x81000, then copy back
+        var expanded_len: i64 = expand_vars(INPUT_BUF_ADDR, input_len, 0x81000, 512);
+        if expanded_len != input_len {
+            // Copy expanded input back to input buffer
+            input_clear();
+            var i: i64 = 0;
+            while i < expanded_len && i < INPUT_MAX {
+                input_write(i, p_mem_read8(0x81000 + i));
+                i = i + 1;
+            }
+            input_len = expanded_len;
+        }
+
+        // ─── Check for variable assignment (name=value) ────────────────
+        var eq_pos: i64 = is_var_assignment(INPUT_BUF_ADDR, input_len);
+        if eq_pos > 0 {
+            // Set variable: name = value
+            var_set(INPUT_BUF_ADDR, eq_pos, INPUT_BUF_ADDR + eq_pos + 1, input_len - eq_pos - 1);
+            con_putc(79); con_putc(75); con_putc(10); // "OK"
+        } else if input_len == 0 {
+            // Empty line
+        } else if input_matches(118, 97, 114, 115, 0, 4, input_len) == 1 {
+            // "vars" — show variables
+            cmd_vars();
+        } else if input_contains_char(INPUT_BUF_ADDR, input_len, 59) >= 0 {
+            // Command chaining: cmd1 ; cmd2 ; cmd3
+            // Save original input to temp buffer at 0x83000 (since dispatch modifies input buffer)
+            var save_i: i64 = 0;
+            while save_i < input_len {
+                p_mem_write8(0x83000 + save_i, p_mem_read8(INPUT_BUF_ADDR + save_i));
+                save_i = save_i + 1;
+            }
+            var saved_input_len: i64 = input_len;
+            // Execute each command in sequence
+            var start: i64 = 0;
+            var pos: i64 = 0;
+            while pos <= saved_input_len {
+                var is_sep: i64 = 0;
+                if pos == saved_input_len { is_sep = 1; }
+                else if p_mem_read8(0x83000 + pos) == 59 { is_sep = 1; }
+                if is_sep == 1 {
+                    // Execute command from start to pos
+                    var cmd_start: i64 = start;
+                    var cmd_len: i64 = pos - start;
+                    // Trim leading spaces
+                    while cmd_len > 0 && p_mem_read8(0x83000 + cmd_start) == 32 {
+                        cmd_start = cmd_start + 1;
+                        cmd_len = cmd_len - 1;
+                    }
+                    // Trim trailing spaces
+                    while cmd_len > 0 && p_mem_read8(0x83000 + cmd_start + cmd_len - 1) == 32 {
+                        cmd_len = cmd_len - 1;
+                    }
+                    if cmd_len > 0 {
+                        // Copy sub-command from saved buffer to input buffer and dispatch
+                        input_clear();
+                        var ti: i64 = 0;
+                        while ti < cmd_len {
+                            input_write(ti, p_mem_read8(0x83000 + cmd_start + ti));
+                            ti = ti + 1;
+                        }
+                        shell_dispatch(cmd_len);
+                    }
+                    start = pos + 1;
+                }
+                pos = pos + 1;
+            }
+        } else if input_contains_char(INPUT_BUF_ADDR, input_len, 124) >= 0 {
+            // Pipe: cmd1 | cmd2 — capture output of cmd1, display as input to cmd2
+            var pipe_pos: i64 = input_contains_char(INPUT_BUF_ADDR, input_len, 124);
+            // Run first command with capture
+            capture_start();
+            // Execute the first command (before the pipe)
+            // Temporarily truncate input at pipe position
+            var saved_len: i64 = input_len;
+            input_len = pipe_pos;
+            shell_dispatch(input_len);
+            input_len = saved_len;
+            capture_stop();
+            // Print captured output (since our commands don't read from stdin,
+            // we just display the piped output)
+            con_putc(10);
+            var cap_len: i64 = capture_get_len();
+            var i: i64 = 0;
+            while i < cap_len {
+                con_putc(p_mem_read8(capture_get_buf() + i));
+                i = i + 1;
+            }
+        } else if input_contains_char(INPUT_BUF_ADDR, input_len, 62) >= 0 {
+            // Redirect: cmd > file or cmd >> file
+            var redir_pos: i64 = input_contains_char(INPUT_BUF_ADDR, input_len, 62);
+            // Check for append (>>)
+            var is_append: i64 = 0;
+            if redir_pos + 1 < input_len && input_get(redir_pos + 1) == 62 {
+                is_append = 1;
+                redir_pos = redir_pos + 1;
+            }
+            // Get filename (after the > or >>)
+            var fname_start: i64 = redir_pos + 1;
+            while fname_start < input_len {
+                if input_get(fname_start) != 32 { break; }
+                fname_start = fname_start + 1;
+            }
+            // Save filename to temp buffer at 0x84000 before dispatch clears input
+            var fname_len: i64 = input_len - fname_start;
+            var fi: i64 = 0;
+            while fi < fname_len {
+                p_mem_write8(0x84000 + fi, input_get(fname_start + fi));
+                fi = fi + 1;
+            }
+            // Capture output of the command
+            capture_start();
+            var saved_len: i64 = input_len;
+            input_len = redir_pos - (is_append);  // truncate before the >
+            if is_append == 1 { input_len = redir_pos - 1; }
+            shell_dispatch(input_len);
+            input_len = saved_len;
+            capture_stop();
+            // Write captured output to file (or just report)
+            con_putc(10);
+            con_putc(82); con_putc(101); con_putc(100); con_putc(105); con_putc(114); con_putc(101); con_putc(99); con_putc(116); // "Redirect"
+            con_putc(32);
+            var cap_len2: i64 = capture_get_len();
+            print_dec(cap_len2);
+            con_putc(32);
+            con_putc(98); con_putc(121); con_putc(116); con_putc(101); con_putc(115); // "bytes"
+            con_putc(32);
+            con_putc(116); con_putc(111); // "to"
+            con_putc(32);
+            // Print saved filename
+            fi = 0;
+            while fi < fname_len {
+                con_putc(p_mem_read8(0x84000 + fi));
+                fi = fi + 1;
+            }
+            con_putc(10);
+        } else {
+            // Normal command dispatch
+            shell_dispatch(input_len);
+        }
+    }
+}
+
+// ─── TCP test command ────────────────────────────────────────────────────
+fn cmd_tcp() -> void {
+    con_putc(10);
+    // "TCP: connect 10.0.2.2:80"
+    con_putc(84); con_putc(67); con_putc(80); con_putc(58); con_putc(32); // "TCP: "
+    con_putc(99); con_putc(111); con_putc(110); con_putc(110); con_putc(101); con_putc(99); con_putc(116); // "connect"
+    con_putc(32);
+    con_putc(49); con_putc(48); con_putc(46); con_putc(48); con_putc(46); con_putc(50); con_putc(46); con_putc(50); // "10.0.2.2"
+    con_putc(58);
+    con_putc(56); con_putc(48); // "80"
+    con_putc(10);
+
+    // Create a TCP socket on local port 4096
+    var sid: i64 = tcp_socket_create(4096);
+    if sid < 0 {
+        con_putc(78); con_putc(111); con_putc(32); con_putc(115); con_putc(111); con_putc(99); con_putc(107); con_putc(101); con_putc(116); // "No socket"
+        con_putc(10);
+        return;
+    }
+
+    // Connect to 10.0.2.2:80 (QEMU SLIRP gateway)
+    var result: i64 = tcp_connect(sid, 0x0A000202, 80);
+    if result == 0 {
+        con_putc(67); con_putc(111); con_putc(110); con_putc(110); con_putc(101); con_putc(99); con_putc(116); con_putc(101); con_putc(100); // "Connected"
+        con_putc(10);
+
+        // Send HTTP GET request
+        var http: i64 = 0x53000;
+        // "GET / HTTP/1.0\r\n\r\n"
+        var req: i64 = 0;
+        p_mem_write8(http + 0, 71);  // G
+        p_mem_write8(http + 1, 69);  // E
+        p_mem_write8(http + 2, 84);  // T
+        p_mem_write8(http + 3, 32);  // (space)
+        p_mem_write8(http + 4, 47);  // /
+        p_mem_write8(http + 5, 32);  // (space)
+        p_mem_write8(http + 6, 72);  // H
+        p_mem_write8(http + 7, 84);  // T
+        p_mem_write8(http + 8, 84);  // T
+        p_mem_write8(http + 9, 80);  // P
+        p_mem_write8(http + 10, 47); // /
+        p_mem_write8(http + 11, 49); // 1
+        p_mem_write8(http + 12, 46); // .
+        p_mem_write8(http + 13, 48); // 0
+        p_mem_write8(http + 14, 13); // \r
+        p_mem_write8(http + 15, 10); // \n
+        p_mem_write8(http + 16, 13); // \r
+        p_mem_write8(http + 17, 10); // \n
+        tcp_socket_send(sid, http, 18);
+        con_putc(83); con_putc(101); con_putc(110); con_putc(116); // "Sent"
+        con_putc(10);
+
+        // Wait for response (poll for ~3 seconds)
+        p_mem_write8(TCP_RECV_FLAG, 0);
+        var timeout: i64 = 1500000;
+        while timeout > 0 {
+            net_poll();
+            if p_mem_read8(TCP_RECV_FLAG) == 1 { break; }
+            timeout = timeout - 1;
+        }
+        if p_mem_read8(TCP_RECV_FLAG) == 1 {
+            con_putc(82); con_putc(101); con_putc(99); con_putc(118); con_putc(58); // "Recv:"
+            con_putc(32);
+            var recv_len: i64 = p_mem_read32(TCP_SOCKET_TABLE + sid * TCP_SOCKET_SIZE + 32);
+            print_dec(recv_len);
+            con_putc(32);
+            con_putc(98); con_putc(121); con_putc(116); con_putc(101); con_putc(115); // "bytes"
+            con_putc(10);
+        } else {
+            con_putc(84); con_putc(105); con_putc(109); con_putc(101); con_putc(111); con_putc(117); con_putc(116); // "Timeout"
+            con_putc(10);
+        }
+        // Close connection
+        tcp_socket_close(sid);
+    } else {
+        con_putc(70); con_putc(97); con_putc(105); con_putc(108); // "Fail"
+        con_putc(10);
+    }
+}
+
+// ─── SMP command stub ───────────────────────────────────────────────────
+fn cmd_smp() -> void {
+    con_putc(10);
+    con_putc(83); con_putc(77); con_putc(80); con_putc(58); con_putc(32); // "SMP: "
+    con_putc(110); con_putc(111); con_putc(116); con_putc(32); // "not "
+    con_putc(97); con_putc(118); con_putc(97); con_putc(105); con_putc(108); // "avail"
+    con_putc(10);
+}
+
+// ─── Shell Command Dispatch ─────────────────────────────────────────────
+// Dispatch a single command based on the input buffer contents.
+fn shell_dispatch(input_len: i64) -> void {
+    if input_len == 0 {
+        // Empty
+    } else if input_matches(104, 101, 108, 112, 0, 4, input_len) == 1 {
+        // "help"
+        cmd_help();
+    } else if input_matches(99, 108, 101, 97, 114, 5, input_len) == 1 {
+        // "clear"
+        cmd_clear();
+    } else if input_prefix4(101, 99, 104, 111, 4, input_len) == 1 {
+        // "echo <text>"
+        cmd_echo(input_len);
+    } else if input_matches8(109, 101, 109, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "mem"
+        cmd_mem();
+    } else if input_matches8(105, 110, 102, 111, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "info"
+        cmd_info();
+    } else if input_matches8(116, 105, 109, 101, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "time"
+        cmd_time();
+    } else if input_matches8(100, 97, 116, 101, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "date"
+        cmd_date();
+    } else if input_matches8(114, 101, 98, 111, 111, 116, 0, 0, 6, input_len) == 1 {
+        // "reboot"
+        cmd_reboot();
+    } else if input_matches8(112, 111, 119, 101, 114, 111, 102, 102, 8, input_len) == 1 {
+        // "poweroff"
+        cmd_poweroff();
+    } else if input_matches8(109, 97, 108, 108, 111, 99, 0, 0, 6, input_len) == 1 {
+        // "malloc"
+        cmd_malloc();
+    } else if input_matches8(100, 105, 115, 107, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "disk"
+        cmd_disk();
+    } else if input_matches8(114, 117, 110, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "run"
+        cmd_run();
+    } else if input_matches8(101, 108, 102, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "elf" — load ELF from sector 2 and run
+        cmd_elf();
+    } else if input_matches8(116, 105, 99, 107, 115, 0, 0, 0, 5, input_len) == 1 {
+        // "ticks"
+        con_putc(10);
+        con_putc(84); con_putc(105); con_putc(99); con_putc(107); con_putc(115); // "Ticks"
+        con_putc(58); con_putc(32);
+        print_dec(timer_get_ticks());
+        con_putc(10);
+    } else if input_matches(112, 115, 0, 0, 0, 2, input_len) == 1 {
+        // "ps" — show process table
+        cmd_ps();
+    } else if input_matches(108, 115, 0, 0, 0, 2, input_len) == 1 {
+        // "ls" — list files
+        cmd_ls();
+    } else if input_prefix4(99, 97, 116, 0, 3, input_len) == 1 {
+        // "cat" — read file (needs filename after space)
+        var fname_start: i64 = 4;
+        while fname_start < input_len {
+            if input_get(fname_start) != 32 { break; }
+            fname_start = fname_start + 1;
+        }
+        if fname_start < input_len {
+            cmd_cat(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
+        } else {
+            con_putc(63); con_putc(10);
+        }
+    } else if input_matches(104, 97, 108, 116, 0, 4, input_len) == 1 {
+        // "halt"
+        cmd_halt();
+    } else if input_matches8(105, 108, 115, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "ils" — list initrd files
+        cmd_initrd_ls();
+    } else if input_matches8(105, 116, 114, 101, 101, 0, 0, 0, 5, input_len) == 1 {
+        // "itree" — show initrd directory tree
+        cmd_initrd_tree();
+    } else if input_prefix4(105, 99, 97, 116, 4, input_len) == 1 {
+        // "icat" — read file from initrd
+        var fname_start: i64 = 5;
+        while fname_start < input_len {
+            if input_get(fname_start) != 32 { break; }
+            fname_start = fname_start + 1;
+        }
+        if fname_start < input_len {
+            cmd_initrd_cat(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
+        } else {
+            con_putc(63); con_putc(10);
+        }
+    } else if input_matches8(112, 99, 105, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "pci" — list PCI devices
+        cmd_pci();
+    } else if input_prefix8(116, 111, 117, 99, 104, 0, 0, 0, 5, input_len) == 1 {
+        // "touch" — create empty file
+        var fname_start: i64 = 6;
+        while fname_start < input_len {
+            if input_get(fname_start) != 32 { break; }
+            fname_start = fname_start + 1;
+        }
+        if fname_start < input_len {
+            cmd_touch(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
+        } else {
+            con_putc(63); con_putc(10);
+        }
+    } else if input_prefix4(114, 109, 0, 0, 2, input_len) == 1 {
+        // "rm" — delete file
+        var fname_start: i64 = 3;
+        while fname_start < input_len {
+            if input_get(fname_start) != 32 { break; }
+            fname_start = fname_start + 1;
+        }
+        if fname_start < input_len {
+            cmd_rm(INPUT_BUF_ADDR + fname_start, input_len - fname_start);
+        } else {
+            con_putc(63); con_putc(10);
+        }
+    } else if input_matches8(97, 99, 112, 105, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "acpi" — show ACPI info
+        cmd_acpi();
+    } else if input_matches8(118, 109, 0, 0, 0, 0, 0, 0, 2, input_len) == 1 {
+        // "vm" — test VM mapping
+        cmd_vm();
+    } else if input_matches8(109, 111, 117, 115, 101, 0, 0, 0, 5, input_len) == 1 {
+        // "mouse" — show mouse state
+        cmd_mouse();
+    } else if input_matches8(97, 112, 105, 99, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "apic" — init/show APIC
+        cmd_apic();
+    } else if input_matches8(104, 101, 97, 112, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "heap" — show heap info
+        con_putc(10);
+        con_putc(110); con_putc(101); con_putc(120); con_putc(116); con_putc(58); con_putc(32); // "next: "
+        print_hex(heap_next);
+        con_putc(10);
+    } else if input_matches8(102, 114, 101, 101, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "free" — test heap free
+        con_putc(10);
+        var p1: i64 = heap_alloc(64);
+        var p2: i64 = heap_alloc(128);
+        heap_free(p1);
+        heap_free(p2);
+        con_putc(79); con_putc(75); // "OK"
+        con_putc(10);
+    } else if input_matches8(110, 101, 116, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "net" — init/show network
+        cmd_net();
+    } else if input_matches8(97, 114, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "arp" — show ARP table
+        cmd_arp();
+    } else if input_matches8(112, 115, 116, 97, 116, 115, 0, 0, 6, input_len) == 1 {
+        // "pstats" — ping statistics
+        cmd_ping_stats();
+    } else if input_matches8(100, 104, 99, 112, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "dhcp" — DHCP client
+        cmd_dhcp();
+    } else if input_matches8(116, 104, 114, 101, 97, 100, 115, 0, 7, input_len) == 1 {
+        // "threads" — show kernel threads
+        cmd_threads();
+    } else if input_matches8(115, 99, 104, 101, 100, 0, 0, 0, 5, input_len) == 1 {
+        // "sched" — show scheduler status
+        cmd_sched();
+    } else if input_matches8(102, 98, 0, 0, 0, 0, 0, 0, 2, input_len) == 1 {
+        // "fb" — show framebuffer info
+        cmd_fb();
+    } else if input_matches8(115, 109, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "smp" — boot SMP
+        cmd_smp();
+    } else if input_matches8(100, 109, 97, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "dma" — show DMA info
+        cmd_dma();
+    } else if input_matches8(112, 105, 110, 103, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "ping" — send ICMP echo
+        cmd_ping(0x0A000202);  // ping 10.0.2.2
+    } else if input_matches8(116, 99, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "tcp" — test TCP connection to 10.0.2.2:80
+        cmd_tcp();
+    } else if input_matches(118, 97, 114, 115, 0, 4, input_len) == 1 {
+        // "vars" — show variables
+        cmd_vars();
+    } else {
+        // Unknown
+        con_putc(63); con_putc(10);
+    }
+}

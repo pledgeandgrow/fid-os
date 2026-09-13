@@ -27,6 +27,12 @@ use net;
 use framebuffer;
 use dma;
 use audio;
+use graphics;
+use gamepad;
+use gpio;
+use button;
+use arm_boot;
+use gameloop;
 use shell_script;
 
 // ─── Shell Commands ─────────────────────────────────────────────────────
@@ -1322,6 +1328,48 @@ fn shell_dispatch(input_len: i64) -> void {
     } else if input_matches8(116, 99, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
         // "tcp" — test TCP connection to 10.0.2.2:80
         cmd_tcp();
+    } else if input_matches8(98, 117, 100, 100, 121, 0, 0, 0, 5, input_len) == 1 {
+        // "buddy" — test buddy allocator
+        cmd_buddy();
+    } else if input_matches8(115, 108, 97, 98, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "slab" — test slab allocator
+        cmd_slab();
+    } else if input_matches8(109, 109, 97, 112, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "mmap" — test mmap/munmap
+        cmd_mmap();
+    } else if input_prefix4(110, 105, 99, 101, 4, input_len) == 1 {
+        // "nice <val>" — set process priority
+        cmd_nice(input_len);
+    } else if input_prefix4(107, 105, 108, 108, 4, input_len) == 1 {
+        // "kill <pid>" — kill process
+        cmd_kill(input_len);
+    } else if input_matches8(102, 111, 114, 107, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "fork" — test fork
+        cmd_fork();
+    } else if input_matches8(112, 114, 111, 99, 115, 0, 0, 0, 5, input_len) == 1 {
+        // "procs" — show process table with priorities
+        cmd_procs();
+    } else if input_matches8(97, 117, 100, 105, 111, 0, 0, 0, 5, input_len) == 1 {
+        // "audio" — play test tone
+        cmd_audio();
+    } else if input_matches8(109, 117, 115, 105, 99, 0, 0, 0, 5, input_len) == 1 {
+        // "music" — play melody
+        cmd_music();
+    } else if input_matches8(103, 102, 120, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "gfx" — graphics test
+        cmd_gfx();
+    } else if input_matches8(103, 112, 97, 100, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "gpad" — gamepad test
+        cmd_gamepad();
+    } else if input_matches8(103, 112, 105, 111, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "gpio" — GPIO test
+        cmd_gpio();
+    } else if input_matches8(98, 116, 110, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "btn" — button test
+        cmd_button();
+    } else if input_matches8(97, 114, 109, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "arm" — ARM boot info
+        cmd_arm();
     } else if input_matches(118, 97, 114, 115, 0, 4, input_len) == 1 {
         // "vars" — show variables
         cmd_vars();
