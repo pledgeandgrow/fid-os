@@ -1347,6 +1347,15 @@ fn shell_dispatch(input_len: i64) -> void {
     } else if input_matches8(99, 97, 112, 102, 115, 0, 0, 0, 5, input_len) == 1 {
         // "capfs" — test capability-gated filesystem
         cmd_capfs();
+    } else if input_matches8(99, 97, 112, 99, 111, 110, 0, 0, 6, input_len) == 1 {
+        // "capcon" — test capability-gated console
+        cmd_capcon();
+    } else if input_matches8(99, 97, 112, 110, 101, 116, 0, 0, 6, input_len) == 1 {
+        // "capnet" — test capability-gated network
+        cmd_capnet();
+    } else if input_matches8(109, 115, 103, 102, 115, 0, 0, 0, 5, input_len) == 1 {
+        // "msgfs" — test message-based filesystem
+        cmd_msgfs();
     } else {
         // Unknown
         con_putc(63); con_putc(10);

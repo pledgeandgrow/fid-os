@@ -296,6 +296,36 @@
 - **Shell command:** `capfs` — grants a read-only child cap, tests that
   reads succeed and writes are denied, then revokes and tests denial
 
+### 3.20 Capability-Gated Console (Fractal Kernel)
+- **File:** `kernel/console.fd` (appended functions)
+- **API:** `con_cap_putc`, `con_cap_putn`, `con_cap_clear`,
+  `con_cap_input_get`, `con_cap_print_dec`, `con_cap_print_hex`
+- **Pattern:** caller passes a CONSOLE capability; functions check type +
+  permission (WRITE for output, READ for input) before delegating
+- **Shell command:** `capcon` — grants a write-only child cap, tests that
+  writes succeed and reads are denied, revokes, tests denial
+
+### 3.21 Capability-Gated Network (Fractal Kernel)
+- **File:** `kernel/net.fd` (appended functions)
+- **API:** `net_cap_send_frame`, `net_cap_poll`, `net_cap_ping`,
+  `net_cap_status`
+- **Pattern:** caller passes a NETWORK or MMIO capability; functions
+  check type + permission (WRITE for send/ping, READ for poll/status)
+- **Shell command:** `capnet` — grants a read-only child cap, tests that
+  status succeeds and send/ping are denied, revokes, tests denial
+
+### 3.22 Message-Based Filesystem (Fractal Kernel)
+- **File:** `kernel/msg.fd` (appended functions)
+- **Protocol:** client sends READ/WRITE/STAT messages to a filesystem
+  endpoint; server processes them and sends REPLY/ERROR back
+- **API:** `msg_fs_read_request`, `msg_fs_write_request`,
+  `msg_fs_stat_request`, `msg_fs_recv_reply`, `msg_fs_server`
+- **Server:** `msg_fs_server(fs_cap, disk_cap)` — receives a message,
+  delegates to `vfs_cap_read_file`/`vfs_cap_write_file`, sends reply
+- **Shell command:** `msgfs` — creates a FS endpoint, sends a READ
+  request, processes it server-side, receives the reply; then sends
+  a WRITE request and processes that too. Full round-trip via messages.
+
 ## 4. Build System
 
 ### 4.1 Compile

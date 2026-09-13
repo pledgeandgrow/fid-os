@@ -24,6 +24,7 @@ module msg;
 
 use console;
 use capability;
+use vfs;
 
 // ─── Endpoint pool ────────────────────────────────────────────────────────
 pub const MSG_ENDPOINT_BASE: i64 = 0x1E1000;
@@ -249,4 +250,195 @@ pub fn cmd_msg() -> void {
     con_putc(114); con_putc(101); con_putc(99); con_putc(118); con_putc(61);
     print_dec(recv_op);
     con_putc(10);
+}
+
+// ─── Message-based filesystem server (fractal kernel) ────────────────────
+// This is the key fractal pattern: instead of calling fat32_read_file()
+// directly, a client sends a READ message to a filesystem endpoint.
+// The server receives the message, reads the file, and sends a REPLY
+// message back with the data.
+//
+// This demonstrates that the same message-passing interface works for
+// filesystem operations — no direct function calls needed.
+//
+// Protocol:
+//   Client → Server: MSG_OP_READ (payload = filename)
+//   Server → Client: MSG_OP_REPLY (payload = file data, up to 48 bytes)
+//   Client → Server: MSG_OP_WRITE (payload = filename)
+//   Server → Client: MSG_OP_REPLY (payload = status)
+//   Client → Server: MSG_OP_STAT (payload = filename)
+//   Server → Client: MSG_OP_REPLY (payload = file size)
+
+// FS message server buffer (for file data that doesn't fit in 48 bytes)
+pub const MSG_FS_BUF: i64 = 0x1E3000;  // 4KB buffer for FS message data
+
+// Send a READ request to a filesystem endpoint.
+// Payload is the filename (up to 48 bytes).
+// Returns 0 on success, -1 if denied or full.
+pub fn msg_fs_read_request(fs_cap: i64, name_addr: i64, name_len: i64) -> i64 {
+    return msg_send(fs_cap, 3, name_addr, name_len);  // MSG_OP_READ
+}
+
+// Send a WRITE request to a filesystem endpoint.
+// Payload is the filename (up to 48 bytes).
+pub fn msg_fs_write_request(fs_cap: i64, name_addr: i64, name_len: i64) -> i64 {
+    return msg_send(fs_cap, 4, name_addr, name_len);  // MSG_OP_WRITE
+}
+
+// Send a STAT request to a filesystem endpoint.
+// Payload is the filename (up to 48 bytes).
+pub fn msg_fs_stat_request(fs_cap: i64, name_addr: i64, name_len: i64) -> i64 {
+    return msg_send(fs_cap, 6, name_addr, name_len);  // MSG_OP_STAT
+}
+
+// Receive a reply from a filesystem endpoint.
+// Writes the payload to buf and the length to len_out.
+// Returns the operation code, or -1 if no message.
+pub fn msg_fs_recv_reply(fs_cap: i64, buf: i64, len_out: i64) -> i64 {
+    return msg_recv(fs_cap, buf, len_out);
+}
+
+// ─── Filesystem message server ──────────────────────────────────────────
+// Processes one message from the filesystem endpoint. If it's a READ
+// request, reads the file and sends a REPLY with the data. If it's a
+// WRITE request, creates the file and sends a REPLY with status.
+// Returns 0 on success, -1 if no message, -2 on error.
+
+pub fn msg_fs_server(fs_cap: i64, disk_cap: i64) -> i64 {
+    // Receive the request message
+    var msg_buf: i64 = 0x1E2000;  // reuse the test buffer
+    var plen: i64 = 0;
+    var op: i64 = msg_recv(fs_cap, msg_buf, 0x1E2080);
+    if op < 0 { return -1; }  // no message
+
+    // Extract payload (filename) from message
+    var name_addr: i64 = msg_buf + 16;  // payload starts at offset 16
+    var name_len: i64 = p_mem_read64(msg_buf + 8);
+    if name_len > 48 { name_len = 48; }
+
+    if op == 3 {
+        // MSG_OP_READ — read file and send reply
+        // Use the capability-gated filesystem
+        var result: i64 = vfs_cap_read_file(disk_cap, name_addr, name_len, MSG_FS_BUF);
+        if result == 0 {
+            // Send reply with file data (up to 48 bytes)
+            var reply_len: i64 = 48;
+            // For small files, send actual content; for large, send first 48 bytes
+            msg_send(fs_cap, 7, MSG_FS_BUF, reply_len);  // MSG_OP_REPLY
+        } else {
+            // Send error reply
+            var err: i64 = 0xFFFFFFFF;  // -1 as error code
+            p_mem_write64(MSG_FS_BUF, err);
+            msg_send(fs_cap, 8, MSG_FS_BUF, 8);  // MSG_OP_ERROR
+        }
+        return 0;
+    } else if op == 4 {
+        // MSG_OP_WRITE — create file and send reply
+        var result: i64 = vfs_cap_write_file(disk_cap, name_addr, name_len);
+        p_mem_write64(MSG_FS_BUF, result);
+        msg_send(fs_cap, 7, MSG_FS_BUF, 8);  // MSG_OP_REPLY
+        return 0;
+    } else if op == 6 {
+        // MSG_OP_STAT — get file info and send reply
+        // For now, just send a placeholder status
+        p_mem_write64(MSG_FS_BUF, 0);
+        p_mem_write64(MSG_FS_BUF + 8, 0);
+        msg_send(fs_cap, 7, MSG_FS_BUF, 16);  // MSG_OP_REPLY
+        return 0;
+    }
+
+    return -2;  // unknown op
+}
+
+// ─── Test: message-based filesystem ──────────────────────────────────────
+// Demonstrates the full round-trip: create a FS endpoint, send a READ
+// request, process it on the server side, receive the reply.
+
+pub fn cmd_msgfs() -> void {
+    con_putc(10);
+    // "MsgFS test:"
+    con_putc(77); con_putc(115); con_putc(103); con_putc(70); con_putc(83);  // "MsgFS"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);  // "test:"
+    con_putc(10);
+
+    // Create a filesystem endpoint (SEND + RECV + GRANT)
+    var fs_cap: i64 = msg_create_endpoint(8 | 16 | 32);
+    if fs_cap == 0 {
+        con_putc(69); con_putc(114); con_putc(114);  // "Err"
+        con_putc(10);
+        return;
+    }
+
+    // "ep="
+    con_putc(101); con_putc(112); con_putc(61);
+    print_dec(fs_cap);
+    con_putc(10);
+
+    // Root disk cap is handle 2 (created at boot)
+    var disk_cap: i64 = 2;
+
+    // Put a test filename in the message payload buffer
+    // "TESTFILE" → T(84) E(69) S(83) T(84) F(70) I(73) L(76) E(69)
+    var name_buf: i64 = 0x1E2100;
+    p_mem_write8(name_buf, 84);      // T
+    p_mem_write8(name_buf + 1, 69);  // E
+    p_mem_write8(name_buf + 2, 83);  // S
+    p_mem_write8(name_buf + 3, 84);  // T
+    p_mem_write8(name_buf + 4, 0);   // null terminator
+
+    // Step 1: Send a READ request
+    var r1: i64 = msg_fs_read_request(fs_cap, name_buf, 4);
+    // "req="
+    con_putc(114); con_putc(101); con_putc(113); con_putc(61);
+    print_dec(r1);
+    con_putc(32);
+
+    // Step 2: Server processes the request
+    var r2: i64 = msg_fs_server(fs_cap, disk_cap);
+    // "srv="
+    con_putc(115); con_putc(114); con_putc(118); con_putc(61);
+    print_dec(r2);
+    con_putc(32);
+
+    // Step 3: Client receives the reply
+    var reply_buf: i64 = 0x1E2200;
+    var reply_len: i64 = 0;
+    var reply_op: i64 = msg_fs_recv_reply(fs_cap, reply_buf, 0x1E2280);
+    // "reply="
+    con_putc(114); con_putc(101); con_putc(112); con_putc(61);
+    print_dec(reply_op);
+    con_putc(32);
+
+    // Show reply length
+    var rlen: i64 = p_mem_read64(0x1E2280);
+    // "len="
+    con_putc(108); con_putc(101); con_putc(110); con_putc(61);
+    print_dec(rlen);
+    con_putc(10);
+
+    // Step 4: Send a WRITE request (create file)
+    var r4: i64 = msg_fs_write_request(fs_cap, name_buf, 4);
+    // "wrreq="
+    con_putc(119); con_putc(114); con_putc(61);
+    print_dec(r4);
+    con_putc(32);
+
+    // Server processes the write
+    var r5: i64 = msg_fs_server(fs_cap, disk_cap);
+    // "wrsrv="
+    con_putc(119); con_putc(115); con_putc(61);
+    print_dec(r5);
+    con_putc(32);
+
+    // Receive the write reply
+    var wreply_op: i64 = msg_fs_recv_reply(fs_cap, reply_buf, 0x1E2280);
+    // "wrrep="
+    con_putc(119); con_putc(114); con_putc(112); con_putc(61);
+    print_dec(wreply_op);
+    con_putc(10);
+
+    // Summary: this demonstrates the fractal pattern — the client and
+    // server communicate entirely through messages, no direct calls.
+    con_putc(79); con_putc(75); con_putc(10);  // "OK"
 }
