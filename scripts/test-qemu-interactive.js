@@ -1,15 +1,22 @@
 // test-qemu-interactive.js — Run QEMU with stdin pipe, send commands, capture output
+// Usage: node test-qemu-interactive.js <iso-path> <cmd1> [cmd2] ... [timeout-ms]
 const { spawn } = require('child_process');
 const fs = require('fs');
+const path = require('path');
+
+// Resolve paths relative to repo root (parent of scripts/)
+const ROOT = path.resolve(__dirname, '..');
+const BUILD = path.join(ROOT, 'build');
 
 const iso = process.argv[2];
 const commands = process.argv.slice(3);
 const timeout = parseInt(process.argv[process.argv.length - 1].match(/^\d+$/) ? process.argv[process.argv.length - 1] : '15000');
+const serialLog = path.join(BUILD, 'serial-interactive.log');
 
 const qemu = spawn('C:/Program Files/qemu/qemu-system-x86_64.exe', [
   '-cdrom', iso,
   '-m', '256',
-  '-serial', 'file:build/serial-interactive.log',
+  '-serial', 'file:' + serialLog,
   '-no-reboot', '-display', 'none'
 ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
@@ -23,7 +30,7 @@ let waitingForBoot = true;
 // Poll the serial log file for output
 const pollInterval = setInterval(() => {
   try {
-    const log = fs.readFileSync('build/serial-interactive.log', 'utf8');
+    const log = fs.readFileSync(serialLog, 'utf8');
     if (log.length > output.length) {
       output = log;
       lastOutputTime = Date.now();
@@ -62,7 +69,7 @@ setTimeout(() => {
   qemu.kill();
   setTimeout(() => {
     try {
-      const log = fs.readFileSync('build/serial-interactive.log', 'utf8');
+      const log = fs.readFileSync(serialLog, 'utf8');
       console.log('---SERIAL OUTPUT---');
       console.log(log.substring(0, 4000));
     } catch(e) {

@@ -4,13 +4,17 @@
 // smaller sizes but handles larger sizes fine (reads extra zeros).
 //
 // Usage: node build-iso.js <raw-kernel.bin> [output.iso] [input-iso]
-//   input-iso defaults to build/fides-os-base.iso
-//   output-iso defaults to build/fides-os.iso
+//   input-iso defaults to <repo-root>/build/fides-os-base.iso
+//   output-iso defaults to <repo-root>/build/fides-os.iso
 const fs = require('fs');
+const path = require('path');
+
+// Resolve paths relative to repo root (parent of scripts/)
+const ROOT = path.resolve(__dirname, '..');
 
 const rawKernel = fs.readFileSync(process.argv[2]);
-const inputIso = process.argv[4] || 'build/fides-os-base.iso';
-const outIso = process.argv[3] || 'build/fides-os.iso';
+const inputIso = process.argv[4] || path.join(ROOT, 'build/fides-os-base.iso');
+const outIso = process.argv[3] || path.join(ROOT, 'build/fides-os.iso');
 
 const iso = Buffer.from(fs.readFileSync(inputIso)); // writable copy
 

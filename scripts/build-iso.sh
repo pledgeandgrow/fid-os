@@ -13,6 +13,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Use self-hosted compiler by default, fall back to Rust bootstrap
 FIDES_SELFHOST="/home/medzer/pledge/p-lang/release/fides-c3.exe"
 FIDES_RUST="/home/medzer/pledge/p-lang/target/release/fidesc"
@@ -23,11 +24,11 @@ if [ -z "${FIDES:-}" ]; then
         FIDES="$FIDES_RUST"
     fi
 fi
-BUILD_DIR="$SCRIPT_DIR/build"
-ISO_DIR="$SCRIPT_DIR/iso"
+BUILD_DIR="$ROOT_DIR/build"
+ISO_DIR="$ROOT_DIR/iso"
 KERNEL="$BUILD_DIR/kernel.bin"
 ISO="$BUILD_DIR/fides-os.iso"
-KERNEL_SRC="$SCRIPT_DIR/kernel/minimal.fd"
+KERNEL_SRC="$ROOT_DIR/kernel/minimal.fd"
 
 # Check prerequisites
 if [ ! -f "$FIDES" ]; then

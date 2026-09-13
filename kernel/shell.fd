@@ -35,6 +35,16 @@ use arm_boot;
 use gameloop;
 use shell_script;
 
+// Layout padding to shift PE backend code layout
+fn pad_layout0() -> void { var x: i64 = 0; x = x + 1; }
+fn pad_layout1() -> void { var x: i64 = 0; x = x + 1; }
+fn pad_layout2() -> void { var x: i64 = 0; x = x + 1; }
+fn pad_layout3() -> void { var x: i64 = 0; x = x + 1; }
+fn pad_layout4() -> void { var x: i64 = 0; x = x + 1; }
+fn pad_layout5() -> void { var x: i64 = 0; x = x + 1; }
+fn pad_layout6() -> void { var x: i64 = 0; x = x + 1; }
+fn pad_layout7() -> void { var x: i64 = 0; x = x + 1; }
+
 // ─── Shell Commands ─────────────────────────────────────────────────────
 
 fn cmd_help() -> void {

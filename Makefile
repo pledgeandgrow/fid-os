@@ -32,6 +32,7 @@ FIDES = $(shell if [ -x "$(FIDES_SELFHOST)" ]; then echo "$(FIDES_SELFHOST)"; el
 QEMU      = qemu-system-x86_64
 GRUB_MKRESCUE = grub-mkrescue
 NODE      = node
+SCRIPTS   = scripts
 
 # ─── Paths ────────────────────────────────────────────────────────────────
 KERNEL_DIR   = kernel
@@ -64,7 +65,7 @@ patch: $(ISO)
 
 $(ISO): $(BASE_ISO) $(KERNEL)
 	@echo "[patch] Patching kernel into base ISO..."
-	@$(NODE) swap-kernel.js $(BASE_ISO) $(KERNEL) $(ISO) || \
+	@$(NODE) $(SCRIPTS)/swap-kernel.js $(BASE_ISO) $(KERNEL) $(ISO) || \
 		(echo "[patch] Kernel too large for base ISO. Run: make base-iso" && exit 1)
 	@echo "[patch] ISO ready: $(ISO) ($$(wc -c < $(ISO)) bytes)"
 
@@ -77,7 +78,7 @@ $(KERNEL_RAW): $(KERNEL_SRCS) | $(BUILD_DIR)
 
 # Wrap raw binary in ELF using make-elf.js (cross-platform, no gcc/ld needed)
 $(KERNEL_ELF): $(KERNEL_RAW)
-	@$(NODE) make-elf.js $(KERNEL_RAW) $(KERNEL_ELF) 0x100000 0x100018
+	@$(NODE) $(SCRIPTS)/make-elf.js $(KERNEL_RAW) $(KERNEL_ELF) 0x100000 0x100018
 
 $(KERNEL): $(KERNEL_ELF)
 	@cp $(KERNEL_ELF) $(KERNEL)

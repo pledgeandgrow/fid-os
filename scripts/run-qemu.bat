@@ -9,8 +9,11 @@ REM Usage:
 REM   run-qemu.bat
 REM   run-qemu.bat path\to\fides-os.iso
 
+REM Resolve repo root (parent of scripts/)
+set ROOT=%~dp0..
+
 set ISO=%~1
-if "%ISO%"=="" set ISO=build\fides-os.iso
+if "%ISO%"=="" set ISO=%ROOT%\build\fides-os.iso
 
 if not exist "%ISO%" (
     echo Error: ISO file not found: %ISO%
