@@ -1379,6 +1379,27 @@ fn shell_dispatch(input_len: i64) -> void {
     } else if input_matches8(100, 114, 118, 116, 101, 115, 116, 0, 7, input_len) == 1 {
         // "drvtest" — test driver isolation (phase 5)
         cmd_driver_test();
+    } else if input_matches8(99, 97, 112, 107, 98, 100, 0, 0, 6, input_len) == 1 {
+        // "capkbd" — test capability-gated keyboard
+        cmd_capkbd();
+    } else if input_matches8(99, 97, 112, 102, 98, 0, 0, 0, 5, input_len) == 1 {
+        // "capfb" — test capability-gated framebuffer
+        cmd_capfb();
+    } else if input_matches8(99, 97, 112, 114, 116, 99, 0, 0, 6, input_len) == 1 {
+        // "caprtc" — test capability-gated RTC
+        cmd_caprtc();
+    } else if input_matches8(99, 97, 112, 112, 99, 105, 0, 0, 6, input_len) == 1 {
+        // "cappci" — test capability-gated PCI
+        cmd_cappci();
+    } else if input_matches8(109, 115, 103, 99, 111, 110, 0, 0, 6, input_len) == 1 {
+        // "msgcon" — test message-based console service
+        cmd_msgcon();
+    } else if input_matches8(109, 115, 103, 112, 114, 111, 99, 0, 7, input_len) == 1 {
+        // "msgproc" — test message-based process service
+        cmd_msgproc();
+    } else if input_matches8(100, 114, 118, 116, 101, 115, 116, 50, 8, input_len) == 1 {
+        // "drvtest2" — test all driver types (extended)
+        cmd_driver_test2();
     } else {
         // Unknown
         con_putc(63); con_putc(10);

@@ -36,6 +36,10 @@ pub const DRIVER_TYPE_NET: i64 = 1;     // E1000 network
 pub const DRIVER_TYPE_DISK: i64 = 2;    // ATA disk
 pub const DRIVER_TYPE_CONSOLE: i64 = 3;  // VGA console
 pub const DRIVER_TYPE_INPUT: i64 = 4;   // keyboard/mouse
+pub const DRIVER_TYPE_FB: i64 = 5;      // framebuffer
+pub const DRIVER_TYPE_RTC: i64 = 6;     // RTC/timer
+pub const DRIVER_TYPE_PCI: i64 = 7;     // PCI bus
+pub const DRIVER_TYPE_FS: i64 = 8;      // filesystem
 
 // ─── Initialize the driver table ──────────────────────────────────────────
 
@@ -335,4 +339,131 @@ pub fn cmd_driver_test() -> void {
     con_putc(97); con_putc(102); con_putc(116); con_putc(101); con_putc(114); con_putc(32); con_putc(99); con_putc(108); con_putc(101); con_putc(97); con_putc(110); con_putc(117); con_putc(112); con_putc(58);
     con_putc(10);
     cmd_drivers();
+}
+
+// ─── Extended driver test: register all driver types ────────────────────
+// Registers keyboard, framebuffer, RTC, PCI, and filesystem drivers.
+// Demonstrates that every subsystem can be isolated as a driver domain.
+
+pub fn cmd_driver_test2() -> void {
+    con_putc(10);
+    // "Driver test2 (all subsystems):"
+    con_putc(68); con_putc(114); con_putc(105); con_putc(118); con_putc(101); con_putc(114);  // "Driver"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(50);  // "test2"
+    con_putc(32);
+    con_putc(40); con_putc(97); con_putc(108); con_putc(108); con_putc(41);  // "(all)"
+    con_putc(58);
+    con_putc(10);
+
+    // Create driver domains for each subsystem
+    var kbd_domain: i64 = domain_create(1, 0xFF, 0x490000, 0x8000);   // 32KB
+    var fb_domain: i64 = domain_create(1, 0xFF, 0x498000, 0x8000);    // 32KB
+    var rtc_domain: i64 = domain_create(1, 0xFF, 0x4A0000, 0x8000);   // 32KB
+    var pci_domain: i64 = domain_create(1, 0xFF, 0x4A8000, 0x8000);   // 32KB
+    var fs_domain: i64 = domain_create(1, 0xFF, 0x4B0000, 0x10000);   // 64KB
+
+    // "domains:"
+    con_putc(100); con_putc(111); con_putc(109); con_putc(115); con_putc(61);  // "doms="
+    print_dec(kbd_domain); con_putc(32);
+    print_dec(fb_domain); con_putc(32);
+    print_dec(rtc_domain); con_putc(32);
+    print_dec(pci_domain); con_putc(32);
+    print_dec(fs_domain);
+    con_putc(10);
+
+    // Register keyboard driver (root keyboard cap = handle 4)
+    var kbd_driver: i64 = driver_register(DRIVER_TYPE_INPUT, 4, kbd_domain);
+    // "kbd="
+    con_putc(107); con_putc(98); con_putc(100); con_putc(61);
+    print_dec(kbd_driver);
+    con_putc(32);
+
+    // Register framebuffer driver (root memory cap = handle 5)
+    var fb_driver: i64 = driver_register(DRIVER_TYPE_FB, 5, fb_domain);
+    // "fb="
+    con_putc(102); con_putc(98); con_putc(61);
+    print_dec(fb_driver);
+    con_putc(32);
+
+    // Register RTC driver — create an RTC cap
+    var rtc_cap: i64 = capability_create(1, 1 | 2, 0x70, 2);  // MMIO, R|W
+    var rtc_driver: i64 = driver_register(DRIVER_TYPE_RTC, rtc_cap, rtc_domain);
+    // "rtc="
+    con_putc(114); con_putc(116); con_putc(99); con_putc(61);
+    print_dec(rtc_driver);
+    con_putc(32);
+
+    // Register PCI driver — create a PCI cap
+    var pci_cap: i64 = capability_create(1, 1 | 2, 0xCF8, 8);
+    var pci_driver: i64 = driver_register(DRIVER_TYPE_PCI, pci_cap, pci_domain);
+    // "pci="
+    con_putc(112); con_putc(99); con_putc(105); con_putc(61);
+    print_dec(pci_driver);
+    con_putc(32);
+
+    // Register filesystem driver (root disk cap = handle 2)
+    var fs_driver: i64 = driver_register(DRIVER_TYPE_FS, 2, fs_domain);
+    // "fs="
+    con_putc(102); con_putc(115); con_putc(61);
+    print_dec(fs_driver);
+    con_putc(10);
+
+    // List all drivers
+    cmd_drivers();
+
+    // Ping each driver
+    var i: i64 = 0;
+    var drv_id: i64 = 1;
+    while drv_id <= 8 {
+        if driver_get_state(drv_id) >= 0 {
+            driver_send(drv_id, 9, 0, 0);  // MSG_OP_PING
+        }
+        drv_id = drv_id + 1;
+    }
+
+    // Show packet counts
+    // "pkts:"
+    con_putc(10);
+    con_putc(112); con_putc(107); con_putc(116); con_putc(115); con_putc(58);  // "pkts:"
+    con_putc(10);
+    drv_id = 1;
+    while drv_id <= 8 {
+        var base: i64 = DRIVER_TABLE + (drv_id - 1) * DRIVER_ENTRY_SIZE;
+        if p_mem_read64(base) != 0 {
+            var pkts: i64 = driver_get_packet_count(drv_id);
+            con_putc(100); con_putc(114); con_putc(118); con_putc(35);  // "drv#"
+            print_dec(drv_id);
+            con_putc(61);
+            print_dec(pkts);
+            con_putc(10);
+        }
+        drv_id = drv_id + 1;
+    }
+
+    // Stop all drivers
+    drv_id = 1;
+    while drv_id <= 8 {
+        driver_stop(drv_id);
+        drv_id = drv_id + 1;
+    }
+
+    // Cleanup: unregister all and destroy domains
+    driver_unregister(kbd_driver);
+    driver_unregister(fb_driver);
+    driver_unregister(rtc_driver);
+    driver_unregister(pci_driver);
+    driver_unregister(fs_driver);
+    capability_revoke(rtc_cap);
+    capability_revoke(pci_cap);
+    domain_destroy(kbd_domain);
+    domain_destroy(fb_domain);
+    domain_destroy(rtc_domain);
+    domain_destroy(pci_domain);
+    domain_destroy(fs_domain);
+
+    // "all cleaned up"
+    con_putc(10);
+    con_putc(97); con_putc(108); con_putc(108); con_putc(32); con_putc(99); con_putc(108); con_putc(101); con_putc(97); con_putc(110); con_putc(101); con_putc(100);  // "all cleaned"
+    con_putc(10);
 }

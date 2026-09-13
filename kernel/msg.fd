@@ -25,6 +25,7 @@ module msg;
 use console;
 use capability;
 use vfs;
+use syscall;
 
 // ─── Endpoint pool ────────────────────────────────────────────────────────
 pub const MSG_ENDPOINT_BASE: i64 = 0x1E1000;
@@ -440,5 +441,222 @@ pub fn cmd_msgfs() -> void {
 
     // Summary: this demonstrates the fractal pattern — the client and
     // server communicate entirely through messages, no direct calls.
+    con_putc(79); con_putc(75); con_putc(10);  // "OK"
+}
+
+// ─── Message-based console service (fractal kernel) ──────────────────────
+// A client sends a WRITE message with text payload to a console endpoint.
+// The server writes it to the screen. This replaces direct con_putc calls.
+//
+// Protocol:
+//   Client → Server: MSG_OP_WRITE (payload = text bytes)
+//   Server → Client: MSG_OP_REPLY (payload = 0 = success)
+
+// Send a write request to a console endpoint.
+// Payload is the text to write (up to 48 bytes per message).
+pub fn msg_con_write(con_cap: i64, text_addr: i64, text_len: i64) -> i64 {
+    return msg_send(con_cap, 4, text_addr, text_len);  // MSG_OP_WRITE
+}
+
+// Console message server — processes one WRITE message.
+// Writes the text to the console using the console capability.
+// Returns 0 on success, -1 if no message, -2 on error.
+pub fn msg_con_server(con_cap: i64, console_cap: i64) -> i64 {
+    var msg_buf: i64 = 0x1E2400;  // buffer for received message
+    var plen: i64 = 0;
+    var op: i64 = msg_recv(con_cap, msg_buf, 0x1E2480);
+    if op < 0 { return -1; }
+
+    if op == 4 {
+        // MSG_OP_WRITE — write text to console
+        var payload_addr: i64 = msg_buf + 16;
+        var payload_len: i64 = p_mem_read64(msg_buf + 8);
+        if payload_len > 48 { payload_len = 48; }
+
+        // Use capability-gated console output
+        var i: i64 = 0;
+        while i < payload_len {
+            var c: i64 = p_mem_read8(payload_addr + i);
+            con_cap_putc(console_cap, c);
+            i = i + 1;
+        }
+
+        // Send reply
+        p_mem_write64(0x1E2500, 0);
+        msg_send(con_cap, 7, 0x1E2500, 8);  // MSG_OP_REPLY
+        return 0;
+    }
+
+    return -2;
+}
+
+// Test: message-based console service.
+pub fn cmd_msgcon() -> void {
+    con_putc(10);
+    // "MsgCon test:"
+    con_putc(77); con_putc(115); con_putc(103); con_putc(67); con_putc(111); con_putc(110);  // "MsgCon"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);
+    con_putc(10);
+
+    // Create a console endpoint
+    var con_ep: i64 = msg_create_endpoint(8 | 16 | 32);  // SEND | RECV | GRANT
+    if con_ep == 0 {
+        con_putc(69); con_putc(114); con_putc(114);
+        con_putc(10);
+        return;
+    }
+
+    // "ep="
+    con_putc(101); con_putc(112); con_putc(61);
+    print_dec(con_ep);
+    con_putc(10);
+
+    // Root console cap is handle 1
+    var console_cap: i64 = 1;
+
+    // Put "Hi!" in the message payload
+    var text_buf: i64 = 0x1E2580;
+    p_mem_write8(text_buf, 72);      // H
+    p_mem_write8(text_buf + 1, 105);  // i
+    p_mem_write8(text_buf + 2, 33);  // !
+
+    // Send a WRITE message
+    var r1: i64 = msg_con_write(con_ep, text_buf, 3);
+    // "send="
+    con_putc(115); con_putc(101); con_putc(110); con_putc(100); con_putc(61);
+    print_dec(r1);
+    con_putc(10);
+
+    // Server processes the message — should print "Hi!"
+    con_putc(111); con_putc(117); con_putc(116); con_putc(61);  // "out="
+    var r2: i64 = msg_con_server(con_ep, console_cap);
+    con_putc(10);
+    // "srv="
+    con_putc(115); con_putc(114); con_putc(118); con_putc(61);
+    print_dec(r2);
+    con_putc(10);
+
+    // Receive the reply
+    var reply_buf: i64 = 0x1E2600;
+    var reply_op: i64 = msg_recv(con_ep, reply_buf, 0);
+    // "reply="
+    con_putc(114); con_putc(101); con_putc(112); con_putc(61);
+    print_dec(reply_op);
+    con_putc(10);
+
+    con_putc(79); con_putc(75); con_putc(10);  // "OK"
+}
+
+// ─── Message-based process service (fractal kernel) ─────────────────────
+// A client sends FORK/WAIT/KILL messages to a process endpoint.
+// The server processes them using sys_fork/sys_wait/sys_kill.
+//
+// Protocol:
+//   Client → Server: MSG_OP_OPEN (payload = 0) → fork
+//   Server → Client: MSG_OP_REPLY (payload = child pid)
+//   Client → Server: MSG_OP_CLOSE (payload = pid) → kill
+//   Server → Client: MSG_OP_REPLY (payload = 0 = success)
+
+// Send a fork request to a process endpoint.
+pub fn msg_proc_fork(proc_cap: i64) -> i64 {
+    return msg_send(proc_cap, 1, 0, 0);  // MSG_OP_OPEN = fork
+}
+
+// Send a kill request to a process endpoint.
+pub fn msg_proc_kill(proc_cap: i64, pid: i64) -> i64 {
+    var buf: i64 = 0x1E2680;
+    p_mem_write64(buf, pid);
+    return msg_send(proc_cap, 2, buf, 8);  // MSG_OP_CLOSE = kill
+}
+
+// Send a wait request to a process endpoint.
+pub fn msg_proc_wait(proc_cap: i64, pid: i64) -> i64 {
+    var buf: i64 = 0x1E2700;
+    p_mem_write64(buf, pid);
+    return msg_send(proc_cap, 6, buf, 8);  // MSG_OP_STAT = wait
+}
+
+// Process message server — processes fork/kill/wait messages.
+pub fn msg_proc_server(proc_cap: i64) -> i64 {
+    var msg_buf: i64 = 0x1E2780;
+    var plen: i64 = 0;
+    var op: i64 = msg_recv(proc_cap, msg_buf, 0x1E2800);
+    if op < 0 { return -1; }
+
+    if op == 1 {
+        // MSG_OP_OPEN = fork
+        var pid: i64 = sys_fork();
+        // Send reply with pid
+        p_mem_write64(0x1E2880, pid);
+        msg_send(proc_cap, 7, 0x1E2880, 8);  // MSG_OP_REPLY
+        return 0;
+    } else if op == 2 {
+        // MSG_OP_CLOSE = kill
+        var pid: i64 = p_mem_read64(msg_buf + 16);
+        var result: i64 = sys_kill(pid, 9);  // SIGKILL
+        p_mem_write64(0x1E2880, result);
+        msg_send(proc_cap, 7, 0x1E2880, 8);
+        return 0;
+    } else if op == 6 {
+        // MSG_OP_STAT = wait
+        var pid: i64 = p_mem_read64(msg_buf + 16);
+        var result: i64 = sys_wait(pid);
+        p_mem_write64(0x1E2880, result);
+        msg_send(proc_cap, 7, 0x1E2880, 8);
+        return 0;
+    }
+
+    return -2;
+}
+
+// Test: message-based process service.
+pub fn cmd_msgproc() -> void {
+    con_putc(10);
+    // "MsgProc test:"
+    con_putc(77); con_putc(115); con_putc(103); con_putc(80); con_putc(114); con_putc(111); con_putc(99);  // "MsgProc"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);
+    con_putc(10);
+
+    // Create a process endpoint
+    var proc_ep: i64 = msg_create_endpoint(8 | 16 | 32);
+    if proc_ep == 0 {
+        con_putc(69); con_putc(114); con_putc(114);
+        con_putc(10);
+        return;
+    }
+
+    // "ep="
+    con_putc(101); con_putc(112); con_putc(61);
+    print_dec(proc_ep);
+    con_putc(10);
+
+    // Send a fork request
+    var r1: i64 = msg_proc_fork(proc_ep);
+    // "fork_req="
+    con_putc(102); con_putc(114); con_putc(107); con_putc(95); con_putc(114); con_putc(61);
+    print_dec(r1);
+    con_putc(10);
+
+    // Server processes the fork
+    var r2: i64 = msg_proc_server(proc_ep);
+    // "fork_srv="
+    con_putc(102); con_putc(114); con_putc(107); con_putc(95); con_putc(115); con_putc(61);
+    print_dec(r2);
+    con_putc(10);
+
+    // Receive the reply (should contain child pid or -1)
+    var reply_buf: i64 = 0x1E2900;
+    var reply_op: i64 = msg_recv(proc_ep, reply_buf, 0);
+    var child_pid: i64 = p_mem_read64(reply_buf + 16);
+    // "fork_reply="
+    con_putc(102); con_putc(114); con_putc(107); con_putc(95); con_putc(114); con_putc(101); con_putc(112); con_putc(61);
+    print_dec(reply_op);
+    con_putc(32);
+    con_putc(112); con_putc(105); con_putc(100); con_putc(61);
+    print_dec(child_pid);
+    con_putc(10);
+
     con_putc(79); con_putc(75); con_putc(10);  // "OK"
 }

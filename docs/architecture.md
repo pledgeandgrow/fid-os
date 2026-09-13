@@ -376,7 +376,59 @@
   The kernel talks to drivers the same way processes talk to each other.
 - **Shell commands:** `drivers` (list all), `drvtest` (register network +
   console + disk drivers, send ping messages, stop/verify denial,
-  unregister)
+  unregister), `drvtest2` (register all 8 driver types: network, disk,
+  console, keyboard, framebuffer, RTC, PCI, filesystem)
+
+### 3.26 Capability-Gated Keyboard (Fractal Kernel Extension)
+- **File:** `kernel/capability.fd`
+- **API:** `kbd_cap_read_scancode`, `kbd_cap_to_ascii`
+- **Pattern:** validates CAP_TYPE_KEYBOARD + READ permission before
+  delegating to `kbd_read_scancode` / `scancode_to_ascii`
+- **Shell command:** `capkbd` — grants read-only child, reads scancode,
+  revokes, verifies denial
+
+### 3.27 Capability-Gated Framebuffer (Fractal Kernel Extension)
+- **File:** `kernel/capability.fd`
+- **API:** `fb_cap_putpixel`, `fb_cap_fillrect`, `fb_cap_clear`
+- **Pattern:** validates CAP_TYPE_MMIO or CAP_TYPE_MEMORY + WRITE
+  permission before delegating to framebuffer primitives
+- **Shell command:** `capfb` — grants write-only child, draws pixel +
+  rect, revokes, verifies denial
+
+### 3.28 Capability-Gated RTC (Fractal Kernel Extension)
+- **File:** `kernel/capability.fd`
+- **API:** `rtc_cap_read_time`
+- **Pattern:** validates CAP_TYPE_MMIO + READ permission before reading
+  CMOS ports 0x70/0x71
+- **Shell command:** `caprtc` — creates RTC cap, reads time, grants
+  read-only child, revokes, verifies denial
+
+### 3.29 Capability-Gated PCI (Fractal Kernel Extension)
+- **File:** `kernel/capability.fd`
+- **API:** `pci_cap_scan`, `pci_cap_config_read`
+- **Pattern:** validates CAP_TYPE_MMIO + READ permission before
+  accessing PCI config ports 0xCF8-0xCFF
+- **Shell command:** `cappci` — creates PCI cap, scans bus, grants
+  read-only child, revokes, verifies denial
+
+### 3.30 Message-Based Console Service (Fractal Kernel Extension)
+- **File:** `kernel/msg.fd`
+- **Protocol:** client sends MSG_OP_WRITE with text payload → server
+  writes to console via `con_cap_putc` → server sends MSG_OP_REPLY
+- **API:** `msg_con_write`, `msg_con_server`
+- **Shell command:** `msgcon` — creates console endpoint, sends "Hi!"
+  message, server processes it (prints to screen), receives reply
+
+### 3.31 Message-Based Process Service (Fractal Kernel Extension)
+- **File:** `kernel/msg.fd`
+- **Protocol:**
+  - MSG_OP_OPEN → fork (reply contains child pid)
+  - MSG_OP_CLOSE → kill (reply contains result)
+  - MSG_OP_STAT → wait (reply contains result)
+- **API:** `msg_proc_fork`, `msg_proc_kill`, `msg_proc_wait`,
+  `msg_proc_server`
+- **Shell command:** `msgproc` — creates process endpoint, sends fork
+  request, server processes it via `sys_fork`, receives reply with pid
 
 ## 4. Build System
 
