@@ -97,7 +97,7 @@
   0x1E1000 - 0x1E2FFF  ── Message endpoints (8 × 1KB ring buffers)
   0x1E2000 - 0x1E20FF  ── Message test buffer (temp, cmd_msg)
   0x1E3000 - 0x1E3FFF  ── Message FS buffer (msg_fs_server)
-  0x200000 - 0x2007FF  ── Per-process PML4 directory (64 × 16 bytes)
+  0x230000 - 0x2307FF  ── Per-process PML4 directory (64 × 16 bytes)
   0x210000 - 0x210FFF  ── Process domain table (16 × 64 bytes)
   0x220000 - 0x220FFF  ── Driver table (8 × 48 bytes)
   0x810000 - 0x8FFFFF  ── Per-process page table pool (bump-allocated)
@@ -333,7 +333,7 @@
 
 ### 3.23 Per-Process Address Spaces (Fractal Kernel Phase 3)
 - **File:** `kernel/vm.fd` (appended functions)
-- **Per-process PML4 directory:** 64 processes × 16 bytes at `0x200000`
+- **Per-process PML4 directory:** 64 processes × 16 bytes at `0x230000`
 - **Page table pool:** `0x810000` - `0x8FFFFF` (1MB, bump-allocated)
 - **API:** `vm_proc_init`, `vm_create_address_space`, `vm_switch_address_space`,
   `vm_map_user`, `vm_destroy_address_space`, `vm_get_pml4`

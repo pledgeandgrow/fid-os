@@ -117,7 +117,7 @@ pub fn cmd_vm() -> void {
 //   [0] pml4_addr: i64 — physical address of the process's PML4
 //   [8] used: i64 — 1 if in use
 
-pub const PROC_PML4_DIR: i64 = 0x200000;
+pub const PROC_PML4_DIR: i64 = 0x230000;
 pub const PT_POOL_BASE: i64 = 0x810000;  // page table page pool
 pub const PT_POOL_END: i64 = 0x8FFFFF;
 pub var pt_pool_next: i64 = 0x810000;

@@ -217,3 +217,134 @@ pub fn cmd_caps() -> void {
         i = i + 1;
     }
 }
+
+// ─── Capability-gated console (fractal kernel) ───────────────────────────
+// Wraps con_putc / vga_clear with capability checks. A caller must present
+// a CAP_TYPE_CONSOLE capability with WRITE permission to output, and
+// READ permission to read the input buffer.
+// Root console capability handle (created at boot in shell.fd): handle 1.
+
+// Write a character using a console capability.
+// Returns 0 on success, -1 if denied.
+pub fn con_cap_putc(console_cap: i64, c: i64) -> i64 {
+    if capability_get_type(console_cap) != 5 { return -1; }  // CAP_TYPE_CONSOLE
+    if capability_check(console_cap, 2) == 0 { return -1; }  // CAP_PERM_WRITE
+    con_putc(c);
+    return 0;
+}
+
+// Write a string using a console capability.
+pub fn con_cap_putn(console_cap: i64, addr: i64, len: i64) -> i64 {
+    if capability_get_type(console_cap) != 5 { return -1; }
+    if capability_check(console_cap, 2) == 0 { return -1; }
+    con_putn(addr, len);
+    return 0;
+}
+
+// Clear the screen using a console capability.
+pub fn con_cap_clear(console_cap: i64) -> i64 {
+    if capability_get_type(console_cap) != 5 { return -1; }
+    if capability_check(console_cap, 2) == 0 { return -1; }
+    vga_clear();
+    return 0;
+}
+
+// Read input buffer using a console capability (READ permission).
+// Returns the byte at index, or -1 if denied.
+pub fn con_cap_input_get(console_cap: i64, idx: i64) -> i64 {
+    if capability_get_type(console_cap) != 5 { return -1; }
+    if capability_check(console_cap, 1) == 0 { return -1; }  // CAP_PERM_READ
+    return input_get(idx);
+}
+
+// Print a decimal integer using a console capability.
+pub fn con_cap_print_dec(console_cap: i64, n: i64) -> i64 {
+    if capability_get_type(console_cap) != 5 { return -1; }
+    if capability_check(console_cap, 2) == 0 { return -1; }
+    print_dec(n);
+    return 0;
+}
+
+// Print a hex integer using a console capability.
+pub fn con_cap_print_hex(console_cap: i64, n: i64) -> i64 {
+    if capability_get_type(console_cap) != 5 { return -1; }
+    if capability_check(console_cap, 2) == 0 { return -1; }
+    print_hex(n);
+    return 0;
+}
+
+// Test the capability-gated console.
+pub fn cmd_capcon() -> void {
+    con_putc(10);
+    // "CapCon test:"
+    con_putc(67); con_putc(97); con_putc(112); con_putc(67); con_putc(111); con_putc(110);  // "CapCon"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);  // "test:"
+    con_putc(10);
+
+    // Root console cap is handle 1 (created at boot)
+    var root_cap: i64 = 1;
+
+    // Verify it exists
+    if capability_get_type(root_cap) != 5 {
+        con_putc(78); con_putc(111); con_putc(32); con_putc(99); con_putc(111); con_putc(110);  // "No con"
+        con_putc(10);
+        return;
+    }
+
+    // "root="
+    con_putc(114); con_putc(111); con_putc(111); con_putc(116); con_putc(61);
+    print_dec(root_cap);
+    con_putc(32);
+    con_putc(112); con_putc(101); con_putc(114); con_putc(109); con_putc(115); con_putc(61);  // "perms="
+    print_dec(capability_get_perms(root_cap));
+    con_putc(10);
+
+    // Grant a write-only child (no GRANT, no READ)
+    var write_only: i64 = capability_grant(root_cap, 2, 0);  // WRITE only
+    // "wo="
+    con_putc(119); con_putc(111); con_putc(61);
+    print_dec(write_only);
+    con_putc(32);
+    con_putc(112); con_putc(101); con_putc(114); con_putc(109); con_putc(115); con_putc(61);
+    print_dec(capability_get_perms(write_only));
+    con_putc(10);
+
+    // Write with write-only cap — should succeed (0)
+    var r1: i64 = con_cap_putc(write_only, 72);  // 'H'
+    con_cap_putc(write_only, 73);  // 'I'
+    con_cap_putc(write_only, 10);
+    // "write="
+    con_putc(119); con_putc(114); con_putc(105); con_putc(116); con_putc(101); con_putc(61);
+    print_dec(r1);
+    con_putc(10);
+
+    // Try to read input with write-only cap — should fail (-1)
+    var r2: i64 = con_cap_input_get(write_only, 0);
+    // "read="
+    con_putc(114); con_putc(101); con_putc(97); con_putc(100); con_putc(61);
+    print_dec(r2);
+    con_putc(32);
+    con_putc(40); con_putc(115); con_putc(104); con_putc(111); con_putc(117); con_putc(108); con_putc(100);  // "(should"
+    con_putc(32); con_putc(98); con_putc(101); con_putc(32); con_putc(45); con_putc(49); con_putc(41);  // " be -1)"
+    con_putc(10);
+
+    // Read with root cap — should succeed
+    var r3: i64 = con_cap_input_get(root_cap, 0);
+    // "rootread="
+    con_putc(114); con_putc(114); con_putc(61);
+    print_dec(r3);
+    con_putc(10);
+
+    // Revoke the write-only cap
+    capability_revoke(write_only);
+    // Try to write with revoked cap — should fail (-1)
+    var r4: i64 = con_cap_putc(write_only, 88);  // 'X'
+    // "revoked="
+    con_putc(114); con_putc(101); con_putc(118); con_putc(61);
+    print_dec(r4);
+    con_putc(32);
+    con_putc(40); con_putc(115); con_putc(104); con_putc(111); con_putc(117); con_putc(108); con_putc(100);  // "(should"
+    con_putc(32); con_putc(98); con_putc(101); con_putc(32); con_putc(45); con_putc(49); con_putc(41);
+    con_putc(10);
+}
