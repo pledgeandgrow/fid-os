@@ -436,32 +436,35 @@ pub fn cmd_procs() -> void {
     }
 }
 
+// Helper: parse integer from input starting at offset
+fn parse_input_int(start: i64, input_len: i64) -> i64 {
+    var result: i64 = 0;
+    var neg: i64 = 0;
+    var i: i64 = start;
+    while i < input_len {
+        var c: i64 = input_get(i);
+        if c == 45 { neg = 1; }
+        if c >= 48 { if c <= 57 { result = result * 10; } }
+        if c >= 48 { if c <= 57 { result = result + c; } }
+        if c >= 48 { if c <= 57 { result = result - 48; } }
+        i = i + 1;
+    }
+    if neg == 1 { result = 0 - result; }
+    return result;
+}
+
 // cmd_nice: set current process priority (nice level)
 // Usage: nice <value>  (e.g. "nice 5" or "nice -10")
 pub fn cmd_nice(input_len: i64) -> void {
-    var val: i64 = 0;
-    var neg: i64 = 0;
-    var i: i64 = 5;  // skip "nice "
-    while i < input_len {
-        var c: i64 = input_get(i);
-        var is_neg: i64 = 0;
-        var is_digit: i64 = 0;
-        if c == 45 { is_neg = 1; }
-        if c >= 48 { if c <= 57 { is_digit = 1; } }
-        if is_neg == 1 { neg = 1; }
-        if is_digit == 1 { val = val * 10 + (c - 48); }
-        i = i + 1;
-    }
-    if neg == 1 { val = 0 - val; }
-    // Clamp to -20..19
-    var min_val: i64 = 0 - 20;
-    if val < min_val { val = min_val; }
-    if val > 19 { val = 19; }
-    var r: i64 = proc_nice(val);
+    var n: i64 = parse_input_int(5, input_len);
+    var min_n: i64 = 0 - 20;
+    if n < min_n { n = min_n; }
+    if n > 19 { n = 19; }
+    var r: i64 = proc_nice(n);
     con_putc(10);
     if r == 0 {
         con_putc(110); con_putc(105); con_putc(99); con_putc(101); con_putc(61); // "nice="
-        print_dec(val);
+        print_dec(n);
     } else {
         con_putc(69); con_putc(114); con_putc(114); con_putc(111); con_putc(114); // "Error"
     }
@@ -471,15 +474,7 @@ pub fn cmd_nice(input_len: i64) -> void {
 // cmd_kill: kill a process by PID
 // Usage: kill <pid>
 pub fn cmd_kill(input_len: i64) -> void {
-    var pid: i64 = 0;
-    var i: i64 = 5;  // skip "kill "
-    while i < input_len {
-        var c: i64 = input_get(i);
-        var is_digit: i64 = 0;
-        if c >= 48 { if c <= 57 { is_digit = 1; } }
-        if is_digit == 1 { pid = pid * 10 + (c - 48); }
-        i = i + 1;
-    }
+    var pid: i64 = parse_input_int(5, input_len);
     if pid <= 0 {
         con_putc(10);
         con_putc(63); con_putc(10);  // "?"
