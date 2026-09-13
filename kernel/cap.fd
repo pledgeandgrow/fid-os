@@ -1,0 +1,219 @@
+// kernel/cap.fd — Capability table (fractal kernel phase 1)
+//
+// A capability is an unforgeable handle (i64) that grants permission
+// to access a resource. Instead of hardcoded addresses, modules and
+// processes receive capabilities and can only access what they're given.
+//
+// Capability entry (32 bytes):
+//   [0]  type:     i64 — resource type (CAP_TYPE_*)
+//   [8]  perms:    i64 — permission bitmask (CAP_PERM_*)
+//   [16] base:    i64 — base address / start sector / resource ID
+//   [24] size:    i64 — size of resource (bytes, sectors, or 0)
+//
+// Table: 128 capabilities × 32 bytes = 4 KB at 0x1E0000
+
+module cap;
+
+use console;
+
+// ─── Capability table ────────────────────────────────────────────────────
+pub const CAP_TABLE: i64 = 0x1E0000;
+pub const CAP_MAX: i64 = 128;
+pub const CAP_ENTRY_SIZE: i64 = 32;
+
+// ─── Resource types ───────────────────────────────────────────────────────
+pub const CAP_TYPE_NONE: i64 = 0;
+pub const CAP_TYPE_MMIO: i64 = 1;      // memory-mapped I/O region
+pub const CAP_TYPE_MEMORY: i64 = 2;    // RAM region
+pub const CAP_TYPE_DISK: i64 = 3;      // disk sectors
+pub const CAP_TYPE_NETWORK: i64 = 4;   // network interface
+pub const CAP_TYPE_CONSOLE: i64 = 5;   // console / VGA output
+pub const CAP_TYPE_KEYBOARD: i64 = 6;  // keyboard input
+pub const CAP_TYPE_MESSAGE: i64 = 7;   // message endpoint
+pub const CAP_TYPE_IRQ: i64 = 8;       // interrupt line
+
+// ─── Permission bits ─────────────────────────────────────────────────────
+pub const CAP_PERM_READ: i64 = 1;      // read from resource
+pub const CAP_PERM_WRITE: i64 = 2;     // write to resource
+pub const CAP_PERM_EXEC: i64 = 4;      // execute (for memory)
+pub const CAP_PERM_SEND: i64 = 8;       // send messages
+pub const CAP_PERM_RECV: i64 = 16;      // receive messages
+pub const CAP_PERM_GRANT: i64 = 32;     // can grant child capabilities
+
+// ─── Initialize the capability table ──────────────────────────────────────
+
+pub fn cap_init() -> void {
+    var i: i64 = 0;
+    while i < CAP_MAX * CAP_ENTRY_SIZE {
+        p_mem_write8(CAP_TABLE + i, 0);
+        i = i + 1;
+    }
+}
+
+// ─── Create a capability ─────────────────────────────────────────────────
+// Returns capability handle (index + 1) or 0 if table is full.
+
+pub fn cap_create(cap_type: i64, perms: i64, base: i64, size: i64) -> i64 {
+    var i: i64 = 0;
+    while i < CAP_MAX {
+        var entry: i64 = CAP_TABLE + i * CAP_ENTRY_SIZE;
+        if p_mem_read64(entry) == CAP_TYPE_NONE {
+            p_mem_write64(entry, cap_type);
+            p_mem_write64(entry + 8, perms);
+            p_mem_write64(entry + 16, base);
+            p_mem_write64(entry + 24, size);
+            return i + 1;  // handle = index + 1 (0 = invalid)
+        }
+        i = i + 1;
+    }
+    return 0;  // table full
+}
+
+// ─── Check if a capability has a permission ──────────────────────────────
+// Returns 1 if granted, 0 if denied or invalid.
+
+pub fn cap_check(handle: i64, perm: i64) -> i64 {
+    if handle <= 0 { return 0; }
+    if handle > CAP_MAX { return 0; }
+    var entry: i64 = CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE;
+    var cap_type: i64 = p_mem_read64(entry);
+    if cap_type == CAP_TYPE_NONE { return 0; }
+    var perms: i64 = p_mem_read64(entry + 8);
+    if (perms & perm) != 0 { return 1; }
+    return 0;
+}
+
+// ─── Get capability fields ────────────────────────────────────────────────
+
+pub fn cap_get_type(handle: i64) -> i64 {
+    if handle <= 0 { return CAP_TYPE_NONE; }
+    if handle > CAP_MAX { return CAP_TYPE_NONE; }
+    return p_mem_read64(CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE);
+}
+
+pub fn cap_get_base(handle: i64) -> i64 {
+    if handle <= 0 { return 0; }
+    if handle > CAP_MAX { return 0; }
+    return p_mem_read64(CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE + 16);
+}
+
+pub fn cap_get_size(handle: i64) -> i64 {
+    if handle <= 0 { return 0; }
+    if handle > CAP_MAX { return 0; }
+    return p_mem_read64(CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE + 24);
+}
+
+pub fn cap_get_perms(handle: i64) -> i64 {
+    if handle <= 0 { return 0; }
+    if handle > CAP_MAX { return 0; }
+    return p_mem_read64(CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE + 8);
+}
+
+// ─── Revoke a capability (clear the entry) ────────────────────────────────
+
+pub fn cap_revoke(handle: i64) -> void {
+    if handle <= 0 { return; }
+    if handle > CAP_MAX { return; }
+    var entry: i64 = CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE;
+    p_mem_write64(entry, CAP_TYPE_NONE);
+    p_mem_write64(entry + 8, 0);
+    p_mem_write64(entry + 16, 0);
+    p_mem_write64(entry + 24, 0);
+}
+
+// ─── Grant a child capability ─────────────────────────────────────────────
+// Creates a new capability with the same type and base, but optionally
+// fewer permissions and/or smaller size. The parent must have CAP_PERM_GRANT.
+// Returns child handle or 0 if denied.
+
+pub fn cap_grant(handle: i64, new_perms: i64, new_size: i64) -> i64 {
+    // Check parent has grant permission
+    if cap_check(handle, CAP_PERM_GRANT) == 0 { return 0; }
+
+    var cap_type: i64 = cap_get_type(handle);
+    var base: i64 = cap_get_base(handle);
+
+    // Child permissions must be a subset of parent's
+    var parent_perms: i64 = cap_get_perms(handle);
+    var child_perms: i64 = new_perms & parent_perms;
+
+    // Child size must not exceed parent's
+    var parent_size: i64 = cap_get_size(handle);
+    var child_size: i64 = new_size;
+    if child_size > parent_size { child_size = parent_size; }
+    if child_size == 0 { child_size = parent_size; }
+
+    return cap_create(cap_type, child_perms, base, child_size);
+}
+
+// ─── Restrict a capability (create child with fewer perms) ────────────────
+// Convenience: same as cap_grant but keeps the same size.
+
+pub fn cap_restrict(handle: i64, new_perms: i64) -> i64 {
+    return cap_grant(handle, new_perms, 0);
+}
+
+// ─── Debug: list all capabilities ─────────────────────────────────────────
+
+pub fn cmd_caps() -> void {
+    con_putc(10);
+    // "Caps:"
+    con_putc(67); con_putc(97); con_putc(112); con_putc(115); con_putc(58);
+    con_putc(10);
+
+    var i: i64 = 0;
+    while i < CAP_MAX {
+        var entry: i64 = CAP_TABLE + i * CAP_ENTRY_SIZE;
+        var cap_type: i64 = p_mem_read64(entry);
+        if cap_type != CAP_TYPE_NONE {
+            var perms: i64 = p_mem_read64(entry + 8);
+            var base: i64 = p_mem_read64(entry + 16);
+            var size: i64 = p_mem_read64(entry + 24);
+
+            // Print handle
+            con_putc(35);  // '#'
+            print_dec(i + 1);
+            con_putc(32);
+
+            // Print type name
+            if cap_type == CAP_TYPE_MMIO {
+                con_putc(77); con_putc(77); con_putc(73); con_putc(79);  // "MMIO"
+            } else if cap_type == CAP_TYPE_MEMORY {
+                con_putc(77); con_putc(101); con_putc(109);  // "Mem"
+            } else if cap_type == CAP_TYPE_DISK {
+                con_putc(68); con_putc(105); con_putc(115); con_putc(107);  // "Disk"
+            } else if cap_type == CAP_TYPE_NETWORK {
+                con_putc(78); con_putc(101); con_putc(116);  // "Net"
+            } else if cap_type == CAP_TYPE_CONSOLE {
+                con_putc(67); con_putc(111); con_putc(110);  // "Con"
+            } else if cap_type == CAP_TYPE_KEYBOARD {
+                con_putc(75); con_putc(98); con_putc(100);  // "Kbd"
+            } else if cap_type == CAP_TYPE_MESSAGE {
+                con_putc(77); con_putc(115); con_putc(103);  // "Msg"
+            } else if cap_type == CAP_TYPE_IRQ {
+                con_putc(73); con_putc(82); con_putc(81);  // "IRQ"
+            }
+            con_putc(32);
+
+            // Print permissions
+            if (perms & CAP_PERM_READ) != 0 { con_putc(82); }  // 'R'
+            if (perms & CAP_PERM_WRITE) != 0 { con_putc(87); }  // 'W'
+            if (perms & CAP_PERM_EXEC) != 0 { con_putc(88); }  // 'X'
+            if (perms & CAP_PERM_SEND) != 0 { con_putc(83); }  // 'S'
+            if (perms & CAP_PERM_RECV) != 0 { con_putc(82); }  // 'R' (recv)
+            if (perms & CAP_PERM_GRANT) != 0 { con_putc(71); }  // 'G'
+            con_putc(32);
+
+            // Print base
+            con_putc(98); con_putc(58);  // "b:"
+            print_hex(base);
+            con_putc(32);
+
+            // Print size
+            con_putc(115); con_putc(58);  // "s:"
+            print_dec(size);
+            con_putc(10);
+        }
+        i = i + 1;
+    }
+}

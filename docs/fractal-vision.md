@@ -3,6 +3,21 @@
 > A kernel where the same patterns repeat at every scale. Zoom in, zoom out —
 > the structure is self-similar. A process is a kernel. A kernel is a process.
 
+## Status
+
+**Phase 1 (Capability system): IN PROGRESS**
+- `kernel/cap.fd` — capability table with create/check/grant/revoke
+- Root capabilities created at boot: console, disk, network MMIO, keyboard, memory heap
+- `caps` shell command lists all capabilities
+- Next: convert subsystems to use capabilities instead of hardcoded addresses
+
+**Phase 2 (Message passing): IN PROGRESS**
+- `kernel/msg.fd` — message endpoints with send/recv (ring buffer)
+- `msg` shell command tests message passing
+- Next: convert filesystem to message-based interface as proof of concept
+
+**Phases 3-5: BLOCKED** by PE backend interrupt handler bug
+
 ## What is a Fractal Kernel?
 
 A fractal kernel has **self-similarity at every level of scale**. The same

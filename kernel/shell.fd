@@ -34,16 +34,8 @@ use button;
 use arm_boot;
 use gameloop;
 use shell_script;
-
-// Layout padding to shift PE backend code layout
-fn pad_layout0() -> void { var x: i64 = 0; x = x + 1; }
-fn pad_layout1() -> void { var x: i64 = 0; x = x + 1; }
-fn pad_layout2() -> void { var x: i64 = 0; x = x + 1; }
-fn pad_layout3() -> void { var x: i64 = 0; x = x + 1; }
-fn pad_layout4() -> void { var x: i64 = 0; x = x + 1; }
-fn pad_layout5() -> void { var x: i64 = 0; x = x + 1; }
-fn pad_layout6() -> void { var x: i64 = 0; x = x + 1; }
-fn pad_layout7() -> void { var x: i64 = 0; x = x + 1; }
+use cap;
+use msg;
 
 // ─── Shell Commands ─────────────────────────────────────────────────────
 
@@ -814,6 +806,17 @@ pub fn main() -> void {
     net_init();
     // Initialize framebuffer
     fb_init();
+    // Initialize capability table (fractal kernel phase 1)
+    cap_init();
+    // Initialize message endpoints (fractal kernel phase 2)
+    msg_init();
+
+    // Create root capabilities — replace hardcoded addresses with grants
+    cap_create(5, 1 | 2 | 32, 0xB8000, 4000);      // Console (VGA)
+    cap_create(3, 1 | 2 | 32, 0, 65536);             // Disk
+    cap_create(1, 1 | 2 | 32, 0xFEB80000, 0x20000);  // Network MMIO
+    cap_create(6, 1 | 32, 0x60, 2);                   // Keyboard
+    cap_create(2, 1 | 2 | 32, 0x300000, 0x100000);   // Memory heap
 
     // Banner: "Fides OS v0.1"
     con_putc(70); con_putc(105); con_putc(100); con_putc(101); con_putc(115);
@@ -1383,6 +1386,12 @@ fn shell_dispatch(input_len: i64) -> void {
     } else if input_matches(118, 97, 114, 115, 0, 4, input_len) == 1 {
         // "vars" — show variables
         cmd_vars();
+    } else if input_matches8(99, 97, 112, 115, 0, 0, 0, 0, 4, input_len) == 1 {
+        // "caps" — list capabilities
+        cmd_caps();
+    } else if input_matches8(109, 115, 103, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "msg" — test message passing
+        cmd_msg();
     } else {
         // Unknown
         con_putc(63); con_putc(10);

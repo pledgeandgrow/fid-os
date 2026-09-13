@@ -1,0 +1,254 @@
+// kernel/msg.fd — Message passing (fractal kernel phase 2)
+//
+// Uniform message passing between capabilities. A message endpoint is
+// backed by a CAP_TYPE_MESSAGE capability. Messages are fixed-size (64 bytes)
+// with an operation code and inline payload.
+//
+// This is the fractal communication layer: the same send/recv interface
+// works at every scale — kernel-to-driver, driver-to-driver, process-to-
+// process. Direct function calls are replaced by message exchange.
+//
+// Message format (64 bytes):
+//   [0]  op:       i64 — operation code (defined per subsystem)
+//   [8]  len:      i64 — payload length (bytes used in payload field)
+//   [16] payload:  48 bytes — inline data for small messages
+//
+// Endpoint (ring buffer, 1024 bytes):
+//   [0]  head:  i64 — next write slot
+//   [8]  tail:  i64 — next read slot
+//   [16] count: i64 — messages in queue
+//   [24] max:   i64 — capacity (15 messages)
+//   [32] slots: 15 × 64 bytes = 960 bytes
+
+module msg;
+
+use console;
+use cap;
+
+// ─── Endpoint pool ────────────────────────────────────────────────────────
+pub const MSG_ENDPOINT_BASE: i64 = 0x1E1000;
+pub const MSG_ENDPOINT_SIZE: i64 = 1024;
+pub const MSG_MAX_ENDPOINTS: i64 = 8;
+pub const MSG_SLOT_SIZE: i64 = 64;
+pub const MSG_MAX_SLOTS: i64 = 15;  // (1024 - 32) / 64 = 15
+
+// ─── Message operation codes (generic, shared across subsystems) ────────
+pub const MSG_OP_NONE: i64 = 0;
+pub const MSG_OP_OPEN: i64 = 1;     // open a resource
+pub const MSG_OP_CLOSE: i64 = 2;    // close a resource
+pub const MSG_OP_READ: i64 = 3;     // read data
+pub const MSG_OP_WRITE: i64 = 4;    // write data
+pub const MSG_OP_SEEK: i64 = 5;     // seek to position
+pub const MSG_OP_STAT: i64 = 6;     // get status info
+pub const MSG_OP_REPLY: i64 = 7;     // reply to a request
+pub const MSG_OP_ERROR: i64 = 8;    // error response
+pub const MSG_OP_PING: i64 = 9;     // keepalive / test
+pub const MSG_OP_SHUTDOWN: i64 = 10; // shutdown endpoint
+
+// ─── Initialize all endpoints ─────────────────────────────────────────────
+
+pub fn msg_init() -> void {
+    var i: i64 = 0;
+    while i < MSG_MAX_ENDPOINTS * MSG_ENDPOINT_SIZE {
+        p_mem_write8(MSG_ENDPOINT_BASE + i, 0);
+        i = i + 1;
+    }
+    // Set max slots for each endpoint
+    i = 0;
+    while i < MSG_MAX_ENDPOINTS {
+        var ep: i64 = MSG_ENDPOINT_BASE + i * MSG_ENDPOINT_SIZE;
+        p_mem_write64(ep + 24, MSG_MAX_SLOTS);
+        i = i + 1;
+    }
+}
+
+// ─── Create a message endpoint ───────────────────────────────────────────
+// Allocates a free endpoint and creates a CAP_TYPE_MESSAGE capability.
+// Returns capability handle (use for send/recv) or 0 if none free.
+
+pub fn msg_create_endpoint(perms: i64) -> i64 {
+    var i: i64 = 0;
+    while i < MSG_MAX_ENDPOINTS {
+        var ep: i64 = MSG_ENDPOINT_BASE + i * MSG_ENDPOINT_SIZE;
+        // Check if this endpoint is free (count == 0 and head == 0 and tail == 0)
+        var count: i64 = p_mem_read64(ep + 16);
+        var max: i64 = p_mem_read64(ep + 24);
+        if max == 0 {
+            // Uninitialized — claim it
+            p_mem_write64(ep, 0);     // head
+            p_mem_write64(ep + 8, 0);  // tail
+            p_mem_write64(ep + 16, 0); // count
+            p_mem_write64(ep + 24, MSG_MAX_SLOTS);
+            // Create capability pointing to this endpoint
+            var cap_handle: i64 = cap_create(
+                7,  // CAP_TYPE_MESSAGE
+                perms,
+                ep,
+                MSG_ENDPOINT_SIZE
+            );
+            return cap_handle;
+        }
+        i = i + 1;
+    }
+    return 0;  // no free endpoints
+}
+
+// ─── Get endpoint address from capability handle ─────────────────────────
+
+fn msg_get_endpoint(handle: i64) -> i64 {
+    if cap_get_type(handle) != 7 { return 0; }  // CAP_TYPE_MESSAGE
+    return cap_get_base(handle);
+}
+
+// ─── Send a message to an endpoint ──────────────────────────────────────
+// Returns 0 on success, -1 if endpoint is full or invalid.
+
+pub fn msg_send(handle: i64, op: i64, payload_addr: i64, payload_len: i64) -> i64 {
+    // Check send permission
+    if cap_check(handle, 8) == 0 { return -1; }  // CAP_PERM_SEND
+
+    var ep: i64 = msg_get_endpoint(handle);
+    if ep == 0 { return -1; }
+
+    var count: i64 = p_mem_read64(ep + 16);
+    var max: i64 = p_mem_read64(ep + 24);
+    if count >= max { return -1; }  // queue full
+
+    var head: i64 = p_mem_read64(ep);
+    var slot: i64 = ep + 32 + head * MSG_SLOT_SIZE;
+
+    // Write message header
+    p_mem_write64(slot, op);
+    var actual_len: i64 = payload_len;
+    if actual_len > 48 { actual_len = 48; }  // cap payload at 48 bytes
+    p_mem_write64(slot + 8, actual_len);
+
+    // Copy payload (up to 48 bytes)
+    var i: i64 = 0;
+    while i < actual_len {
+        var b: i64 = 0;
+        if payload_addr != 0 {
+            b = p_mem_read8(payload_addr + i);
+        }
+        p_mem_write8(slot + 16 + i, b);
+        i = i + 1;
+    }
+
+    // Advance head (wrap around)
+    head = head + 1;
+    if head >= max { head = 0; }
+    p_mem_write64(ep, head);
+
+    // Increment count
+    p_mem_write64(ep + 16, count + 1);
+
+    return 0;
+}
+
+// ─── Receive a message from an endpoint ──────────────────────────────────
+// Reads the next message into buf (must be at least 64 bytes).
+// Returns the operation code, or -1 if empty or invalid.
+// The payload length is written to len_out.
+
+pub fn msg_recv(handle: i64, buf: i64, len_out: i64) -> i64 {
+    // Check recv permission
+    if cap_check(handle, 16) == 0 { return -1; }  // CAP_PERM_RECV
+
+    var ep: i64 = msg_get_endpoint(handle);
+    if ep == 0 { return -1; }
+
+    var count: i64 = p_mem_read64(ep + 16);
+    if count == 0 { return -1; }  // queue empty
+
+    var tail: i64 = p_mem_read64(ep + 8);
+    var max: i64 = p_mem_read64(ep + 24);
+    var slot: i64 = ep + 32 + tail * MSG_SLOT_SIZE;
+
+    // Read message header
+    var op: i64 = p_mem_read64(slot);
+    var plen: i64 = p_mem_read64(slot + 8);
+
+    // Write to output buffer
+    if buf != 0 {
+        p_mem_write64(buf, op);
+        p_mem_write64(buf + 8, plen);
+        var i: i64 = 0;
+        while i < 48 {
+            var b: i64 = p_mem_read8(slot + 16 + i);
+            p_mem_write8(buf + 16 + i, b);
+            i = i + 1;
+        }
+    }
+
+    // Write payload length to len_out
+    if len_out != 0 {
+        p_mem_write64(len_out, plen);
+    }
+
+    // Advance tail (wrap around)
+    tail = tail + 1;
+    if tail >= max { tail = 0; }
+    p_mem_write64(ep + 8, tail);
+
+    // Decrement count
+    p_mem_write64(ep + 16, count - 1);
+
+    return op;
+}
+
+// ─── Check if endpoint has messages ──────────────────────────────────────
+
+pub fn msg_pending(handle: i64) -> i64 {
+    var ep: i64 = msg_get_endpoint(handle);
+    if ep == 0 { return 0; }
+    var count: i64 = p_mem_read64(ep + 16);
+    if count > 0 { return 1; }
+    return 0;
+}
+
+// ─── Debug: test message passing ──────────────────────────────────────────
+
+pub fn cmd_msg() -> void {
+    con_putc(10);
+    // "Msg test:"
+    con_putc(77); con_putc(115); con_putc(103); con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);
+    con_putc(10);
+
+    // Create an endpoint with send + recv + grant
+    var ep_cap: i64 = msg_create_endpoint(8 | 16 | 32);  // SEND | RECV | GRANT
+    if ep_cap == 0 {
+        con_putc(69); con_putc(114); con_putc(114);  // "Err"
+        con_putc(10);
+        return;
+    }
+
+    // "ep="
+    con_putc(101); con_putc(112); con_putc(61);
+    print_dec(ep_cap);
+    con_putc(32);
+
+    // Send a ping message with payload "HELLO"
+    var payload: i64 = 0x48454C4C4F;  // "HELLO" packed (little-endian-ish)
+    var result: i64 = msg_send(ep_cap, 9, 0, 0);  // MSG_OP_PING, no payload
+    // "snd="
+    con_putc(115); con_putc(110); con_putc(100); con_putc(61);
+    print_dec(result);
+    con_putc(32);
+
+    // Check pending
+    var pending: i64 = msg_pending(ep_cap);
+    // "pend="
+    con_putc(112); con_putc(101); con_putc(110); con_putc(100); con_putc(61);
+    print_dec(pending);
+    con_putc(32);
+
+    // Receive the message
+    var recv_buf: i64 = 0x1E2000;  // temp buffer for received message
+    var recv_len: i64 = 0;
+    var recv_op: i64 = msg_recv(ep_cap, recv_buf, 0x1E2080);
+    // "recv="
+    con_putc(114); con_putc(101); con_putc(99); con_putc(118); con_putc(61);
+    print_dec(recv_op);
+    con_putc(10);
+}
