@@ -459,6 +459,13 @@
 - RCU (read-copy-update for lock-free reads)
 - CPU hotplug (bring cores online/offline)
 
+### Fractal Architecture (see docs/fractal-vision.md)
+- **Phase 1: Capability system** — replace hardcoded addresses with passed capabilities
+- **Phase 2: Message passing** — convert one subsystem (filesystem) to message-passing as proof of concept
+- **Phase 3: Per-process page tables** — each process gets its own address space (requires PE backend fix)
+- **Phase 4: Recursive processes** — a process can host children with the same syscall interface
+- **Phase 5: Driver isolation** — drivers run in their own capability domains
+
 ### Security
 - User/group permissions (uid, gid, permission checks)
 - ASLR (address space layout randomization)
