@@ -1,31 +1,39 @@
-# Makefile — Fides OS kernel build
+# Makefile — Fides OS kernel build with incremental caching
 #
-# Builds the kernel using the Fides compiler's --boot mode
-# and packages it into a bootable ISO with GRUB.
+# Build pipeline:
+#   .fd source → kernel-raw.bin → kernel.elf → kernel.bin → patched ISO
+#
+# Caching strategy (like Rust's incremental compilation):
+#   - Base ISO is built once with grub-mkrescue and cached as fides-os-base.iso
+#   - Kernel is only recompiled if any .fd source file changed
+#   - On each rebuild, the kernel is patched into the cached base ISO
+#   - Full ISO rebuild only needed when GRUB config changes or kernel grows
 #
 # Requirements:
 #   - Fides compiler (fidesc or fides-c3.exe)
+#   - Node.js (for ELF wrapping + ISO patching — no gcc/ld needed)
 #   - qemu-system-x86_64 (for testing)
-#   - grub-mkrescue + xorriso (for ISO creation)
-#   - gcc + ld (for ELF wrapper)
+#   - grub-mkrescue + xorriso (only for `base-iso` and `iso` targets)
 #
 # Usage:
-#   make            # build kernel.bin
-#   make iso        # build fides-os.iso
+#   make            # build kernel + patch into cached ISO (fast, default)
+#   make patch      # same as above, explicit
+#   make base-iso   # build base ISO with grub-mkrescue (run once first time)
+#   make iso        # full rebuild with grub-mkrescue (slow, no caching)
 #   make run        # build + run in QEMU
 #   make minimal    # build minimal kernel (serial output only)
-#   make clean      # remove build artifacts
+#   make clean      # remove kernel + patched ISO (keeps base ISO cache)
+#   make distclean  # remove everything including base ISO cache
 
-# Use the self-hosted Fides compiler (fides-c3.exe) by default.
-# Fall back to the Rust bootstrap compiler (fidesc) if not available.
+# ─── Tools ────────────────────────────────────────────────────────────────
 FIDES_SELFHOST = ../p-lang/release/fides-c3.exe
 FIDES_RUST     = ../p-lang/target/release/fidesc.exe
 FIDES = $(shell if [ -x "$(FIDES_SELFHOST)" ]; then echo "$(FIDES_SELFHOST)"; else echo "$(FIDES_RUST)"; fi)
 QEMU      = qemu-system-x86_64
 GRUB_MKRESCUE = grub-mkrescue
-CC        = gcc
-LD        = ld
+NODE      = node
 
+# ─── Paths ────────────────────────────────────────────────────────────────
 KERNEL_DIR   = kernel
 BUILD_DIR    = build
 ISO_DIR      = iso
@@ -34,68 +42,57 @@ KERNEL_RAW   = $(BUILD_DIR)/kernel-raw.bin
 KERNEL_ELF   = $(BUILD_DIR)/kernel.elf
 KERNEL       = $(BUILD_DIR)/kernel.bin
 MINIMAL      = $(BUILD_DIR)/minimal.bin
+BASE_ISO     = $(BUILD_DIR)/fides-os-base.iso
 ISO          = $(BUILD_DIR)/fides-os.iso
 
-# ELF wrapper source and linker script
-WRAP_SRC     = $(BUILD_DIR)/kernel_wrap.S
-WRAP_OBJ     = $(BUILD_DIR)/kernel_wrap.o
-WRAP_LD      = $(BUILD_DIR)/kernel_wrap.ld
+# ─── Source dependencies (all .fd files) ──────────────────────────────────
+# Any .fd file change triggers a kernel recompile — like Rust tracking deps
+KERNEL_SRCS = $(wildcard $(KERNEL_DIR)/*.fd)
 
-# QEMU flags: boot from CD, 256MB RAM, serial to stdout
+# ─── QEMU flags ───────────────────────────────────────────────────────────
 QEMU_FLAGS = -cdrom $(ISO) -m 256 -serial stdio -no-reboot
 
-.PHONY: all minimal iso run clean
+.PHONY: all patch base-iso iso run minimal clean distclean
 
-all: $(KERNEL)
+all: patch
 
-# ─── Minimal kernel (serial output only) ──────────────────────────────────
-# This is the simplest bootable kernel — just prints to COM1
+# ─── Fast build: compile + patch into cached base ISO ─────────────────────
+# This is the default. Only recompiles if .fd files changed.
+# Requires a base ISO — run `make base-iso` first if missing.
 
-$(MINIMAL): $(KERNEL_DIR)/minimal.fd | $(BUILD_DIR)
-	@echo "[build] Compiling minimal kernel..."
-	$(FIDES) emit $(KERNEL_DIR)/minimal.fd --boot -o $(MINIMAL)
-	@echo "[build] Minimal kernel: $(MINIMAL) ($(shell wc -c < $(MINIMAL)) bytes)"
+patch: $(ISO)
 
-# ─── Full kernel ───────────────────────────────────────────────────────────
-# The Fides compiler emits a flat binary with a Multiboot2 header.
-# GRUB's multiboot2 command expects an ELF image, so we wrap the flat
-# binary in a minimal ELF with a load segment at 0x100000 and entry
-# point 0x100018 (0x100000 + 24-byte MB2 header).
+$(ISO): $(BASE_ISO) $(KERNEL)
+	@echo "[patch] Patching kernel into base ISO..."
+	@$(NODE) swap-kernel.js $(BASE_ISO) $(KERNEL) $(ISO) || \
+		(echo "[patch] Kernel too large for base ISO. Run: make base-iso" && exit 1)
+	@echo "[patch] ISO ready: $(ISO) ($$(wc -c < $(ISO)) bytes)"
 
-$(KERNEL_RAW): $(KERNEL_DIR)/shell.fd | $(BUILD_DIR)
+# ─── Compile kernel (only if .fd sources changed) ────────────────────────
+
+$(KERNEL_RAW): $(KERNEL_SRCS) | $(BUILD_DIR)
 	@echo "[build] Compiling kernel (Fides --boot mode)..."
-	$(FIDES) emit $(KERNEL_DIR)/shell.fd --boot -o $(KERNEL_RAW)
+	@$(FIDES) emit $(KERNEL_DIR)/shell.fd --boot -o $(KERNEL_RAW)
 	@echo "[build] Raw kernel: $(KERNEL_RAW) ($$(wc -c < $(KERNEL_RAW)) bytes)"
 
-# Generate the ELF wrapper source (just includes the raw binary)
-$(WRAP_SRC): | $(BUILD_DIR)
-	@echo '.section .text' > $(WRAP_SRC)
-	@echo '.global _start' >> $(WRAP_SRC)
-	@echo '_start:' >> $(WRAP_SRC)
-	@echo '    .incbin "$(KERNEL_RAW)"' >> $(WRAP_SRC)
-
-# Generate the linker script for the ELF wrapper
-$(WRAP_LD): | $(BUILD_DIR)
-	@echo 'PHDRS { text PT_LOAD; }' > $(WRAP_LD)
-	@echo 'SECTIONS { . = 0x100000; .text : { *(.text) } :text }' >> $(WRAP_LD)
-
-$(WRAP_OBJ): $(WRAP_SRC) $(KERNEL_RAW)
-	$(CC) -c -o $(WRAP_OBJ) $(WRAP_SRC)
-
-$(KERNEL_ELF): $(WRAP_OBJ) $(WRAP_LD)
-	$(LD) -T $(WRAP_LD) -e 0x100018 -N -o $(KERNEL_ELF) $(WRAP_OBJ) 2>/dev/null
+# Wrap raw binary in ELF using make-elf.js (cross-platform, no gcc/ld needed)
+$(KERNEL_ELF): $(KERNEL_RAW)
+	@$(NODE) make-elf.js $(KERNEL_RAW) $(KERNEL_ELF) 0x100000 0x100018
 
 $(KERNEL): $(KERNEL_ELF)
 	@cp $(KERNEL_ELF) $(KERNEL)
 	@echo "[build] Kernel ELF: $(KERNEL) ($$(wc -c < $(KERNEL)) bytes)"
 
-# ─── Build bootable ISO ───────────────────────────────────────────────────
+# ─── Base ISO: built once with grub-mkrescue, then cached ─────────────────
+# Only needs grub-mkrescue. Uses current kernel so ISO is large enough.
+# Rebuild when: first time, GRUB config changes, or kernel outgrows ISO.
 
-iso: $(KERNEL) | $(BUILD_DIR)
-	@echo "[iso] Building ISO..."
+# Order-only prereq: kernel must EXIST to build base ISO, but kernel
+# changes do NOT trigger a base ISO rebuild (that's the caching).
+$(BASE_ISO): | $(KERNEL) $(BUILD_DIR)
+	@echo "[base-iso] Building base ISO with grub-mkrescue..."
 	@rm -rf $(ISO_DIR)
 	@mkdir -p $(ISO_DIR)/boot/grub
-	@cp $(KERNEL) $(ISO_DIR)/boot/kernel.bin
 	@echo 'set timeout=0' > $(ISO_DIR)/boot/grub/grub.cfg
 	@echo 'set default=0' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '' >> $(ISO_DIR)/boot/grub/grub.cfg
@@ -103,23 +100,62 @@ iso: $(KERNEL) | $(BUILD_DIR)
 	@echo '    multiboot2 /boot/kernel.bin' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '    boot' >> $(ISO_DIR)/boot/grub/grub.cfg
 	@echo '}' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@cp $(KERNEL) $(ISO_DIR)/boot/kernel.bin
+	$(GRUB_MKRESCUE) -o $(BASE_ISO) $(ISO_DIR) 2>/dev/null || \
+		(echo "[base-iso] grub-mkrescue failed. Install grub-common + xorriso." && exit 1)
+	@echo "[base-iso] Base ISO cached: $(BASE_ISO) ($$(wc -c < $(BASE_ISO)) bytes)"
+	@echo "[base-iso] Future builds will patch into this — run: make"
+
+base-iso: $(BASE_ISO)
+
+# ─── Full ISO rebuild (grub-mkrescue, no caching) ─────────────────────────
+# Use when GRUB config changes or base ISO is stale.
+
+iso: $(KERNEL) | $(BUILD_DIR)
+	@echo "[iso] Full ISO rebuild with grub-mkrescue..."
+	@rm -rf $(ISO_DIR)
+	@mkdir -p $(ISO_DIR)/boot/grub
+	@echo 'set timeout=0' > $(ISO_DIR)/boot/grub/grub.cfg
+	@echo 'set default=0' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo 'menuentry "Fides OS" {' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    multiboot2 /boot/kernel.bin' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '    boot' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@echo '}' >> $(ISO_DIR)/boot/grub/grub.cfg
+	@cp $(KERNEL) $(ISO_DIR)/boot/kernel.bin
 	$(GRUB_MKRESCUE) -o $(ISO) $(ISO_DIR) 2>/dev/null || \
 		(echo "[iso] grub-mkrescue failed. Install grub-common + xorriso." && exit 1)
-	@echo "[iso] ISO: $(ISO)"
+	@echo "[iso] ISO: $(ISO) ($$(wc -c < $(ISO)) bytes)"
 
 # ─── Run in QEMU ───────────────────────────────────────────────────────────
 
-run: iso
+run: patch
 	@echo "[qemu] Launching Fides OS..."
 	$(QEMU) $(QEMU_FLAGS)
 
-# ─── Build directories ────────────────────────────────────────────────────
+# ─── Minimal kernel (serial output only) ──────────────────────────────────
+
+$(MINIMAL): $(KERNEL_DIR)/minimal.fd | $(BUILD_DIR)
+	@echo "[build] Compiling minimal kernel..."
+	@$(FIDES) emit $(KERNEL_DIR)/minimal.fd --boot -o $(MINIMAL)
+	@echo "[build] Minimal kernel: $(MINIMAL) ($$(wc -c < $(MINIMAL)) bytes)"
+
+minimal: $(MINIMAL)
+
+# ─── Build directory ───────────────────────────────────────────────────────
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
-# ─── Clean ────────────────────────────────────────────────────────────────
+# ─── Clean (keep base ISO cache for fast rebuilds) ───────────────────────
 
 clean:
+	@rm -f $(KERNEL_RAW) $(KERNEL_ELF) $(KERNEL) $(MINIMAL) $(ISO)
+	@rm -rf $(ISO_DIR)
+	@echo "[clean] Build artifacts removed (base ISO cache kept)"
+
+# ─── Distclean (remove everything including cache) ───────────────────────
+
+distclean:
 	@rm -rf $(BUILD_DIR) $(ISO_DIR)
-	@echo "[clean] Build artifacts removed"
+	@echo "[distclean] All build artifacts removed (including base ISO cache)"

@@ -2,7 +2,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 
-const iso = process.argv[2] || 'build/fides-os-patched.iso';
+const iso = process.argv[2] || 'build/fides-os.iso';
 const timeout = parseInt(process.argv[3] || '12000');
 const extraArgs = process.argv.slice(4);
 
