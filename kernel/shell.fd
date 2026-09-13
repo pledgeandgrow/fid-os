@@ -1328,6 +1328,15 @@ fn shell_dispatch(input_len: i64) -> void {
     } else if input_matches8(116, 99, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
         // "tcp" — test TCP connection to 10.0.2.2:80
         cmd_tcp();
+    } else if input_matches8(100, 110, 115, 0, 0, 0, 0, 0, 3, input_len) == 1 {
+        // "dns" — DNS lookup
+        cmd_dns();
+    } else if input_matches8(100, 104, 99, 112, 100, 0, 0, 0, 5, input_len) == 1 {
+        // "dhcpd" — DHCP daemon
+        cmd_dhcpd();
+    } else if input_matches8(108, 105, 115, 116, 101, 110, 0, 0, 6, input_len) == 1 {
+        // "listen" — TCP listener
+        cmd_listen();
     } else if input_matches8(98, 117, 100, 100, 121, 0, 0, 0, 5, input_len) == 1 {
         // "buddy" — test buddy allocator
         cmd_buddy();

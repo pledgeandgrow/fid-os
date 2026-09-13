@@ -1,1 +1,27 @@
 nul
+
+# Build outputs
+build/
+*.iso
+*.bin
+*.elf
+*.exe
+*.img
+*.o
+*.cat
+
+# Logs and captures
+*.log
+*.pcap
+
+# Compiled kernel in iso/ (rebuild with make)
+iso/boot/kernel.bin
+
+# Throwaway test scripts
+run-test.js
+run-test2.js
+run-test3.js
+run-test4.js
+test-int.js
+run-qemu-debug.js
+run-qemu-kernel.js

@@ -1,2 +1,0 @@
-C:\Program Files\qemu\qemu-system-x86_64.exe: -serial file:build/serial-patched.log: open build/serial-patched.log failed
-C:\Program Files\qemu\qemu-system-x86_64.exe: -serial file:build/serial-patched.log: could not connect serial device to character backend 'file:build/serial-patched.log'
