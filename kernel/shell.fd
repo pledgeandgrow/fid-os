@@ -27,14 +27,8 @@ use net;
 use framebuffer;
 use dma;
 use audio;
-use graphics;
-use gamepad;
-use gpio;
-use button;
-use arm_boot;
-use gameloop;
 use shell_script;
-use cap;
+use capability;
 use msg;
 
 // ─── Shell Commands ─────────────────────────────────────────────────────
@@ -807,16 +801,16 @@ pub fn main() -> void {
     // Initialize framebuffer
     fb_init();
     // Initialize capability table (fractal kernel phase 1)
-    cap_init();
+    capability_init();
     // Initialize message endpoints (fractal kernel phase 2)
     msg_init();
 
     // Create root capabilities — replace hardcoded addresses with grants
-    cap_create(5, 1 | 2 | 32, 0xB8000, 4000);      // Console (VGA)
-    cap_create(3, 1 | 2 | 32, 0, 65536);             // Disk
-    cap_create(1, 1 | 2 | 32, 0xFEB80000, 0x20000);  // Network MMIO
-    cap_create(6, 1 | 32, 0x60, 2);                   // Keyboard
-    cap_create(2, 1 | 2 | 32, 0x300000, 0x100000);   // Memory heap
+    capability_create(5, 1 | 2 | 32, 0xB8000, 4000);      // Console (VGA)
+    capability_create(3, 1 | 2 | 32, 0, 65536);             // Disk
+    capability_create(1, 1 | 2 | 32, 0xFEB80000, 0x20000);  // Network MMIO
+    capability_create(6, 1 | 32, 0x60, 2);                   // Keyboard
+    capability_create(2, 1 | 2 | 32, 0x300000, 0x100000);   // Memory heap
 
     // Banner: "Fides OS v0.1"
     con_putc(70); con_putc(105); con_putc(100); con_putc(101); con_putc(115);
@@ -1341,48 +1335,6 @@ fn shell_dispatch(input_len: i64) -> void {
     } else if input_matches8(116, 99, 112, 0, 0, 0, 0, 0, 3, input_len) == 1 {
         // "tcp" — test TCP connection to 10.0.2.2:80
         cmd_tcp();
-    } else if input_matches8(98, 117, 100, 100, 121, 0, 0, 0, 5, input_len) == 1 {
-        // "buddy" — test buddy allocator
-        cmd_buddy();
-    } else if input_matches8(115, 108, 97, 98, 0, 0, 0, 0, 4, input_len) == 1 {
-        // "slab" — test slab allocator
-        cmd_slab();
-    } else if input_matches8(109, 109, 97, 112, 0, 0, 0, 0, 4, input_len) == 1 {
-        // "mmap" — test mmap/munmap
-        cmd_mmap();
-    } else if input_prefix4(110, 105, 99, 101, 4, input_len) == 1 {
-        // "nice <val>" — set process priority
-        cmd_nice(input_len);
-    } else if input_prefix4(107, 105, 108, 108, 4, input_len) == 1 {
-        // "kill <pid>" — kill process
-        cmd_kill(input_len);
-    } else if input_matches8(102, 111, 114, 107, 0, 0, 0, 0, 4, input_len) == 1 {
-        // "fork" — test fork
-        cmd_fork();
-    } else if input_matches8(112, 114, 111, 99, 115, 0, 0, 0, 5, input_len) == 1 {
-        // "procs" — show process table with priorities
-        cmd_procs();
-    } else if input_matches8(97, 117, 100, 105, 111, 0, 0, 0, 5, input_len) == 1 {
-        // "audio" — play test tone
-        cmd_audio();
-    } else if input_matches8(109, 117, 115, 105, 99, 0, 0, 0, 5, input_len) == 1 {
-        // "music" — play melody
-        cmd_music();
-    } else if input_matches8(103, 102, 120, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-        // "gfx" — graphics test
-        cmd_gfx();
-    } else if input_matches8(103, 112, 97, 100, 0, 0, 0, 0, 4, input_len) == 1 {
-        // "gpad" — gamepad test
-        cmd_gamepad();
-    } else if input_matches8(103, 112, 105, 111, 0, 0, 0, 0, 4, input_len) == 1 {
-        // "gpio" — GPIO test
-        cmd_gpio();
-    } else if input_matches8(98, 116, 110, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-        // "btn" — button test
-        cmd_button();
-    } else if input_matches8(97, 114, 109, 0, 0, 0, 0, 0, 3, input_len) == 1 {
-        // "arm" — ARM boot info
-        cmd_arm();
     } else if input_matches(118, 97, 114, 115, 0, 4, input_len) == 1 {
         // "vars" — show variables
         cmd_vars();
@@ -1392,6 +1344,9 @@ fn shell_dispatch(input_len: i64) -> void {
     } else if input_matches8(109, 115, 103, 0, 0, 0, 0, 0, 3, input_len) == 1 {
         // "msg" — test message passing
         cmd_msg();
+    } else if input_matches8(99, 97, 112, 102, 115, 0, 0, 0, 5, input_len) == 1 {
+        // "capfs" — test capability-gated filesystem
+        cmd_capfs();
     } else {
         // Unknown
         con_putc(63); con_putc(10);

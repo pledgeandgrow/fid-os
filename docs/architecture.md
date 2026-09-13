@@ -93,6 +93,9 @@
   0x1D3000 - 0x1D4000  ── Pipe input buffer (4KB)
   0x1D5000 - 0x1D5008  ── Capture flag + length (console output capture)
   0x1D6000 - 0x1D6FFF  ── Shell history (16 entries × 128 bytes)
+  0x1E0000 - 0x1E0FFF  ── Capability table (128 entries × 32 bytes)
+  0x1E1000 - 0x1E2FFF  ── Message endpoints (8 × 1KB ring buffers)
+  0x1E2000 - 0x1E20FF  ── Message test buffer (temp, cmd_msg)
   0x50000              ── Multiboot2 info pointer (saved by boot trampoline)
   0x70000 - 0x71FFF    ── Boot page tables (PML4 + PDPT, identity-mapped)
   0xFEE00000           ── LAPIC MMIO base
@@ -263,6 +266,36 @@
 - **Capture flag:** At `0x1D5000`
 - **History:** 16 entries × 128 bytes at `0x1D6000`
 
+### 3.17 Capability System (Fractal Kernel Phase 1)
+- **File:** `kernel/capability.fd`
+- **Table:** 128 entries × 32 bytes at `0x1E0000`
+- **Entry:** type(8), perms(8), base(8), size(8)
+- **Types:** MMIO, MEMORY, DISK, NETWORK, CONSOLE, KEYBOARD, MESSAGE, IRQ
+- **Permissions:** READ, WRITE, EXEC, SEND, RECV, GRANT
+- **API:** `capability_create`, `capability_check`, `capability_grant`,
+  `capability_revoke`, `capability_get_base/size/type/perms`
+- **Root capabilities** created at boot: console, disk, network MMIO,
+  keyboard, memory heap (all with READ+WRITE+GRANT)
+- **Shell command:** `caps` — list all capabilities
+
+### 3.18 Message Passing (Fractal Kernel Phase 2)
+- **File:** `kernel/msg.fd`
+- **Endpoints:** 8 ring buffers at `0x1E1000` (1 KB each, 15 messages)
+- **Message:** 64 bytes — op(8) + len(8) + 48-byte payload
+- **Operations:** OPEN, CLOSE, READ, WRITE, SEEK, STAT, REPLY, ERROR,
+  PING, SHUTDOWN
+- **API:** `msg_create_endpoint`, `msg_send`, `msg_recv`, `msg_pending`
+- **Permission-gated** via CAP_TYPE_MESSAGE capabilities
+- **Shell command:** `msg` — test send/recv round-trip
+
+### 3.19 Capability-Gated Filesystem (Fractal Proof of Concept)
+- **File:** `kernel/vfs.fd` (appended functions)
+- **API:** `vfs_cap_read_file`, `vfs_cap_write_file`, `vfs_cap_list`
+- **Pattern:** caller passes a DISK capability; functions check type +
+  permission before delegating to existing FAT32 operations
+- **Shell command:** `capfs` — grants a read-only child cap, tests that
+  reads succeed and writes are denied, then revokes and tests denial
+
 ## 4. Build System
 
 ### 4.1 Compile
@@ -361,6 +394,8 @@ with bare-metal primitives (i64, port I/O, memory access).
 | `gpio.fd` | **ACTIVE** | GPIO support |
 | `button.fd` | **ACTIVE** | Button input |
 | `arm_boot.fd` | **ACTIVE** | ARM Cortex-M target info |
+| `capability.fd` | **ACTIVE** | Capability table (fractal kernel phase 1) |
+| `msg.fd` | **ACTIVE** | Message passing endpoints (fractal kernel phase 2) |
 
 ## 7. Repository Boundaries
 

@@ -23,7 +23,7 @@
 module msg;
 
 use console;
-use cap;
+use capability;
 
 // ─── Endpoint pool ────────────────────────────────────────────────────────
 pub const MSG_ENDPOINT_BASE: i64 = 0x1E1000;
@@ -80,13 +80,13 @@ pub fn msg_create_endpoint(perms: i64) -> i64 {
             p_mem_write64(ep + 16, 0); // count
             p_mem_write64(ep + 24, MSG_MAX_SLOTS);
             // Create capability pointing to this endpoint
-            var cap_handle: i64 = cap_create(
+            var capability_handle: i64 = capability_create(
                 7,  // CAP_TYPE_MESSAGE
                 perms,
                 ep,
                 MSG_ENDPOINT_SIZE
             );
-            return cap_handle;
+            return capability_handle;
         }
         i = i + 1;
     }
@@ -96,8 +96,8 @@ pub fn msg_create_endpoint(perms: i64) -> i64 {
 // ─── Get endpoint address from capability handle ─────────────────────────
 
 fn msg_get_endpoint(handle: i64) -> i64 {
-    if cap_get_type(handle) != 7 { return 0; }  // CAP_TYPE_MESSAGE
-    return cap_get_base(handle);
+    if capability_get_type(handle) != 7 { return 0; }  // CAP_TYPE_MESSAGE
+    return capability_get_base(handle);
 }
 
 // ─── Send a message to an endpoint ──────────────────────────────────────
@@ -105,7 +105,7 @@ fn msg_get_endpoint(handle: i64) -> i64 {
 
 pub fn msg_send(handle: i64, op: i64, payload_addr: i64, payload_len: i64) -> i64 {
     // Check send permission
-    if cap_check(handle, 8) == 0 { return -1; }  // CAP_PERM_SEND
+    if capability_check(handle, 8) == 0 { return -1; }  // CAP_PERM_SEND
 
     var ep: i64 = msg_get_endpoint(handle);
     if ep == 0 { return -1; }
@@ -152,7 +152,7 @@ pub fn msg_send(handle: i64, op: i64, payload_addr: i64, payload_len: i64) -> i6
 
 pub fn msg_recv(handle: i64, buf: i64, len_out: i64) -> i64 {
     // Check recv permission
-    if cap_check(handle, 16) == 0 { return -1; }  // CAP_PERM_RECV
+    if capability_check(handle, 16) == 0 { return -1; }  // CAP_PERM_RECV
 
     var ep: i64 = msg_get_endpoint(handle);
     if ep == 0 { return -1; }
@@ -228,8 +228,7 @@ pub fn cmd_msg() -> void {
     print_dec(ep_cap);
     con_putc(32);
 
-    // Send a ping message with payload "HELLO"
-    var payload: i64 = 0x48454C4C4F;  // "HELLO" packed (little-endian-ish)
+    // Send a ping message
     var result: i64 = msg_send(ep_cap, 9, 0, 0);  // MSG_OP_PING, no payload
     // "snd="
     con_putc(115); con_putc(110); con_putc(100); con_putc(61);
@@ -245,7 +244,6 @@ pub fn cmd_msg() -> void {
 
     // Receive the message
     var recv_buf: i64 = 0x1E2000;  // temp buffer for received message
-    var recv_len: i64 = 0;
     var recv_op: i64 = msg_recv(ep_cap, recv_buf, 0x1E2080);
     // "recv="
     con_putc(114); con_putc(101); con_putc(99); con_putc(118); con_putc(61);

@@ -1,4 +1,4 @@
-// kernel/cap.fd — Capability table (fractal kernel phase 1)
+// kernel/capability.fd — Capability table (fractal kernel phase 1)
 //
 // A capability is an unforgeable handle (i64) that grants permission
 // to access a resource. Instead of hardcoded addresses, modules and
@@ -12,7 +12,7 @@
 //
 // Table: 128 capabilities × 32 bytes = 4 KB at 0x1E0000
 
-module cap;
+module capability;
 
 use console;
 
@@ -42,7 +42,7 @@ pub const CAP_PERM_GRANT: i64 = 32;     // can grant child capabilities
 
 // ─── Initialize the capability table ──────────────────────────────────────
 
-pub fn cap_init() -> void {
+pub fn capability_init() -> void {
     var i: i64 = 0;
     while i < CAP_MAX * CAP_ENTRY_SIZE {
         p_mem_write8(CAP_TABLE + i, 0);
@@ -53,7 +53,7 @@ pub fn cap_init() -> void {
 // ─── Create a capability ─────────────────────────────────────────────────
 // Returns capability handle (index + 1) or 0 if table is full.
 
-pub fn cap_create(cap_type: i64, perms: i64, base: i64, size: i64) -> i64 {
+pub fn capability_create(cap_type: i64, perms: i64, base: i64, size: i64) -> i64 {
     var i: i64 = 0;
     while i < CAP_MAX {
         var entry: i64 = CAP_TABLE + i * CAP_ENTRY_SIZE;
@@ -72,7 +72,7 @@ pub fn cap_create(cap_type: i64, perms: i64, base: i64, size: i64) -> i64 {
 // ─── Check if a capability has a permission ──────────────────────────────
 // Returns 1 if granted, 0 if denied or invalid.
 
-pub fn cap_check(handle: i64, perm: i64) -> i64 {
+pub fn capability_check(handle: i64, perm: i64) -> i64 {
     if handle <= 0 { return 0; }
     if handle > CAP_MAX { return 0; }
     var entry: i64 = CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE;
@@ -85,25 +85,25 @@ pub fn cap_check(handle: i64, perm: i64) -> i64 {
 
 // ─── Get capability fields ────────────────────────────────────────────────
 
-pub fn cap_get_type(handle: i64) -> i64 {
+pub fn capability_get_type(handle: i64) -> i64 {
     if handle <= 0 { return CAP_TYPE_NONE; }
     if handle > CAP_MAX { return CAP_TYPE_NONE; }
     return p_mem_read64(CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE);
 }
 
-pub fn cap_get_base(handle: i64) -> i64 {
+pub fn capability_get_base(handle: i64) -> i64 {
     if handle <= 0 { return 0; }
     if handle > CAP_MAX { return 0; }
     return p_mem_read64(CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE + 16);
 }
 
-pub fn cap_get_size(handle: i64) -> i64 {
+pub fn capability_get_size(handle: i64) -> i64 {
     if handle <= 0 { return 0; }
     if handle > CAP_MAX { return 0; }
     return p_mem_read64(CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE + 24);
 }
 
-pub fn cap_get_perms(handle: i64) -> i64 {
+pub fn capability_get_perms(handle: i64) -> i64 {
     if handle <= 0 { return 0; }
     if handle > CAP_MAX { return 0; }
     return p_mem_read64(CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE + 8);
@@ -111,7 +111,7 @@ pub fn cap_get_perms(handle: i64) -> i64 {
 
 // ─── Revoke a capability (clear the entry) ────────────────────────────────
 
-pub fn cap_revoke(handle: i64) -> void {
+pub fn capability_revoke(handle: i64) -> void {
     if handle <= 0 { return; }
     if handle > CAP_MAX { return; }
     var entry: i64 = CAP_TABLE + (handle - 1) * CAP_ENTRY_SIZE;
@@ -126,31 +126,31 @@ pub fn cap_revoke(handle: i64) -> void {
 // fewer permissions and/or smaller size. The parent must have CAP_PERM_GRANT.
 // Returns child handle or 0 if denied.
 
-pub fn cap_grant(handle: i64, new_perms: i64, new_size: i64) -> i64 {
+pub fn capability_grant(handle: i64, new_perms: i64, new_size: i64) -> i64 {
     // Check parent has grant permission
-    if cap_check(handle, CAP_PERM_GRANT) == 0 { return 0; }
+    if capability_check(handle, CAP_PERM_GRANT) == 0 { return 0; }
 
-    var cap_type: i64 = cap_get_type(handle);
-    var base: i64 = cap_get_base(handle);
+    var cap_type: i64 = capability_get_type(handle);
+    var base: i64 = capability_get_base(handle);
 
     // Child permissions must be a subset of parent's
-    var parent_perms: i64 = cap_get_perms(handle);
+    var parent_perms: i64 = capability_get_perms(handle);
     var child_perms: i64 = new_perms & parent_perms;
 
     // Child size must not exceed parent's
-    var parent_size: i64 = cap_get_size(handle);
+    var parent_size: i64 = capability_get_size(handle);
     var child_size: i64 = new_size;
     if child_size > parent_size { child_size = parent_size; }
     if child_size == 0 { child_size = parent_size; }
 
-    return cap_create(cap_type, child_perms, base, child_size);
+    return capability_create(cap_type, child_perms, base, child_size);
 }
 
 // ─── Restrict a capability (create child with fewer perms) ────────────────
-// Convenience: same as cap_grant but keeps the same size.
+// Convenience: same as capability_grant but keeps the same size.
 
-pub fn cap_restrict(handle: i64, new_perms: i64) -> i64 {
-    return cap_grant(handle, new_perms, 0);
+pub fn capability_restrict(handle: i64, new_perms: i64) -> i64 {
+    return capability_grant(handle, new_perms, 0);
 }
 
 // ─── Debug: list all capabilities ─────────────────────────────────────────

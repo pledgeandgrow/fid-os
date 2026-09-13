@@ -5,6 +5,7 @@ module vfs;
 
 use console;
 use ata;
+use capability;
 
 pub const FAT32_BUF: i64 = 0x40000;     // sector buffer for FS operations
 pub const FAT_ROOT_CLUSTER: i64 = 2;    // FAT32 root dir starts at cluster 2
@@ -504,4 +505,141 @@ pub fn cmd_rm(name_addr: i64, name_len: i64) -> void {
         con_putc(78); con_putc(111); con_putc(116); con_putc(32); con_putc(102); con_putc(111); con_putc(117); con_putc(110); con_putc(100); // "Not found"
         con_putc(10);
     }
+}
+
+// ─── Capability-gated filesystem (fractal kernel proof of concept) ───────
+// These functions wrap the existing FAT32 operations with capability
+// checks. A caller must present a valid DISK capability with the
+// appropriate permission (READ or WRITE) to access the filesystem.
+//
+// This demonstrates the fractal pattern: instead of any module calling
+// fat32_read_file() directly, it must first obtain a disk capability
+// and pass it to these gated functions. The capability enforces that
+// the caller has been explicitly granted access.
+//
+// Root disk capability handle (created at boot in shell.fd):
+//   handle 2 = CAP_TYPE_DISK, perms=READ|WRITE|GRANT, base=0, size=65536
+
+// Read a file using a disk capability. Returns 0 on success, -1 if
+// the capability is invalid or lacks READ permission, -2 if read fails.
+pub fn vfs_cap_read_file(disk_cap: i64, name_addr: i64, name_len: i64, buf: i64) -> i64 {
+    // Verify the caller has a disk capability with READ permission
+    if capability_get_type(disk_cap) != 3 { return -1; }  // CAP_TYPE_DISK
+    if capability_check(disk_cap, 1) == 0 { return -1; }  // CAP_PERM_READ
+
+    // Check the requested file is within the capability's sector range
+    // (base sector to base + size). For now, all files are in the root
+    // directory which starts at cluster 2 — we allow it if the cap
+    // covers sector 0 (where the BPB lives).
+    var cap_base: i64 = capability_get_base(disk_cap);
+    var cap_size: i64 = capability_get_size(disk_cap);
+    if cap_base > 0 { return -1; }  // must start at sector 0 for FAT32
+    if cap_size < 100 { return -1; }  // too small to be useful
+
+    // Delegate to the existing FAT32 read
+    var file_size: i64 = 0;
+    var cluster: i64 = fat32_find_file(name_addr, name_len, 0x41040);
+    if cluster == 0 { return -2; }
+    var result: i64 = fat32_read_file(cluster, buf);
+    return result;
+}
+
+// Write (create) a file using a disk capability. Returns 0 on success,
+// -1 if the capability is invalid or lacks WRITE permission.
+pub fn vfs_cap_write_file(disk_cap: i64, name_addr: i64, name_len: i64) -> i64 {
+    if capability_get_type(disk_cap) != 3 { return -1; }  // CAP_TYPE_DISK
+    if capability_check(disk_cap, 2) == 0 { return -1; }  // CAP_PERM_WRITE
+
+    var cap_base: i64 = capability_get_base(disk_cap);
+    if cap_base > 0 { return -1; }
+
+    return fat32_create_file(name_addr, name_len);
+}
+
+// List files using a disk capability. Returns 0 on success, -1 if
+// the capability is invalid or lacks READ permission.
+pub fn vfs_cap_list(disk_cap: i64) -> i64 {
+    if capability_get_type(disk_cap) != 3 { return -1; }  // CAP_TYPE_DISK
+    if capability_check(disk_cap, 1) == 0 { return -1; }  // CAP_PERM_READ
+
+    cmd_ls();
+    return 0;
+}
+
+// Test the capability-gated filesystem. Called by a new shell command.
+// Demonstrates: grant a restricted disk cap, then read/list with it.
+pub fn cmd_capfs() -> void {
+    con_putc(10);
+    // "CapFS test:"
+    con_putc(67); con_putc(97); con_putc(112); con_putc(70); con_putc(83);  // "CapFS"
+    con_putc(32);
+    con_putc(116); con_putc(101); con_putc(115); con_putc(116); con_putc(58);  // "test:"
+    con_putc(10);
+
+    // Root disk cap is handle 2 (created at boot)
+    var root_cap: i64 = 2;
+
+    // Verify it exists
+    var cap_type: i64 = capability_get_type(root_cap);
+    if cap_type != 3 {
+        con_putc(78); con_putc(111); con_putc(32); con_putc(100); con_putc(105); con_putc(115); con_putc(107);  // "No disk"
+        con_putc(10);
+        return;
+    }
+
+    // "root="
+    con_putc(114); con_putc(111); con_putc(111); con_putc(116); con_putc(61);
+    print_dec(root_cap);
+    con_putc(32);
+    con_putc(112); con_putc(101); con_putc(114); con_putc(109); con_putc(115); con_putc(61);  // "perms="
+    print_dec(capability_get_perms(root_cap));
+    con_putc(10);
+
+    // Grant a read-only child capability (no WRITE, no GRANT)
+    var read_only_cap: i64 = capability_grant(root_cap, 1, 0);  // READ only
+    // "ro="
+    con_putc(114); con_putc(111); con_putc(61);
+    print_dec(read_only_cap);
+    con_putc(32);
+    con_putc(112); con_putc(101); con_putc(114); con_putc(109); con_putc(115); con_putc(61);  // "perms="
+    print_dec(capability_get_perms(read_only_cap));
+    con_putc(10);
+
+    // Try to list with the read-only cap — should succeed
+    var r1: i64 = vfs_cap_list(read_only_cap);
+    // "list="
+    con_putc(108); con_putc(105); con_putc(115); con_putc(116); con_putc(61);
+    print_dec(r1);
+    con_putc(10);
+
+    // Try to write with the read-only cap — should fail (-1)
+    var dummy_name: i64 = 0x41060;
+    p_mem_write8(dummy_name, 84);  // 'T'
+    p_mem_write8(dummy_name + 1, 77);  // 'M'
+    p_mem_write8(dummy_name + 2, 80);  // 'P'
+    p_mem_write8(dummy_name + 3, 0);
+    var r2: i64 = vfs_cap_write_file(read_only_cap, dummy_name, 3);
+    // "write="
+    con_putc(119); con_putc(114); con_putc(105); con_putc(116); con_putc(101); con_putc(61);
+    print_dec(r2);
+    // " (should be -1)"
+    con_putc(32); con_putc(40); con_putc(115); con_putc(104); con_putc(111); con_putc(117); con_putc(108); con_putc(100);  // " (should"
+    con_putc(32); con_putc(98); con_putc(101); con_putc(32); con_putc(45); con_putc(49); con_putc(41);  // " be -1)"
+    con_putc(10);
+
+    // Try to write with the root cap — should succeed (0)
+    var r3: i64 = vfs_cap_write_file(root_cap, dummy_name, 3);
+    // "rootwrite="
+    con_putc(114); con_putc(119); con_putc(61);
+    print_dec(r3);
+    con_putc(10);
+
+    // Revoke the read-only cap
+    capability_revoke(read_only_cap);
+    // Try to list with revoked cap — should fail (-1)
+    var r4: i64 = vfs_cap_list(read_only_cap);
+    // "revoked="
+    con_putc(114); con_putc(101); con_putc(118); con_putc(61);
+    print_dec(r4);
+    con_putc(10);
 }
